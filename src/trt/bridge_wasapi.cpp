@@ -3,6 +3,7 @@
 #include "bridge_wasapi.h"
 #include "bridge_audio.h"
 #include "bridge_ole.h"
+#include "images.h"
 #include "thunk.h"
 #include "trt.h"
 // Settings knob (audio_buffer_ms); weak link keeps offline tests green when
@@ -955,6 +956,56 @@ static_com_obj g_enumerator = {k_enum_vtbl};
 
 extern "C" {
 
+// ---- mmdevapi.dll: the UWP-side audio activation entry point -------------
+// Windows store titles (and Rust/wgpu games like Veloren) never open a
+// WASAPI device through the COM enumerator; they call mmdevapi!
+// ActivateAudioInterfaceAsync(VID, IID_IAudioClient, pfn, handler) and the
+// OS asynchronously delivers IAudioClient through the completion handler's
+// ActivateCompleted (IActivateAudioInterfaceCompletionHandler, slot 3).
+// We activate synchronously against the real wasapi_client implementation
+// and fire the handler's ActivateCompleted through trt_call_guest (same
+// gate as the MF bridge's IMFAsyncCallback::Invoke) before returning S_OK.
+
+u64 TRT_GUEST_ABI wasapi_GetActivationFactory(const u16* vid, void** out) {
+  (void)vid;
+  if (out) *out = nullptr;
+  return (u64)k_e_nointerface;
+}
+
+i32 TRT_GUEST_ABI wasapi_ActivateAudioInterfaceAsync(
+    const u16* device_interface_path, const void* riid, void* pfn,
+    void* completion_handler, void** out_async_op) {
+  (void)device_interface_path;
+  (void)pfn;
+  if (out_async_op) *out_async_op = nullptr;
+  if (!riid || !completion_handler) return k_e_invalidarg;
+
+  // Create the real client (the same object IMMDevice::Activate hands out)
+  wasapi_client* c = alloc_client();
+  if (!c) return k_e_outofmemory;
+
+  // Deliver synchronously: ActivateCompleted(this, IAsyncOperation*) is
+  // slot 3 of IActivateAudioInterfaceCompletionHandler. The async op is
+  // null; games only test it for non-null before reading results, and the
+  // GetResults path lives on the handler's caller side.
+  bool delivered = false;
+  const void** vt = *(const void***)completion_handler;
+  if (vt && vt[3]) {
+    trt_call_guest((void*)vt[3], (u64)(uintptr_t)completion_handler, 0, 0, 0);
+    delivered = true;
+  }
+  char line[128];
+  snprintf(line, sizeof(line),
+           "wasapi: ActivateAudioInterfaceAsync -> IAudioClient%s",
+           delivered ? " (ActivateCompleted fired)" : " (no handler slot)");
+  wasapilog::line(line);
+
+  // S_OK even when the handler slot is absent: the client object exists
+  // and stays referenced; a handler-less caller is a probing game.
+  (void)delivered;
+  return k_s_ok;
+}
+
 int trt_wasapi_create_enumerator(const void* iid, void** out, void* user) {
   (void)iid;
   (void)user;
@@ -1007,6 +1058,14 @@ int trt_bridge_register_wasapi(void) {
   };
   trt_module_register("avrt.dll", TRT_ROUTE_BUILTIN, k_avrt_fns,
                       (int)(sizeof(k_avrt_fns) / sizeof(k_avrt_fns[0])));
+  // mmdevapi.dll: UWP audio activation (Veloren/wgpu path)
+  static const trt_named_fn k_mmdevapi_fns[] = {
+      {"ActivateAudioInterfaceAsync",
+       (void*)&wasapi_ActivateAudioInterfaceAsync},
+      {"GetActivationFactory", (void*)&wasapi_GetActivationFactory},
+  };
+  trt_module_register("mmdevapi.dll", TRT_ROUTE_BUILTIN, k_mmdevapi_fns,
+                      (int)(sizeof(k_mmdevapi_fns) / sizeof(k_mmdevapi_fns[0])));
   return 0;
 }
 

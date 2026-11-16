@@ -4,6 +4,8 @@ EXPORTS
     timeBeginPeriod
     timeEndPeriod
     timeGetDevCaps
+    timeSetEvent
+    timeKillEvent
     waveOutGetNumDevs
     waveOutGetDevCapsW
     midiOutGetNumDevs

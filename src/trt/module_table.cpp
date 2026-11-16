@@ -425,12 +425,13 @@ const mod_default k_defaults[] = {
     // LoadLibrary("d3d12.dll") resolves in the AppContainer.
     {"d3d12.dll", TRT_ROUTE_SYSTEM},
     {"d3d12core.dll", TRT_ROUTE_SYSTEM},
-    // DirectStorage: games normally SHIP dstorage.dll/dstoragecore.dll in
-    // their own directory (the Go Next corpus does); the console also
-    // carries them, so route SYSTEM as fallback when the game does not
-    // bring its own copy.
-    {"dstorage.dll", TRT_ROUTE_SYSTEM},
-    {"dstoragecore.dll", TRT_ROUTE_SYSTEM},
+    // DirectStorage: BUILTIN honest-runtime (was SYSTEM fallback). Unity 6
+    // titles import DSTORAGE.dll!DStorageGetFactory even when they do NOT
+    // ship the DLL (measured: Go Next corpus) — depending on console
+    // presence made those boots nondeterministic (SYSTEM(C) at the gate).
+    // The bridge answers the factory probe S_OK and fails io visibly.
+    {"dstorage.dll", TRT_ROUTE_BUILTIN},
+    {"dstoragecore.dll", TRT_ROUTE_BUILTIN},
     {"dxgi.dll", TRT_ROUTE_SYSTEM},
     {"d3dcompiler_47.dll", TRT_ROUTE_SYSTEM},
     {"dcomp.dll", TRT_ROUTE_SYSTEM},

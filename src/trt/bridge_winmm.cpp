@@ -13,11 +13,18 @@
 #include "bridge_winmm.h"
 #include "trt.h"
 #include "thunk.h"
+#include "images.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#include <cerrno>
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -30,6 +37,99 @@ u32 now_ms() {
 
 // the requested period (ms), for visibility in logs
 u32 g_min_period = 0;
+
+// ---- multimedia timers (timeSetEvent/timeKillEvent): OpenTTD uses these
+// as its network/scheduler tick. Real contract: a callback fired on a host
+// thread every `period` ms (periodic) or once (TIME_ONESHOT). We run one
+// std::thread per timer with a monotonic steady_clock schedule and an
+// atomic kill flag — no polling loops at coarse granularity. ----
+struct mm_timer {
+  std::atomic<u32> dead{0};
+  u32 id = 0;     // the opaque id we handed out (== callback arg0)
+  u64 cb = 0;     // guest function pointer
+  u64 user = 0;   // guest user data
+  std::thread th;
+};
+std::mutex g_mm_mu;
+std::vector<mm_timer*> g_mm_timers;
+
+void mm_timer_fire(u32 id, u64 cb, u64 user) {
+  // Guest callback: Win64 ABI TimeProc(UINT uTimerID, UINT uMsg,
+  // DWORD_PTR dwUser, DWORD_PTR dw1, DWORD_PTR dw2). Call through
+  // trt_call_guest (the same gate CreateThread uses) so the call gets a
+  // guest image context and exceptions stay inside guest dispatch.
+  trt_call_guest((void*)(uintptr_t)cb, id, 0, user, 0);
+}
+
+void mm_timer_thread(mm_timer* t, u32 period_ms, bool periodic) {
+  struct timespec next;
+  timespec_get(&next, TIME_UTC);
+  u64 ns = (u64)next.tv_sec * 1000000000ull + (u64)next.tv_nsec;
+  const u64 period_ns = (u64)period_ms * 1000000ull;
+  for (;;) {
+    ns += period_ns;
+    next.tv_sec = ns / 1000000000ull;
+    next.tv_nsec = ns % 1000000000ull;
+    struct timespec now;
+    timespec_get(&now, TIME_UTC);
+    u64 now_ns = (u64)now.tv_sec * 1000000000ull + (u64)now.tv_nsec;
+    if (ns > now_ns) {
+      struct timespec wait = {next.tv_sec, next.tv_nsec};
+      int r;
+      while ((r = nanosleep(&wait, &wait)) == -1 && errno == EINTR) {}
+      if (r == -1) return;
+    }
+    if (t->dead.load(std::memory_order_acquire)) return;
+    mm_timer_fire(t->id, t->cb, t->user);
+    if (t->dead.load(std::memory_order_acquire) || !periodic) return;
+  }
+}
+
+u32 mm_timer_set(u32 period_ms, u64 cb, u64 user, u32 flags) {
+  if (!period_ms || !cb) return 0;  // TIMERR_NOCANDO
+  const bool periodic = (flags & 0x0001) != 0;  // TIME_PERIODIC
+  auto* t = new mm_timer();
+  t->cb = cb;
+  t->user = user;
+  t->id = (u32)(uintptr_t)t | 1u;  // opaque nonzero id; the pointer is ours
+  {
+    std::lock_guard<std::mutex> lk(g_mm_mu);
+    g_mm_timers.push_back(t);
+  }
+  char line[128];
+  snprintf(line, sizeof(line),
+           "winmm: timeSetEvent(period=%ums %s cb=%llx) -> host timer live",
+           period_ms, periodic ? "periodic" : "oneshot", (unsigned long long)cb);
+  trt_core_log(line);
+  try {
+    t->th = std::thread(mm_timer_thread, t, period_ms, periodic);
+  } catch (...) {
+    t->dead.store(1, std::memory_order_release);
+    return 0;
+  }
+  // Win32 returns the opaque nonzero timer id (== TimeProc arg0).
+  return t->id;
+}
+
+void mm_timer_kill(u32 id) {
+  if (!id) return;
+  mm_timer* t = (mm_timer*)(uintptr_t)(id & ~1u);
+  {
+    std::lock_guard<std::mutex> lk(g_mm_mu);
+    for (mm_timer* x : g_mm_timers)
+      if (x == t) { t->dead.store(1, std::memory_order_release); return; }
+  }
+}
+
+void mm_timer_teardown_all() {
+  std::lock_guard<std::mutex> lk(g_mm_mu);
+  for (mm_timer* t : g_mm_timers) {
+    if (!t) continue;
+    t->dead.store(1, std::memory_order_release);
+    if (t->th.joinable()) t->th.detach();
+  }
+  g_mm_timers.clear();
+}
 
 } // namespace
 
@@ -56,6 +156,19 @@ u32 TRT_GUEST_ABI trt_timeGetDevCaps(void* caps, u32 size) {
   *(u32*)(p + 0) = 1;      // wPeriodMin
   *(u32*)(p + 4) = 1000;   // wPeriodMax
   return 0;
+}
+
+// timeSetEvent/timeKillEvent/timeGetSystemTime: the multimedia timer queue
+// (OpenTTD's scheduler tick). Real host threads, see mm_timer_* above.
+u32 TRT_GUEST_ABI trt_timeSetEvent(u32 period_ms, u32 resolution, u64 cb,
+                                   u64 user, u32 flags) {
+  (void)resolution;
+  return mm_timer_set(period_ms, cb, user, flags);
+}
+
+u32 TRT_GUEST_ABI trt_timeKillEvent(u32 id) {
+  mm_timer_kill(id);
+  return 0;  // TIMERR_NOERROR
 }
 
 // ---- legacy audio device probes: "no devices", never a crash ----
@@ -170,12 +283,30 @@ u32 TRT_GUEST_ABI trt_midiInGetErrorTextA(u32 err, char* buf, u32 len) {
   return 8;  // MMSYSERR_BADERRNUM
 }
 
+// midiOut* device-cap probes: 0 devices (MIDIOUTCAPS untouched), the same
+// "no legacy MIDI on console" answer as midiOutGetNumDevs. OpenTTD probes
+// midiOutGetDevCapsW during its sound-backend sweep.
+u32 TRT_GUEST_ABI trt_midiOutGetDevCapsA(u64, void*, u32) { return 4; }  // MMSYSERR_BADDEVICEID
+u32 TRT_GUEST_ABI trt_midiOutGetDevCapsW(u64, void*, u32) { return 4; }
+u32 TRT_GUEST_ABI trt_midiOutGetErrorTextA(u32 err, char* buf, u32 len) {
+  (void)err;
+  if (buf && len > 0) buf[0] = 0;
+  return 8;  // MMSYSERR_BADERRNUM
+}
+u32 TRT_GUEST_ABI trt_midiOutGetErrorTextW(u32 err, u16* buf, u32 len) {
+  (void)err;
+  if (buf && len > 0) buf[0] = 0;
+  return 8;
+}
+
 int trt_bridge_register_winmm(void) {
   static const trt_named_fn k_fns[] = {
       {"timeGetTime", (void*)&trt_timeGetTime},
       {"timeBeginPeriod", (void*)&trt_timeBeginPeriod},
       {"timeEndPeriod", (void*)&trt_timeEndPeriod},
       {"timeGetDevCaps", (void*)&trt_timeGetDevCaps},
+      {"timeSetEvent", (void*)&trt_timeSetEvent},
+      {"timeKillEvent", (void*)&trt_timeKillEvent},
       {"waveOutGetNumDevs", (void*)&trt_waveOutGetNumDevs},
       {"waveOutGetDevCapsW", (void*)&trt_waveOutGetDevCapsW},
       {"waveInGetNumDevs", (void*)&trt_waveInGetNumDevs},
@@ -206,6 +337,10 @@ int trt_bridge_register_winmm(void) {
       {"waveInGetErrorTextW", (void*)&trt_waveInGetErrorTextW},
       {"waveInGetErrorTextA", (void*)&trt_waveInGetErrorTextW},
       {"midiOutGetNumDevs", (void*)&trt_midiOutGetNumDevs},
+      {"midiOutGetDevCapsA", (void*)&trt_midiOutGetDevCapsA},
+      {"midiOutGetDevCapsW", (void*)&trt_midiOutGetDevCapsW},
+      {"midiOutGetErrorTextA", (void*)&trt_midiOutGetErrorTextA},
+      {"midiOutGetErrorTextW", (void*)&trt_midiOutGetErrorTextW},
       {"midiInGetNumDevs", (void*)&trt_midiInGetNumDevs},
       {"midiInOpen", (void*)&trt_midiInOpen},
       {"midiInClose", (void*)&trt_midiInHandleOp},

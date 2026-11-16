@@ -1276,6 +1276,9 @@ void trt_bridge_boot(const trt_backend* be) {
   trt_bridge_register_crypt32();
   trt_bridge_register_bcrypt();
   trt_bridge_register_dbghelp();
+  // DirectStorage: UnityPlayer 6 imports DSTORAGE.dll!DStorageGetFactory
+  // unconditionally; factory probe answers S_OK, io surfaces fail visibly.
+  trt_bridge_register_dstorage();
   trt_bridge_register_ntdll();
   trt_bridge_register_console_pack();
   trt_bridge_register_sys_extras();

@@ -57,6 +57,40 @@ address — measured ehfix18 SIGSEGV). RACCOIN ladder: 7/7 REACHED. Go Next
 demo.exe also reports `UNITYMAIN2 CALLED: REACHED (IAT-probed)` — two real
 Unity games through the same gate.
 
+### 2026-11-16 (later) — corpus grows to 8 families; named-gap fixes
+
+- **Three new engine families staged** (all open-source, SHA-verified,
+  outside git):
+  - OpenTTD 15.3 — native C++/own engine; OpenGL + XAudio2_8 + WINMM
+    multimedia-timer surfaces.
+  - Cataclysm-BN 0.13 — native C++, SDL2 + GL/GLES + D3D11/12; heaviest
+    PE yet (632 MB, ships mesa/libGLESv2/WinPix/steam_api64).
+  - Veloren (weekly) — Rust + wgpu (Vulkan/DX12/GL backends); first Rust
+    engine entry, exercises bridge_vulkan + shader-cache knob end-to-end.
+- **Named gaps fixed from the gate** (each was a LOAD FAILED with the
+  symbol named; fix = real implementation, not a whitelist edit):
+  - `winmm!timeSetEvent/timeKillEvent` — real host-thread multimedia
+    timers (steady-clock schedule, atomic kill flag, trt_call_guest gate
+    for the guest callback; OpenTTD's scheduler tick).
+  - `shell32!DragFinish/SHBrowseForFolderW/SHGetPathFromIDListW` —
+    "picker cancelled" (the API's own named failure) + drag cleanup.
+  - `gdi32!GetPixelFormat/GetICMProfileW` — constant-1 pixel format
+    (matches ChoosePixelFormat/DescribePixelFormat/SetPixelFormat) and
+    honest "no ICM profile" (0).
+- **DStorage C->BUILTIN conversion** (boot-determinism): UnityPlayer 6
+  imports `DSTORAGE.dll!DStorageGetFactory` even when the game does not
+  ship the DLL — the SYSTEM(C) route made Go Next boots depend on
+  unproven console presence (the pre-existing MISMATCH line). New
+  `bridge_dstorage.cpp`: factory probe answers S_OK with a real vtable;
+  CreateQueue/OpenFile fail visibly (E_NOTIMPL + named log) so optional-
+  path games degrade to stdio and required-path games name the gap.
+- **Live proof of the unwinder hardening** (build9 corpus run): Go
+  Next's UnityPlayer crash path now produces the named verdict
+  `ehfix: unwind metadata rejected (ui=1a4a4894c base=180000000) ->
+  unwind failed cleanly` where the same input SIGSEGV'd the host before
+  wave 2. OrTMM terminates via the 100k-bounce named cap. RACCOIN boots
+  7/7 and exits clean (EXIT(0)).
+
 ### 2026-11-16 — unwinder hardening + livelock cap + native DLL overrides
 
 - **trt_RtlVirtualUnwind hardened** (kernel32 bridge): UnityPlayer's exception

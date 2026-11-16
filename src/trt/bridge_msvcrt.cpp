@@ -31,6 +31,10 @@
 #include "thunk.h"
 #include "trt.h"
 
+// kernel32 bridge's SEH language handler (same pointer msvcrt must export —
+// MinGW runtime DLLs import it from msvcrt.dll, not kernel32.dll)
+u32 TRT_STDCALL trt_C_specific_handler(u64 rec_p, u64 frame, u64 ctx_p, u64 dc_p);
+
 // Settings knob (memory_budget_mb); weak symbol keeps offline tests green
 // when src/host/settings.cpp is not in the test binary. Missing definition
 // resolves to 0 -> crt_malloc keeps the 256 MB default.
@@ -1788,6 +1792,33 @@ i32 TRT_GUEST_ABI crt_vfprintf(void* gf, const char* fmt, const u64* va) {
   return n;
 }
 
+// printf: same formatting core as vfprintf, routed to the guest's stdout
+// FILE (index 1 of the __iob_func table). MinGW PEs (libwinpthread /
+// libgcc_s / libstdc++ in the Veloren corpus) import this unconditionally.
+i32 TRT_GUEST_ABI crt_printf(const char* fmt, const u64* va) {
+  return crt_vfprintf(crt___iob_func() ? (void*)((u8*)crt___iob_func() + 1 * 48)
+                                       : nullptr,
+                      fmt, va);
+}
+
+// _ultoa: MSVC-specific u64->decimal (MinGW libgcc/libstdc++ import it).
+// Windows semantics: writes at most 17 bytes (33 on 32-bit), always
+// NUL-terminated, returns the pointer like MSVC (unlike the C standard).
+char* TRT_GUEST_ABI crt__ultoa(u64 val, char* buf, int radix) {
+  if (!buf || radix < 2 || radix > 36) return buf;
+  char tmp[72];
+  int n = 0;
+  do {
+    const int d = (int)(val % (u64)radix);
+    tmp[n++] = (char)(d < 10 ? '0' + d : 'a' + (d - 10));
+    val /= (u64)radix;
+  } while (val && n < 64);
+  int i = 0;
+  for (; n > 0; --n) buf[i++] = tmp[n - 1];
+  buf[i] = 0;
+  return buf;
+}
+
 i32 TRT_GUEST_ABI crt_fprintf(void* gf, const char* fmt, ...) {
   char buf[1024];
   ms_va_list ap;
@@ -2726,6 +2757,14 @@ const trt_named_fn k_msvcrt_fns[] = {
     {"sscanf_s",           (void*)&crt_sscanf_s},
     {"vfprintf",           (void*)&crt_vfprintf},
     {"fprintf",            (void*)&crt_fprintf},
+    {"printf",             (void*)&crt_printf},
+    // MSVC-specific converters + the SEH language handler: MinGW runtime
+    // DLLs (libwinpthread/libgcc_s in the Veloren corpus) import these from
+    // msvcrt.dll even though ucrt-era PEs get them elsewhere. The handler
+    // is the SAME implementation kernel32 exports (trt_C_specific_handler).
+    {"_ultoa",             (void*)&crt__ultoa},
+    {"__C_specific_handler", (void*)&trt_C_specific_handler},
+    {"__C_specific_handler_impl", (void*)&trt_C_specific_handler},
     {"fwprintf",           (void*)&crt_fwprintf},
     // Math
     {"sin",                (void*)&crt_sin},

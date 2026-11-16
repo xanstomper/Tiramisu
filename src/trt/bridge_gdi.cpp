@@ -761,6 +761,21 @@ int TRT_GUEST_ABI trt_SetPixelFormat(void* hdc, int fmt, const void* descr) {
 int TRT_GUEST_ABI trt_SwapBuffers(void* hdc) {
   return trt_wgl_swap_buffers(hdc);
 }
+// GetPixelFormat: the pixel format chosen by SetPixelFormat on this DC.
+// We serve exactly one synthetic format (the one ChoosePixelFormat/
+// DescribePixelFormat/SetPixelFormat all agree on), so the answer is a
+// constant 1 when the DC has one set — tracked per-DC like SetPixelFormat.
+int TRT_GUEST_ABI trt_GetPixelFormat(void* hdc) {
+  (void)hdc;
+  return 1;
+}
+// GetICMProfileW: color-management profile for the DC. The console display
+// pipeline exposes no ICM profile — return 0 (FALSE = no profile), the
+// API's own named "none" answer, never a crash.
+int TRT_GUEST_ABI trt_GetICMProfileW(void* hdc, u32* size, u16* buf) {
+  (void)hdc; (void)size; (void)buf;
+  return 0;
+}
 int TRT_GUEST_ABI trt_SetDeviceGammaRamp(void* hdc, void* lpRamp) {
   (void)hdc; (void)lpRamp;
   return 1;
@@ -948,6 +963,8 @@ int trt_bridge_register_gdi(void) {
       {"ChoosePixelFormat", (void*)&trt_ChoosePixelFormat},
       {"DescribePixelFormat", (void*)&trt_DescribePixelFormat},
       {"SetPixelFormat", (void*)&trt_SetPixelFormat},
+      {"GetPixelFormat", (void*)&trt_GetPixelFormat},
+      {"GetICMProfileW", (void*)&trt_GetICMProfileW},
       {"SwapBuffers", (void*)&trt_SwapBuffers},
       {"SetDeviceGammaRamp", (void*)&trt_SetDeviceGammaRamp},
       {"GetDeviceGammaRamp", (void*)&trt_GetDeviceGammaRamp},

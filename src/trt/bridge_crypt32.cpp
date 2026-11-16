@@ -313,6 +313,15 @@ u32 TRT_GUEST_ABI trt_BCryptGenRandom(void* alg, u8* buf, u32 len, u32 flags) {
   return 0;
 }
 
+// ProcessPrng (bcryptprimitives.dll): Win10+ direct random — PVOID, ULONG.
+// Distinct ABI from BCryptGenRandom (no alg handle, no flags); returns 1
+// (BOOL TRUE) on success, not NTSTATUS. Veloren's libwinpthread imports it.
+u32 TRT_GUEST_ABI trt_ProcessPrng(u8* buf, u32 len) {
+  if (!buf && len > 0) return 0;
+  trt_csprng_fill(buf, len);
+  return 1;
+}
+
 u32 TRT_GUEST_ABI trt_BCryptGetProperty(void* obj, const u16* prop, u8* out,
                                         u32 cb_out, u32* cb_res, u32 flags) {
   (void)flags;
@@ -414,6 +423,16 @@ int trt_bridge_register_bcrypt(void) {
   };
   trt_module_register("bcrypt.dll", TRT_ROUTE_BUILTIN, k_bcrypt_fns,
                       (int)(sizeof(k_bcrypt_fns) / sizeof(k_bcrypt_fns[0])));
+  // bcryptprimitives.dll: the Windows 10+ implementation DLL behind
+  // bcrypt.dll. Modern MinGW/GCC stacks (libwinpthread in the Veloren
+  // corpus) import ProcessPrng from it directly — the same getrandom()
+  // contract BCryptGenRandom(BCRYPT_USE_SYSTEM_PREFERRED_RNG) serves.
+  static const trt_named_fn k_bcryptprimitives_fns[] = {
+      {"ProcessPrng", (void*)&trt_ProcessPrng},
+  };
+  trt_module_register(
+      "bcryptprimitives.dll", TRT_ROUTE_BUILTIN, k_bcryptprimitives_fns,
+      (int)(sizeof(k_bcryptprimitives_fns) / sizeof(k_bcryptprimitives_fns[0])));
   return 0;
 }
 

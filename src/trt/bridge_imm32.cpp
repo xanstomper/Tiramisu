@@ -119,6 +119,20 @@ u32 TRT_GUEST_ABI imm_ImmGetCandidateListCountW(void* ctx, u32* lpdwListCount) {
   return 0;
 }
 
+// ImmGetIMEFileNameA/W: with no IME installed Windows answers empty string
+// + 0 (the caller treats empty as "no IME"). Cataclysm-BN probes this while
+// walking the input stack.
+u32 TRT_GUEST_ABI imm_ImmGetIMEFileNameA(void* ctx, char* buf, u32 len) {
+  (void)ctx;
+  if (buf && len > 0) buf[0] = 0;
+  return 0;
+}
+u32 TRT_GUEST_ABI imm_ImmGetIMEFileNameW(void* ctx, u16* buf, u32 len) {
+  (void)ctx;
+  if (buf && len > 0) buf[0] = 0;
+  return 0;
+}
+
 int TRT_GUEST_ABI imm_ImmSetCompositionFontW(void* ctx, const void* lplf) {
   (void)ctx; (void)lplf;
   return 0;
@@ -166,6 +180,8 @@ int trt_bridge_register_imm32(void) {
       {"ImmSetCompositionWindow", (void*)&imm_ImmSetCompositionWindow},
       {"ImmGetCandidateListW", (void*)&imm_ImmGetCandidateListW},
       {"ImmGetCandidateListCountW", (void*)&imm_ImmGetCandidateListCountW},
+      {"ImmGetIMEFileNameA", (void*)&imm_ImmGetIMEFileNameA},
+      {"ImmGetIMEFileNameW", (void*)&imm_ImmGetIMEFileNameW},
       {"ImmSetCompositionFontW", (void*)&imm_ImmSetCompositionFontW},
       {"ImmGetCompositionFontW", (void*)&imm_ImmGetCompositionFontW},
       {"ImmGetVirtualKey", (void*)&imm_ImmGetVirtualKey},

@@ -415,6 +415,25 @@ int TRT_GUEST_ABI shell_Shell_NotifyIconW(u32 msg, void* nid) {
   return 0;  // FALSE: no system tray on console UWP
 }
 
+// ---- shell file dialogs + drag-drop finishing (Cataclysm-BN imports).
+// No window manager on console: dialogs answer "cancelled" (fail-visible,
+// the API's own named failure), DragFinish just frees the host-side drop. ----
+int TRT_GUEST_ABI shell_SHBrowseForFolderW(void* browse) {
+  (void)browse;
+  return 0;  // NULL pidl = user cancelled the folder picker
+}
+
+int TRT_GUEST_ABI shell_SHGetPathFromIDListW(u64 pidl, u16* buf) {
+  // A NULL pidl from the cancelled picker above converts to FALSE/empty.
+  if (!pidl || !buf) return 0;
+  buf[0] = 0;
+  return 0;  // FALSE
+}
+
+void TRT_GUEST_ABI shell_DragFinish(u64 hdrop) {
+  (void)hdrop;  // host-side GlobalFree equivalent: nothing guest-visible
+}
+
 }  // namespace
 
 extern "C" {
@@ -438,6 +457,9 @@ int trt_bridge_register_shell(void) {
        (void*)&shell_SetCurrentProcessExplicitAppUserModelID},
       {"Shell_NotifyIconGetRect", (void*)&shell_Shell_NotifyIconGetRect},
       {"Shell_NotifyIconW", (void*)&shell_Shell_NotifyIconW},
+      {"SHBrowseForFolderW", (void*)&shell_SHBrowseForFolderW},
+      {"SHGetPathFromIDListW", (void*)&shell_SHGetPathFromIDListW},
+      {"DragFinish", (void*)&shell_DragFinish},
   };
   trt_module_register("shell32.dll", TRT_ROUTE_BUILTIN, k_fns,
                       (int)(sizeof(k_fns) / sizeof(k_fns[0])));

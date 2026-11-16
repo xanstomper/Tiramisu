@@ -127,7 +127,7 @@ int main(int argc, char** argv) {
   CHECK(trt_seal_image(&be, img) == TRT_OK, "image sealed (W^X)");
 
   const u64 ret = win64_call(img->base + img->entry_rva, 0, 0, 0);
-  printf("  guest returned 0x%llx (want 0x3f)\n", (unsigned long long)ret);
+  printf("  guest returned 0x%llx (want 0xff)\n", (unsigned long long)ret);
 
   CHECK(ret & 0x01u, "timeBeginPeriod(1) accepted");
   CHECK(ret & 0x02u, "clock nondecreasing");
@@ -135,6 +135,8 @@ int main(int argc, char** argv) {
   CHECK(ret & 0x08u, "waveOutGetNumDevs -> 0 without crash");
   CHECK(ret & 0x10u, "timeGetDevCaps sane");
   CHECK(ret & 0x20u, "mciSendStringW fails visibly (263)");
+  CHECK(ret & 0x40u, "timeSetEvent oneshot fired guest callback (host thread)");
+  CHECK(ret & 0x80u, "timeKillEvent froze the periodic timer");
 
   free(file);
   if (failures == 0) {
