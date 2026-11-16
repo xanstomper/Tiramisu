@@ -29,11 +29,13 @@
 
 #include "bridge_msvcrt.h"
 #include "thunk.h"
+#include "images.h"
 #include "trt.h"
 
 // kernel32 bridge's SEH language handler (same pointer msvcrt must export —
 // MinGW runtime DLLs import it from msvcrt.dll, not kernel32.dll)
-u32 TRT_STDCALL trt_C_specific_handler(u64 rec_p, u64 frame, u64 ctx_p, u64 dc_p);
+extern "C" u32 TRT_STDCALL trt_C_specific_handler(u64 rec_p, u64 frame,
+                                                  u64 ctx_p, u64 dc_p);
 
 // Settings knob (memory_budget_mb); weak symbol keeps offline tests green
 // when src/host/settings.cpp is not in the test binary. Missing definition
@@ -261,6 +263,35 @@ int host_fd_of(i32 gfd) {
 int set_errno_from_host(int e) {
   t_msvcrt_errno = e;
   return e;
+}
+
+// _close: closes a guest fd (the _open/_wopen/_sopen table). Std handles
+// 0-2 stay open. Any FILE* wrapping the fd is detached first so a later
+// fread/fwrite through the stale FILE gets EOF/0 instead of a use-after-
+// close on the host fd. libstdc++-6 (Veloren) imports _close via its
+// glibc-to-win32 stdio shim.
+i32 TRT_GUEST_ABI crt__close(i32 gfd) {
+  if (gfd < 0) return set_errno_from_host(EBADF);
+  if (gfd <= 2) return 0;  // std streams stay open for the process lifetime
+  file_lock();
+  init_files_locked();
+  int fd = (gfd >= 3 && gfd < k_max_files) ? g_os_fds[gfd] : gfd;
+  for (int i = 3; i < k_max_files; ++i) {
+    if (g_os_fds[i] == fd) {
+      g_os_fds[i] = -1;
+      g_os_files[i] = nullptr;
+      memset(&g_files[i], 0, sizeof(g_files[i]));
+    }
+  }
+  if (gfd >= 3 && gfd < k_max_files && fd == gfd) g_os_fds[gfd] = -1;
+  file_unlock();
+  if (fd < 3) return 0;
+#ifdef _WIN32
+  return _close(fd);
+#else
+  const int r = close(fd);
+  return r == 0 ? 0 : set_errno_from_host(errno);
+#endif
 }
 
 // ---------- Win64 stat32 / stat64 layouts ----------------------------------
@@ -1819,6 +1850,147 @@ char* TRT_GUEST_ABI crt__ultoa(u64 val, char* buf, int radix) {
   return buf;
 }
 
+// _telli64/_wfullpath/_wopen/_wutime64/_fpreset/_localtime64/_onexit:
+// the second MinGW wave (libstdc++'s locale/io shims pull these after the
+// first chain clears). All have direct host equivalents.
+i64 TRT_GUEST_ABI crt__telli64(i32 gfd) {
+  const int hfd = host_fd_of(gfd);
+  if (hfd < 0) return set_errno_from_host(EBADF), (i64)-1;
+#ifdef _WIN32
+  return _telli64(hfd);
+#else
+  const off_t r = lseek(hfd, 0, SEEK_CUR);
+  if (r < 0) { set_errno_from_host(errno); return -1; }
+  return (i64)r;
+#endif
+}
+
+u16* TRT_GUEST_ABI crt__wfullpath(u16* abs_buf, const u16* rel_path,
+                                  size_t sz) {
+  if (!rel_path || !abs_buf || sz == 0) return nullptr;
+  // Already absolute (drive letter or \\)? Copy through.
+  const u16 c0 = rel_path[0];
+  const bool absolute = (c0 >= L'A' && c0 <= L'Z') || (c0 >= L'a' && c0 <= L'z')
+                            ? rel_path[1] == L':' : (c0 == L'\\' && rel_path[1] == L'\\');
+  size_t i = 0;
+  if (absolute) {
+    while (rel_path[i] && i + 1 < sz) { abs_buf[i] = rel_path[i]; ++i; }
+  } else {
+    // Relative to the guest cwd: resolve through the VFS working dir by
+    // prefixing, best-effort (getcwd on the host mirrors the guest cwd).
+    char cwd[256];
+    if (!getcwd(cwd, sizeof(cwd) - 4)) cwd[0] = 0;
+    size_t n = 0;
+    for (; cwd[n] && n + 1 < sz; ++n) abs_buf[n] = (u16)(u8)cwd[n];
+    if (n + 1 < sz) abs_buf[n++] = L'\\';
+    i = n;
+    for (size_t k = 0; rel_path[k] && i + 1 < sz; ++k, ++i) abs_buf[i] = rel_path[k];
+  }
+  abs_buf[i] = 0;
+  return abs_buf;
+}
+
+i32 TRT_GUEST_ABI crt__wopen(const u16* path, u32 oflag, ...) {
+  // Translate to the narrow _open path via the existing VFS resolver.
+  char u8[512];
+  size_t n = 0;
+  for (size_t i = 0; path && path[i] && n + 1 < sizeof(u8); ++i)
+    u8[n++] = (path[i] >= 0x20 && path[i] < 0x7F) ? (char)path[i] : '?';
+  u8[n] = 0;
+  // oflag: _O_RDONLY 0, _O_WRONLY 1, _O_RDWR 2, _O_CREAT 0x0100,
+  // _O_TRUNC 0x0200, _O_APPEND 0x0008, _O_BINARY 0x8000 (no-op on POSIX).
+  int host_flags = 0;
+  const int acc = (int)(oflag & 3u);
+  host_flags = acc == 0 ? O_RDONLY : (acc == 1 ? O_WRONLY : O_RDWR);
+  if (oflag & 0x0100u) host_flags |= O_CREAT;
+  if (oflag & 0x0200u) host_flags |= O_TRUNC;
+  if (oflag & 0x0008u) host_flags |= O_APPEND;
+  const int fd = open(u8, host_flags, 0644);
+  if (fd < 0) return set_errno_from_host(errno);
+  file_lock();
+  init_files_locked();
+  int gfd = -1;
+  for (int i = 3; i < k_max_files; ++i)
+    if (g_os_fds[i] < 0) { g_os_fds[i] = fd; gfd = i; break; }
+  file_unlock();
+  if (gfd < 0) { close(fd); set_errno_from_host(EMFILE); return -1; }
+  return gfd;
+}
+
+i32 TRT_GUEST_ABI crt__wutime64(i32 gfd, const void* times) {
+  // fd-based utime: only the host fd matters; times = 2x __utimbuf64.
+  const int hfd = host_fd_of(gfd);
+  if (hfd < 0) return set_errno_from_host(EBADF), (i32)-1;
+  const u64* t = (const u64*)times;
+  struct timespec tv[2];
+  const u64 act = t ? t[0] : 0;
+  const u64 mod = t ? t[1] : 0;
+  tv[0].tv_sec = (time_t)act; tv[0].tv_nsec = 0;
+  tv[1].tv_sec = (time_t)mod; tv[1].tv_nsec = 0;
+  char proc[64];
+  snprintf(proc, sizeof(proc), "/proc/self/fd/%d", hfd);
+  const int r = utimensat(AT_FDCWD, proc, tv, 0);
+  return r == 0 ? 0 : set_errno_from_host(errno);
+}
+
+void TRT_GUEST_ABI crt__fpreset(void) {
+  // x87/SSE state reset — guest FPU state is per-thread host state on this
+  // runtime and always starts clean; nothing to do (and nothing may fault).
+}
+
+i64 TRT_GUEST_ABI crt__localtime64(const i64* timer) {
+  // Returns a pointer to a static struct tm in the guest-visible CRT
+  // (the same pattern localtime uses). We keep one host-side static and
+  // copy through the guest tm layout (32-bit ints, like Win64).
+  static struct {
+    i32 sec, min, hour, mday, mon, year, wday, yday, isdst;
+  } g_tm;
+  if (!timer) return 0;
+  const time_t tt = (time_t)*timer;
+  struct tm tmv;
+  if (!localtime_r(&tt, &tmv)) return 0;
+  g_tm.sec = tmv.tm_sec; g_tm.min = tmv.tm_min; g_tm.hour = tmv.tm_hour;
+  g_tm.mday = tmv.tm_mday; g_tm.mon = tmv.tm_mon;
+  g_tm.year = tmv.tm_year; g_tm.wday = tmv.tm_wday;
+  g_tm.yday = tmv.tm_yday; g_tm.isdst = tmv.tm_isdst;
+  return (i64)(uintptr_t)&g_tm;
+}
+
+// MinGW's atexit chain through _onexit. Guest function pointers must be
+// invoked through the guest-call gate at process exit, so entries go in a
+// static registry and a captureless trampoline walks it.
+struct onexit_entry { u64 (*fn)(u64, void*); void* arg; };
+onexit_entry g_onexit[64];
+int g_onexit_n = 0;
+void onexit_trampoline() {
+  for (int i = 0; i < g_onexit_n; ++i)
+    trt_call_guest((void*)(uintptr_t)g_onexit[i].fn,
+                   (u64)(uintptr_t)g_onexit[i].arg, 0, 0, 0);
+}
+u64 TRT_GUEST_ABI crt__onexit(u64 (*fn)(u64, void*), void* arg) {
+  if (!fn) return 0;
+  if (g_onexit_n == 0) atexit(&onexit_trampoline);
+  if (g_onexit_n >= 64) return 0;  // LIFO limit reached: report full
+  g_onexit[g_onexit_n++] = {fn, arg};
+  return (u64)(uintptr_t)fn;
+}
+
+i32 TRT_GUEST_ABI crt_strspn(const char* s, const char* accept) {
+  return s && accept ? (i32)strspn(s, accept) : 0;
+}
+
+// ---- narrow-float math (MinGW imports the f-variants from msvcrt) --------
+// 1:1 libm delegates; the Win64 calling convention passes floats in XMM
+// and returns in XMM0, which the host libm ABI matches directly.
+float TRT_GUEST_ABI crt_acosf(float x) { return acosf(x); }
+float TRT_GUEST_ABI crt_asinf(float x) { return asinf(x); }
+float TRT_GUEST_ABI crt_atanf(float x) { return atanf(x); }
+float TRT_GUEST_ABI crt_ceilf(float x) { return ceilf(x); }
+float TRT_GUEST_ABI crt_coshf(float x) { return coshf(x); }
+float TRT_GUEST_ABI crt_log10f(float x) { return log10f(x); }
+float TRT_GUEST_ABI crt_sinhf(float x) { return sinhf(x); }
+float TRT_GUEST_ABI crt_tanf(float x) { return tanf(x); }
+
 i32 TRT_GUEST_ABI crt_fprintf(void* gf, const char* fmt, ...) {
   char buf[1024];
   ms_va_list ap;
@@ -2703,6 +2875,24 @@ const trt_named_fn k_msvcrt_fns[] = {
     {"_fdopen",            (void*)&crt__fdopen},
     {"_read",              (void*)&crt__read},
     {"_write",             (void*)&crt__write},
+    {"_close",             (void*)&crt__close},
+    {"_telli64",           (void*)&crt__telli64},
+    {"_wfullpath",         (void*)&crt__wfullpath},
+    {"_wopen",             (void*)&crt__wopen},
+    {"_wutime64",          (void*)&crt__wutime64},
+    {"_fpreset",           (void*)&crt__fpreset},
+    {"_localtime64",       (void*)&crt__localtime64},
+    {"_onexit",            (void*)&crt__onexit},
+    {"strspn",             (void*)&crt_strspn},
+    // float math: MinGW imports the narrow-float variants from msvcrt
+    {"acosf",              (void*)&crt_acosf},
+    {"asinf",              (void*)&crt_asinf},
+    {"atanf",              (void*)&crt_atanf},
+    {"ceilf",              (void*)&crt_ceilf},
+    {"coshf",              (void*)&crt_coshf},
+    {"log10f",             (void*)&crt_log10f},
+    {"sinhf",              (void*)&crt_sinhf},
+    {"tanf",               (void*)&crt_tanf},
     {"_lseeki64",          (void*)&crt__lseeki64},
     {"_filelengthi64",     (void*)&crt__filelengthi64},
     {"_chsize",            (void*)&crt__chsize},

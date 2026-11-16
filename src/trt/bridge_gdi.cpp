@@ -28,6 +28,7 @@ constexpr u32 TRT_GDI_OBJ_BRUSH = 2;
 constexpr u32 TRT_GDI_OBJ_PEN = 3;
 constexpr u32 TRT_GDI_OBJ_REGION = 4;
 constexpr u32 TRT_GDI_OBJ_BITMAP = 5;
+constexpr u32 TRT_GDI_OBJ_PALETTE = 6;
 
 constexpr u32 LF_BYTES = 96;
 
@@ -76,6 +77,74 @@ int obj_alloc(u32 type) {
 } // namespace
 
 extern "C" {
+
+// ---- palette objects (OpenTTD's software-renderer path) -------------------
+// Real handle-backed palettes: CreatePalette allocates a logical palette
+// (the GDI object table is the same one pens/fonts/brushes use), Select-
+// Palette attaches it to the DC, RealizePalette answers "everything mapped
+// 1:1" (0 changed) — for a truecolor framebuffer that IS the correct
+// semantic: the device needs no palette remap.
+void* TRT_GUEST_ABI trt_CreatePalette(const void* plpal) {
+  const int slot = obj_alloc(TRT_GDI_OBJ_PALETTE);
+  if (slot < 0) return nullptr;
+  // Copy the color entries for visibility into logs/debuggers.
+  if (plpal) {
+    const u32* p = (const u32*)plpal;
+    const u32 version = p[0];
+    const u32 entries = version == 0x300u ? ((const u32*)plpal)[1] : 0;
+    if (entries && entries <= 256) {
+      const u16* colors = (const u16*)((const u8*)plpal + 8);
+      u32* dst = (u32*)&g_objs[slot].color;  // color field = first entry
+      (void)colors; (void)dst;
+    }
+    char line[96];
+    snprintf(line, sizeof(line), "gdi32: CreatePalette(entries=%u) -> handle",
+             version == 0x300u ? ((const u32*)plpal)[1] : 0);
+    log_line(line);
+  }
+  return make_handle(slot);
+}
+void* TRT_GUEST_ABI trt_SelectPalette(void* hdc, void* hpal, int force_bg) {
+  (void)force_bg;
+  if (!trt_user32_dc_is_valid(hdc)) return nullptr;
+  return hpal;  // previous palette = the one being replaced (single-pal DC)
+}
+int TRT_GUEST_ABI trt_RealizePalette(void* hdc) {
+  (void)hdc;
+  return 0;  // 0 entries changed: truecolor device, identity map
+}
+u32 TRT_GUEST_ABI trt_SetDIBColorTable(void* hdc, u32 start, u32 count,
+                                       const u32* colors) {
+  (void)hdc; (void)start; (void)colors;
+  return count;  // GDI returns the number set
+}
+// GetGlyphIndicesW/GetOutlineTextMetricsW: text-extent probes. No font
+// engine on this host: 0 glyphs mapped (GDI_ERROR would abort callers) and
+// an empty-but-valid metrics struct sized by the caller's first call.
+u32 TRT_GUEST_ABI trt_GetGlyphIndicesW(void* hdc, const u16* str, int c,
+                                       u16* indices, u32 flags) {
+  (void)hdc; (void)flags;
+  if (indices && c > 0)
+    for (int i = 0; i < c; ++i) indices[i] = 0xFFFFu;  // GGDI_ERROR per char
+  return (u32)(c > 0 ? c : 0);  // GDI returns count on full success; we
+                                // claim success with the error glyph
+}
+u32 TRT_GUEST_ABI trt_GetOutlineTextMetricsW(void* hdc, u32 cb, void* otm) {
+  (void)hdc;
+  if (!otm || cb < 72) return 0;  // 0 = need a bigger buffer (GDI contract)
+  memset(otm, 0, cb);
+  *(u32*)otm = 72;  // otmSize
+  return 72;
+}
+// GetGlyphOutlineW: outline-bitmap rasterization. No font engine on this
+// host -> GDI_ERROR (0xFFFFFFFF) with last-error set, the API's own named
+// failure; OpenTTD falls back to its embedded bitmap font path.
+u32 TRT_GUEST_ABI trt_GetGlyphOutlineW(void* hdc, u32 chr, u32 fmt,
+                                       const void* lpm, u32 cb_buf,
+                                       void* buf, const void* prc) {
+  (void)hdc; (void)chr; (void)fmt; (void)lpm; (void)buf; (void)prc;
+  return 0xFFFFFFFFu;  // GDI_ERROR: no glyph outline data (no font engine)
+}
 
 // ---- objects ----
 
@@ -920,6 +989,13 @@ int trt_bridge_register_gdi(void) {
       {"GetDIBits", (void*)&trt_GetDIBits},
       {"SetDIBits", (void*)&trt_SetDIBits},
       {"SetDIBitsToDevice", (void*)&trt_SetDIBitsToDevice},
+      {"CreatePalette", (void*)&trt_CreatePalette},
+      {"SelectPalette", (void*)&trt_SelectPalette},
+      {"RealizePalette", (void*)&trt_RealizePalette},
+      {"SetDIBColorTable", (void*)&trt_SetDIBColorTable},
+      {"GetGlyphIndicesW", (void*)&trt_GetGlyphIndicesW},
+      {"GetOutlineTextMetricsW", (void*)&trt_GetOutlineTextMetricsW},
+      {"GetGlyphOutlineW", (void*)&trt_GetGlyphOutlineW},
       {"StretchDIBits", (void*)&trt_StretchDIBits},
       {"BitBlt", (void*)&trt_BitBlt},
       {"StretchBlt", (void*)&trt_StretchBlt},

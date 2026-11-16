@@ -133,6 +133,12 @@ u32 TRT_GUEST_ABI imm_ImmGetIMEFileNameW(void* ctx, u16* buf, u32 len) {
   return 0;
 }
 
+// ImmGetProperty: no IME context on console -> property 0 (no features).
+u32 TRT_GUEST_ABI imm_ImmGetProperty(void* ctx, u32) {
+  (void)ctx;
+  return 0;
+}
+
 int TRT_GUEST_ABI imm_ImmSetCompositionFontW(void* ctx, const void* lplf) {
   (void)ctx; (void)lplf;
   return 0;
@@ -182,6 +188,7 @@ int trt_bridge_register_imm32(void) {
       {"ImmGetCandidateListCountW", (void*)&imm_ImmGetCandidateListCountW},
       {"ImmGetIMEFileNameA", (void*)&imm_ImmGetIMEFileNameA},
       {"ImmGetIMEFileNameW", (void*)&imm_ImmGetIMEFileNameW},
+      {"ImmGetProperty", (void*)&imm_ImmGetProperty},
       {"ImmSetCompositionFontW", (void*)&imm_ImmSetCompositionFontW},
       {"ImmGetCompositionFontW", (void*)&imm_ImmGetCompositionFontW},
       {"ImmGetVirtualKey", (void*)&imm_ImmGetVirtualKey},

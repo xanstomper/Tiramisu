@@ -62,19 +62,26 @@ void mm_timer_fire(u32 id, u64 cb, u64 user) {
 }
 
 void mm_timer_thread(mm_timer* t, u32 period_ms, bool periodic) {
-  struct timespec next;
-  timespec_get(&next, TIME_UTC);
-  u64 ns = (u64)next.tv_sec * 1000000000ull + (u64)next.tv_nsec;
+  u64 ns = 0;
+  {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    ns = (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+  }
   const u64 period_ns = (u64)period_ms * 1000000ull;
   for (;;) {
     ns += period_ns;
-    next.tv_sec = ns / 1000000000ull;
-    next.tv_nsec = ns % 1000000000ull;
     struct timespec now;
     timespec_get(&now, TIME_UTC);
-    u64 now_ns = (u64)now.tv_sec * 1000000000ull + (u64)now.tv_nsec;
+    const u64 now_ns = (u64)now.tv_sec * 1000000000ull + (u64)now.tv_nsec;
+    // nanosleep wants a RELATIVE duration — the delta to the deadline,
+    // never the absolute timestamp (the first draft passed the epoch-
+    // second timestamp itself: the timer slept for ~1.7 billion seconds
+    // and never fired; caught by the guest_winmm 0x40/0x80 contract).
     if (ns > now_ns) {
-      struct timespec wait = {next.tv_sec, next.tv_nsec};
+      struct timespec wait;
+      wait.tv_sec = (time_t)((ns - now_ns) / 1000000000ull);
+      wait.tv_nsec = (long)((ns - now_ns) % 1000000000ull);
       int r;
       while ((r = nanosleep(&wait, &wait)) == -1 && errno == EINTR) {}
       if (r == -1) return;
@@ -105,6 +112,11 @@ u32 mm_timer_set(u32 period_ms, u64 cb, u64 user, u32 flags) {
     t->th = std::thread(mm_timer_thread, t, period_ms, periodic);
   } catch (...) {
     t->dead.store(1, std::memory_order_release);
+    char err[96];
+    snprintf(err, sizeof(err),
+             "winmm: timeSetEvent thread creation FAILED (errno=%d) -> 0",
+             errno);
+    trt_core_log(err);
     return 0;
   }
   // Win32 returns the opaque nonzero timer id (== TimeProc arg0).
@@ -288,6 +300,24 @@ u32 TRT_GUEST_ABI trt_midiInGetErrorTextA(u32 err, char* buf, u32 len) {
 // midiOutGetDevCapsW during its sound-backend sweep.
 u32 TRT_GUEST_ABI trt_midiOutGetDevCapsA(u64, void*, u32) { return 4; }  // MMSYSERR_BADDEVICEID
 u32 TRT_GUEST_ABI trt_midiOutGetDevCapsW(u64, void*, u32) { return 4; }
+
+// midiOutOpen: with 0 MIDI devices Windows returns MMSYSERR_BADDEVICEID (4)
+// and leaves the handle untouched — OpenTTD's device sweep treats that as
+// "no MIDI, use the next backend", exactly the console answer.
+u32 TRT_GUEST_ABI trt_midiOutOpen(u64* handle, u64, u64, u64, u32) {
+  if (handle) *handle = 0;
+  return 4;  // MMSYSERR_BADDEVICEID
+}
+// The rest of the midiOut family on a no-device host: every handle-based
+// call answers MMSYSERR_BADDEVICEID (MMSYSERR_NOCANDO for prepare/unprepare
+// is 6; BADDEVICEID 4 is what a NULL/closed handle produces and is what
+// callers test for after a failed open).
+u32 TRT_GUEST_ABI trt_midiOutClose(u64) { return 4; }
+u32 TRT_GUEST_ABI trt_midiOutReset(u64) { return 4; }
+u32 TRT_GUEST_ABI trt_midiOutShortMsg(u64, u32) { return 4; }
+u32 TRT_GUEST_ABI trt_midiOutLongMsg(u64, void*, u32) { return 4; }
+u32 TRT_GUEST_ABI trt_midiOutPrepareHeader(u64, void*, u32) { return 4; }
+u32 TRT_GUEST_ABI trt_midiOutUnprepareHeader(u64, void*, u32) { return 4; }
 u32 TRT_GUEST_ABI trt_midiOutGetErrorTextA(u32 err, char* buf, u32 len) {
   (void)err;
   if (buf && len > 0) buf[0] = 0;
@@ -341,6 +371,13 @@ int trt_bridge_register_winmm(void) {
       {"midiOutGetDevCapsW", (void*)&trt_midiOutGetDevCapsW},
       {"midiOutGetErrorTextA", (void*)&trt_midiOutGetErrorTextA},
       {"midiOutGetErrorTextW", (void*)&trt_midiOutGetErrorTextW},
+      {"midiOutOpen", (void*)&trt_midiOutOpen},
+      {"midiOutClose", (void*)&trt_midiOutClose},
+      {"midiOutReset", (void*)&trt_midiOutReset},
+      {"midiOutShortMsg", (void*)&trt_midiOutShortMsg},
+      {"midiOutLongMsg", (void*)&trt_midiOutLongMsg},
+      {"midiOutPrepareHeader", (void*)&trt_midiOutPrepareHeader},
+      {"midiOutUnprepareHeader", (void*)&trt_midiOutUnprepareHeader},
       {"midiInGetNumDevs", (void*)&trt_midiInGetNumDevs},
       {"midiInOpen", (void*)&trt_midiInOpen},
       {"midiInClose", (void*)&trt_midiInHandleOp},

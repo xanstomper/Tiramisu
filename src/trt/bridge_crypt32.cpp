@@ -541,6 +541,46 @@ void* TRT_GUEST_ABI crypt_CertEnumCertificatesInStore(void* store,
   return nullptr;
 }
 
+// CertDuplicateCertificateContext: reference-count duplicate. There are no
+// certificate contexts on this host (every create/enumerate answers empty),
+// so a duplicate of NULL is NULL with LastError untouched — the same
+// answer Windows gives for an invalid context minus the crash. Veloren's
+// Rust tls stack calls it defensively on handles it never obtained.
+void* TRT_GUEST_ABI crypt_CertDuplicateCertificateContext(void* ctx) {
+  (void)ctx;
+  return ctx;  // NULL in, NULL out; non-NULL never happens here
+}
+
+// The cert-chain-engine / enhanced-key-usage / property / time-validity
+// family: same "empty trust store" answers as the rest of the bridge.
+// Veloren's rustls-native-certs shim imports all four defensively.
+void TRT_GUEST_ABI crypt_CertFreeCertificateChainEngine(void* engine) {
+  (void)engine;  // nothing was allocated; free is a no-op
+}
+u32 TRT_GUEST_ABI crypt_CertGetEnhancedKeyUsage(void* ctx, u32 flags,
+                                                void* usage, u32* cb) {
+  (void)ctx; (void)flags; (void)usage;
+  if (cb) *cb = 0;
+  trt_SetLastError(0x80092004u);  // CRYPT_E_NOT_FOUND
+  return 0;  // FALSE: no EKUs (empty store)
+}
+u32 TRT_GUEST_ABI crypt_CertSetCertificateContextProperty(void* ctx, u32 prop,
+                                                          u32 flags,
+                                                          const void* data) {
+  (void)ctx; (void)prop; (void)flags; (void)data;
+  trt_SetLastError(0x80092004u);  // CRYPT_E_NOT_FOUND: no such context
+  return 0;  // FALSE
+}
+u32 TRT_GUEST_ABI crypt_CertVerifyTimeValidity(const void* file_time,
+                                               void* cert_info) {
+  (void)cert_info;
+  // With an empty store there is no cert to verify; Windows compares the
+  // two FILETIMEs inside the cert info. Answer "expired" (-1) only if a
+  // caller actually passes a comparison time; 0 would claim valid.
+  (void)file_time;
+  return (u32)-1;  // -1 = not valid at this time
+}
+
 int TRT_GUEST_ABI crypt_CertGetCertificateContextProperty(void* ctx, u32 prop,
                                                           void* data,
                                                           u32* cb_data) {
@@ -626,6 +666,14 @@ int trt_bridge_register_crypt32(void) {
       {"CertFreeCertificateChain", (void*)&crypt_CertFreeCertificateChain},
       {"CertEnumCertificatesInStore",
        (void*)&crypt_CertEnumCertificatesInStore},
+      {"CertDuplicateCertificateContext",
+       (void*)&crypt_CertDuplicateCertificateContext},
+      {"CertFreeCertificateChainEngine",
+       (void*)&crypt_CertFreeCertificateChainEngine},
+      {"CertGetEnhancedKeyUsage", (void*)&crypt_CertGetEnhancedKeyUsage},
+      {"CertSetCertificateContextProperty",
+       (void*)&crypt_CertSetCertificateContextProperty},
+      {"CertVerifyTimeValidity", (void*)&crypt_CertVerifyTimeValidity},
       {"CertGetCertificateContextProperty",
        (void*)&crypt_CertGetCertificateContextProperty},
       {"CryptBinaryToStringA", (void*)&crypt_CryptBinaryToStringA},

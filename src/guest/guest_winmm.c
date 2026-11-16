@@ -76,23 +76,34 @@ u32 GSTD guest_winmm_main(u64 a, u64 b, u64 c) {
 
   // 6. multimedia timers: one-shot fires the guest callback from a host
   //    thread (through the same trt_call_guest gate CreateThread uses —
-  //    this is the exact contract OpenTTD's scheduler lives on).
+  //    this is the exact contract OpenTTD's scheduler lives on). The wait
+  //    is a timeGetTime deadline (500ms), NOT an iteration count: spins
+  //    vary 10x across hosts and the old fixed count expired before the
+  //    20ms timer fired.
   const u32 one = timeSetEvent(20, 10, (void*)&mm_timer_cb, 0x1234u, 0x0000u);
   if (one) {
-    for (volatile int i = 0; i < 5000000 && g_fire_count == 0; ++i) {}
+    const u32 t0 = timeGetTime();
+    while (g_fire_count == 0 && (u32)(timeGetTime() - t0) < 500u) {}
     if (g_fire_count >= 1) bits |= 0x40u;
     timeKillEvent(one);
   }
 
-  // 7. periodic timer: count advances while live, freezes after kill
+  // 7. periodic timer: count advances while live, freezes after kill.
+  //    Sampled over real 120ms windows (timeGetTime), so the count is
+  //    nonzero by construction if the thread actually runs.
   g_fire_count = 0;
   const u32 per = timeSetEvent(30, 10, (void*)&mm_timer_cb, 0x5678u, 0x0001u);
   if (per) {
-    for (volatile int i = 0; i < 3000000; ++i) {}
+    const u32 t1 = timeGetTime();
+    while ((u32)(timeGetTime() - t1) < 120u) {}
     const u32 during = g_fire_count;
     timeKillEvent(per);
     const u32 after = g_fire_count;
-    for (volatile int i = 0; i < 5000000; ++i) {}
+    const u32 t2 = timeGetTime();
+    while ((u32)(timeGetTime() - t2) < 120u) {}
+    // allow <= 1 in-flight fire at kill time (a thread already past its
+    // dead-check completes its callback); anything more means the kill
+    // did not stop the schedule.
     if (during >= 1 && g_fire_count - after <= 1) bits |= 0x80u;
   }
 

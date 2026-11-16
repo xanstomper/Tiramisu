@@ -197,6 +197,7 @@ int trt_bridge_register_iphlpapi(void);
 int trt_bridge_register_imm32(void);
 int trt_bridge_register_crypt32(void);
 int trt_bridge_register_dbghelp(void);
+int trt_bridge_register_dstorage(void);
 // UTF-16 -> UTF-8 helper (paths, strings)
 int trt_utf16_to_utf8(const u16* in, char* out, size_t out_cap);
 // the bytes behind a guest file handle (the memory-mapping bridge)

@@ -196,6 +196,37 @@ void* TRT_GUEST_ABI ole_CoTaskMemRealloc(void* p, u32 bytes) {
   return realloc(p, bytes);
 }
 void TRT_GUEST_ABI ole_CoTaskMemFree(void* p) { free(p); }
+
+// StringFromIID: allocates (CoTaskMemAlloc) the canonical "{...}" string
+// form of an IID. Veloren's Rust COM shim calls it for error text. Real
+// contract: S_OK + LPOLESTR (caller frees with CoTaskMemFree), or a null
+// arg E_POINTER... Windows actually documents NULL out -> E_POINTER, and
+// also accepts the pointer-out being preallocated (lplpsz non-null).
+static const char k_hex[16] = {'0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f'};
+i32 TRT_GUEST_ABI ole_StringFromIID(const void* riid, u16** out) {
+  if (!riid || !out) return (i32)0x80004003u;  // E_POINTER
+  const u8* g = (const u8*)riid;
+  // IID is LE GUID: Data1(u32) Data2(u16) Data3(u16) Data4[8]
+  char s[40];
+  int p = 0;
+  s[p++] = '{';
+  for (int i = 3; i >= 0; --i) { s[p++] = k_hex[(g[i] >> 4) & 15]; s[p++] = k_hex[g[i] & 15]; }
+  s[p++] = '-';
+  for (int i = 1; i >= 0; --i) { s[p++] = k_hex[(g[4 + i] >> 4) & 15]; s[p++] = k_hex[g[4 + i] & 15]; }
+  s[p++] = '-';
+  for (int i = 1; i >= 0; --i) { s[p++] = k_hex[(g[6 + i] >> 4) & 15]; s[p++] = k_hex[g[6 + i] & 15]; }
+  s[p++] = '-';
+  for (int i = 0; i < 2; ++i) { s[p++] = k_hex[(g[8 + i] >> 4) & 15]; s[p++] = k_hex[g[8 + i] & 15]; }
+  s[p++] = '-';
+  for (int i = 0; i < 6; ++i) { s[p++] = k_hex[(g[10 + i] >> 4) & 15]; s[p++] = k_hex[g[10 + i] & 15]; }
+  s[p++] = '}';
+  s[p] = 0;
+  u16* w = (u16*)ole_CoTaskMemAlloc((u32)((p + 1) * 2));
+  if (!w) return (i32)0x8007000Eu;  // E_OUTOFMEMORY
+  for (int i = 0; i <= p; ++i) w[i] = (u16)(u8)s[i];
+  *out = w;
+  return 0;  // S_OK
+}
 u32 TRT_GUEST_ABI ole_CoTaskMemSize(void* p) {
   (void)p;
   return 0;  // Windows answers the alloc size; nothing depends on it here
@@ -693,6 +724,7 @@ int trt_bridge_register_ole(void) {
       {"CoGetClassObject", (void*)&ole_CoGetClassObject},
       {"CoGetApartmentType", (void*)&ole_CoGetApartmentType},
       {"CoTaskMemAlloc", (void*)&ole_CoTaskMemAlloc},
+      {"StringFromIID", (void*)&ole_StringFromIID},
       {"CoTaskMemRealloc", (void*)&ole_CoTaskMemRealloc},
       {"CoTaskMemFree", (void*)&ole_CoTaskMemFree},
       {"CoTaskMemSize", (void*)&ole_CoTaskMemSize},
