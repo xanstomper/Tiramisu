@@ -27,8 +27,10 @@
 // Unwinder readability probe (page_readable): process_vm_readv EFAULT
 // mapped-check (see comment at the probe for why not write()/dev/null).
 #include <errno.h>
+#if !defined(_WIN32)
 #include <sys/uio.h>
 #include <unistd.h>
+#endif
 #include "bridge_openal.h"
 #include "bridge_ole.h"
 #include "bridge_shell.h"
@@ -3937,6 +3939,19 @@ namespace {
 // the user buffer, so unmapped pages "passed" the probe and still SIGSEGV'd
 // at the first ui[0] dereference; caught by the test_unwind_safety
 // regression and confirmed in the disassembly.)
+#if defined(_WIN32)
+bool page_readable(const void* p) {
+  // UWP host: VirtualQuery is the equivalent mapped-page check — a committed
+  // readable page (MEM_COMMIT + any read flag) proves readability without
+  // touching the memory.
+  MEMORY_BASIC_INFORMATION mbi{};
+  return VirtualQuery(p, &mbi, sizeof(mbi)) != 0 &&
+         mbi.State == MEM_COMMIT &&
+         (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                         PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                         PAGE_EXECUTE_WRITECOPY));
+}
+#else
 bool page_readable(const void* p) {
   char scratch;  // probe writes 1 byte into this local
   struct iovec local { &scratch, 1 };
@@ -3950,6 +3965,7 @@ bool page_readable(const void* p) {
   errno = saved;
   return r >= 0;
 }
+#endif
 bool ptr_in_guest_image(const void* p) {
   if (!p) return false;
   const uintptr_t v = (uintptr_t)p;
@@ -4241,6 +4257,24 @@ u64 TRT_STDCALL trt_RtlVirtualUnwind(u32 handler_type, u64 image_base,
   return 0;
 #endif
 }
+
+// ---- Sprint 3 item 46: the last-chance unhandled-exception filter ---------
+// Shared state for BOTH EH halves (Linux SysV personality below and the
+// Windows native-Rtl half in the #else): SetUnhandledExceptionFilter stores
+// the guest filter; the terminal fatal path invokes it once with a Win64
+// EXCEPTION_POINTERS before terminating, and the UnhandledExceptionFilter
+// export consults it exactly as real Win32 does (return the filter's
+// verdict; EXCEPTION_CONTINUE_SEARCH with none stored).
+namespace {
+std::atomic<void*> g_unhandled_filter{nullptr};
+
+const char* eh_filter_verdict_name(i32 v) {
+  if (v == 1 /*EXCEPTION_EXECUTE_HANDLER*/) return "handled";
+  if (v == -1 /*EXCEPTION_CONTINUE_EXECUTION*/)
+    return "unhandled(continue-exec)";  // undefined per MSDN; treated as death
+  return "unhandled";
+}
+}  // namespace
 
 #if !defined(_WIN32) && defined(__x86_64__)
 static bool eh_trace_enabled() {
@@ -4835,20 +4869,7 @@ extern "C" int TRT_STDCALL trt_dispatch_win32_exception(void* ep) {
 
 // ---- Sprint 3 item 46: the last-chance unhandled-exception filter ---------
 // SetUnhandledExceptionFilter stores the guest filter; the terminal fatal path
-// (trt_raise_exception_sysv after the SEH walk finds no handler) invokes it
-// once with a Win64 EXCEPTION_POINTERS before terminating, and the
-// UnhandledExceptionFilter export consults it exactly as real Win32 does
 // (return the filter's verdict; EXCEPTION_CONTINUE_SEARCH with none stored).
-namespace {
-std::atomic<void*> g_unhandled_filter{nullptr};
-
-const char* eh_filter_verdict_name(i32 v) {
-  if (v == 1 /*EXCEPTION_EXECUTE_HANDLER*/) return "handled";
-  if (v == -1 /*EXCEPTION_CONTINUE_EXECUTION*/)
-    return "unhandled(continue-exec)";  // undefined per MSDN; treated as death
-  return "unhandled";
-}
-}  // namespace
 
 // Sprint 3 item 46: the terminal unhandled-exception path gives the stored
 // SetUnhandledExceptionFilter one look at the record before the runtime

@@ -24,6 +24,7 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <chrono>
 #include <vector>
 
 namespace {
@@ -62,30 +63,17 @@ void mm_timer_fire(u32 id, u64 cb, u64 user) {
 }
 
 void mm_timer_thread(mm_timer* t, u32 period_ms, bool periodic) {
-  u64 ns = 0;
-  {
-    struct timespec ts;
-    timespec_get(&ts, TIME_UTC);
-    ns = (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
-  }
-  const u64 period_ns = (u64)period_ms * 1000000ull;
+  auto deadline = std::chrono::steady_clock::now();
+  const auto period = std::chrono::milliseconds(period_ms);
   for (;;) {
-    ns += period_ns;
-    struct timespec now;
-    timespec_get(&now, TIME_UTC);
-    const u64 now_ns = (u64)now.tv_sec * 1000000000ull + (u64)now.tv_nsec;
-    // nanosleep wants a RELATIVE duration — the delta to the deadline,
-    // never the absolute timestamp (the first draft passed the epoch-
-    // second timestamp itself: the timer slept for ~1.7 billion seconds
-    // and never fired; caught by the guest_winmm 0x40/0x80 contract).
-    if (ns > now_ns) {
-      struct timespec wait;
-      wait.tv_sec = (time_t)((ns - now_ns) / 1000000000ull);
-      wait.tv_nsec = (long)((ns - now_ns) % 1000000000ull);
-      int r;
-      while ((r = nanosleep(&wait, &wait)) == -1 && errno == EINTR) {}
-      if (r == -1) return;
-    }
+    deadline += period;
+    // sleep_until the absolute steady-clock deadline: keeps the drift-free
+    // accumulate-to-deadline schedule AND works under the UCRT (which has
+    // no POSIX nanosleep — the clang-cl UWP host build failed to compile
+    // the old pair). History: the first draft passed the raw epoch-ns
+    // timestamp to nanosleep as its RELATIVE duration and the timer slept
+    // ~1.7 billion seconds (caught by the guest_winmm 0x40/0x80 contract).
+    std::this_thread::sleep_until(deadline);
     if (t->dead.load(std::memory_order_acquire)) return;
     mm_timer_fire(t->id, t->cb, t->user);
     if (t->dead.load(std::memory_order_acquire) || !periodic) return;

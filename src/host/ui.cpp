@@ -9,6 +9,7 @@
 #include <dxgi1_2.h>
 #include <stdint.h>
 
+#include "settings.h"
 #include "vendor/qrcodegen.h"
 
 #pragma comment(lib, "d2d1.lib")
@@ -264,6 +265,8 @@ void draw_sysinfo_overlay() {
   bbr->Release();
   text_out(g_small, 12, 10, g_w * 0.35f - 8, 20, g_sysinfo.c_str(), g_dim);
 }
+
+void draw_tabs(float m) {
   // three-screen tab strip: SHELF / SETTINGS / LOG — teal on the active tab
   const wchar_t* names[3] = {L"SHELF", L"SETTINGS", L"LIVE LOG"};
   const float tab_w = g_w * 0.115f, tab_h = g_h * 0.052f;

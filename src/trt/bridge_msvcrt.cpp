@@ -1879,7 +1879,11 @@ u16* TRT_GUEST_ABI crt__wfullpath(u16* abs_buf, const u16* rel_path,
     // Relative to the guest cwd: resolve through the VFS working dir by
     // prefixing, best-effort (getcwd on the host mirrors the guest cwd).
     char cwd[256];
+#ifdef _WIN32
+    if (!_getcwd(cwd, sizeof(cwd) - 4)) cwd[0] = 0;
+#else
     if (!getcwd(cwd, sizeof(cwd) - 4)) cwd[0] = 0;
+#endif
     size_t n = 0;
     for (; cwd[n] && n + 1 < sz; ++n) abs_buf[n] = (u16)(u8)cwd[n];
     if (n + 1 < sz) abs_buf[n++] = L'\\';
@@ -1929,8 +1933,15 @@ i32 TRT_GUEST_ABI crt__wutime64(i32 gfd, const void* times) {
   tv[1].tv_sec = (time_t)mod; tv[1].tv_nsec = 0;
   char proc[64];
   snprintf(proc, sizeof(proc), "/proc/self/fd/%d", hfd);
+#ifdef _WIN32
+  // UWP host: no /proc and no POSIX utimensat — fail visibly (ENOENT-ish)
+  // rather than pretending the timestamp was written.
+  (void)tv; (void)proc;
+  return set_errno_from_host(ENOENT);
+#else
   const int r = utimensat(AT_FDCWD, proc, tv, 0);
   return r == 0 ? 0 : set_errno_from_host(errno);
+#endif
 }
 
 void TRT_GUEST_ABI crt__fpreset(void) {
@@ -1948,7 +1959,11 @@ i64 TRT_GUEST_ABI crt__localtime64(const i64* timer) {
   if (!timer) return 0;
   const time_t tt = (time_t)*timer;
   struct tm tmv;
+#ifdef _WIN32
+  if (localtime_s(&tmv, &tt) != 0) return 0;
+#else
   if (!localtime_r(&tt, &tmv)) return 0;
+#endif
   g_tm.sec = tmv.tm_sec; g_tm.min = tmv.tm_min; g_tm.hour = tmv.tm_hour;
   g_tm.mday = tmv.tm_mday; g_tm.mon = tmv.tm_mon;
   g_tm.year = tmv.tm_year; g_tm.wday = tmv.tm_wday;

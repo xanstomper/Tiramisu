@@ -18,6 +18,11 @@
 #include <string.h>
 #include <sys/stat.h>
 
+// clang-cl/UCRT sys/stat.h does not define the POSIX mode-test macros.
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
+#endif
+
 namespace {
 
 char lower_ascii(char c) {
