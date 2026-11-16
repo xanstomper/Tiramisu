@@ -51,16 +51,19 @@
 - **Gaps:** UnityPlayer SEH unwind metadata validation (hardened, re-measure);
   DStorage DLLs excluded from minimal corpus.
 
-### OrTMM (OpenTyrian-mod, native C++ PE32+)
+### OrTMM (embedded CPython 3.13 app, PE32+)
 - **Status:** Tier C (offline) — named livelock, capped
-- **Engine:** Native C++ (non-Unity), DirectInput8 + bare ordinal imports
+- **Engine:** Embedded CPython 3.13 (python313.dll imports) — NOT Unity, NOT
+  a classic game engine; first Python-family corpus entry
 - **Depth:** CRT ✓ WINMAIN ✓ — enters an EH bounce livelock
-- **Notes:** First native-C++ (non-Unity) corpus entry. Boots through CRT +
-  WinMain, then a single (rip,fault) pair is "handled" forever — 14.5M
-  identical EH bounces. Fixed: per-thread bounce cap at 100k now terminates
-  with a named verdict instead of spinning. Re-measurement pending.
-- **Gaps:** EH bounce livelock root cause (rip=7e014aeefbe1, fault=0); likely
-  a guest fault handler that restores a faulting context incorrectly.
+- **Notes:** Boots through CRT + WinMain, then a single (rip,fault) pair is
+  "handled" forever — 14.5M identical EH bounces (measured). CPython's
+  signal-handling and exception machinery stress the EH path differently
+  than game engines; the 100k bounce cap now terminates with a named
+  verdict instead of spinning. Root cause of the identical (rip,fault)
+  reproduction: rip=7e014aeefbe1 fault=0 — a guest fault handler restoring
+  the faulting context without advancing PC.
+- **Gaps:** EH livelock root cause (Python signal handler restart semantics).
 
 ## Corpus load matrix (DLLs that map + seal cleanly)
 | PE | Status |
