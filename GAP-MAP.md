@@ -57,6 +57,36 @@ address — measured ehfix18 SIGSEGV). RACCOIN ladder: 7/7 REACHED. Go Next
 demo.exe also reports `UNITYMAIN2 CALLED: REACHED (IAT-probed)` — two real
 Unity games through the same gate.
 
+### 2026-11-16 (evening) — UWP host cross-build resurrected after 4 Linux-isms
+
+- **The host UI never compiled since the community-UX commit (3da09af):**
+  `draw_tabs()`'s function header was missing from the committed ui.cpp
+  (the Linux gate doesn't build the host UI, so nothing caught it —
+  build-host.sh had never been run on that wave). Restored the header;
+  added the missing `settings.h` include.
+- **main.cpp quick-menu scope rot:** the quick-menu branch referenced
+  `want_up/want_dn/want_go/b/pad_vm` after the launcher-nav block closed
+  its scope. Now recomputes from the same poll result; `qm_toggle` hoisted
+  so both Back+Start chord branches see it.
+- **UCRT portability fixes (Linux paths byte-identical):** S_ISREG macro
+  fallback; winmm timer thread moved from nanosleep to
+  `std::this_thread::sleep_until` (UCRT has no nanosleep; the drift-free
+  deadline schedule is preserved and the guest 0x40/0x80 contract was
+  re-proven on Linux after the rewrite — builds 20/21); msvcrt
+  _getcwd/localtime_s variants; _wutime64 fails visibly (ENOENT) on UWP
+  (no /proc, no utimensat); unwinder `page_readable` gains a VirtualQuery
+  Windows half alongside process_vm_readv; `g_unhandled_filter` hoisted
+  above both EH halves so SetUnhandledExceptionFilter links in the
+  Windows native-Rtl half.
+- **Result:** `out/layout/tiramisu.exe` (3.1 MB) with
+  `DllCharacteristics 0x9160` = APPCONTAINER | NX_COMPAT | DYNAMIC_BASE |
+  HIGH_ENTROPY_VA — a real AppContainer UWP image, cross-built from Linux.
+  Discipline note: run `tools/build-host.sh` (the UWP profile) after ANY
+  commit that touches host UI or runtime headers — the Linux gate cannot
+  see UCRT compile errors, and shared-tree commits that never compiled
+  host-side are indistinguishable from working ones until the cross-build
+  runs.
+
 ### 2026-11-16 (later still) — full unresolved-list sweep; all 8 families load; 3 of 4 new families boot
 
 - **Corpus gate: 23 ok / 0 LOAD FAILED** (build17). OpenTTD boots through
