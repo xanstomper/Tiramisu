@@ -955,8 +955,15 @@ int main(int argc, char** argv) {
         const int code = WEXITSTATUS(st);
         if (code == 0) ++n_ok;
         else if (code == 42) {
-          printf("BOOT FAILED %s: guest fault/hang backstop (exit 42)\n", name);
-          ++n_failed;
+          // exit 42 = the named-fault report fired. The ring holds either a
+          // hardware-fault discovery artifact or the ehfix livelock's named
+          // verdict ("ehfix: BOUNCE-LIVELOCK cap hit ... named verdict" +
+          // "signal: SIGABRT"). Both are NAMED outcomes: the report IS the
+          // work item. Classify by what the ring's last verdict line says.
+          printf("BOOT-NAMED %s: named report fired (exit 42; ring above "
+                 "holds the verdict — ehfix bounce-cap = known livelock "
+                 "class, everything else = discovery artifact)\n", name);
+          ++n_failed;  // still not a boot; but the report is named
         } else if (code == 43) {
           printf("BOOT FAILED %s: watchdog exit 43\n", name);
           ++n_failed;
