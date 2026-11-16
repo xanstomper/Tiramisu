@@ -78,6 +78,43 @@
 | Ultra Pool game.exe | Boots (see above) |
 | OrTMM.exe | Boots to EH livelock (see above) |
 | Go Next demo.exe | Boots to UnityMain2 (see above) |
+| openttd.exe (15.3, MinGW) | Boots: CRT-STARTUP → WinMain → window created → clean ExitProcess(1) (no MIDI/font engine on host — named gap, degrades to stdio sound path) |
+| cataclysm-bn-tiles.exe (0.13.0, 632MB) | Loads (all imports bound); boots to named EH bounce-cap at rip=1437258d1 (all-zero GPRs: its C++ throw machinery) |
+| veloren-voxygen.exe (weekly, Rust+wgpu) | Boots: CRT-STARTUP → WinMain entered → clean ExitProcess(2) (its own named exit before first wgpu surface request) |
+| veloren-server-cli.exe (headless server) | Loads; import chain through libgcc_s/libstdc++/libwinpthread fully bound (msvcrt/bcryptprimitives/crypt32 fixes) |
+
+### Wave-2 engine-family entries (2026-11-16)
+- **OpenTTD 15.3 — Tier C+ (offline):** full boot through window creation with
+  60,268 unwind funcs registered via RtlAddFunctionTable; exits ExitProcess(1)
+  on its own named "no sound/font backend" path (the console host answers 0
+  MIDI devices and GDI_ERROR for outline glyphs — both the API's real no-device
+  contract). Multimedia timers (timeSetEvent/timeKillEvent) proven by the
+  guest_winmm 0xff contract: oneshot fires the guest TimeProc from a host
+  thread through trt_call_guest with the real timer id; timeKillEvent freezes
+  a periodic within ≤1 in-flight fire. Timer bug this wave: mm_timer_thread
+  passed the raw epoch-ns target to nanosleep (wants a relative delta) — the
+  thread slept ~1.7 billion seconds; caught by the 0x40/0x80 guest contract.
+- **Cataclysm-BN 0.13.0 — Tier C (offline):** heaviest PE in the corpus (632MB,
+  .text 0x39c554c); all imports bound (imm32 IME-filename, shell32 pickers,
+  gdi32 pixel-format/ICM added this wave). Boots into its C++ exception
+  machinery and hits the EH bounce cap with a named verdict
+  (rip=1437258d1, zeroed GPRs — a fault handler restoring context without
+  advancing PC, the same class as the OrTMM livelock). The abort path needs
+  the boot-depth harness to classify "signal 6 after a named ehfix verdict"
+  as BOOT-NAMED, not BOOT FAILED — report-format gap, tracked.
+- **Veloren (weekly) — Tier C (offline):** first Rust+wgpu engine in the
+  corpus. Load chain required: msvcrt printf/_ultoa/__C_specific_handler
+  (the SEH language handler is the SAME trt_C_specific_handler kernel32
+  exports — one implementation, two module exports), _close/_telli64/
+  _wfullpath/_wopen/_wutime64/_fpreset/_localtime64/_onexit/strspn + 8
+  narrow-float math (acosf…tanf), bcryptprimitives!ProcessPrng (Win10+
+  direct random, BOOL return — distinct ABI from BCryptGenRandom),
+  mmdevapi!ActivateAudioInterfaceAsync (UWP audio activation: creates the
+  REAL wasapi_client and fires ActivateCompleted slot 3 through
+  trt_call_guest), ole32!StringFromIID, crypt32 cert-chain family.
+  veloren-voxygen boots CRT → WinMain → ExitProcess(2) (its own named exit
+  before the first wgpu surface request — Vulkan/DX12 backend probe is the
+  next named gap).
 
 ## Native DLL overrides (Proton-style)
 

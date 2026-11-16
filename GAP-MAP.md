@@ -57,6 +57,55 @@ address — measured ehfix18 SIGSEGV). RACCOIN ladder: 7/7 REACHED. Go Next
 demo.exe also reports `UNITYMAIN2 CALLED: REACHED (IAT-probed)` — two real
 Unity games through the same gate.
 
+### 2026-11-16 (later still) — full unresolved-list sweep; all 8 families load; 3 of 4 new families boot
+
+- **Corpus gate: 23 ok / 0 LOAD FAILED** (build17). OpenTTD boots through
+  window creation (60,268 unwind funcs) → clean ExitProcess(1); Veloren
+  voxygen boots CRT → WinMain → clean ExitProcess(2); CDDA loads fully and
+  boots to the named EH bounce-cap (verdict named, harness classification
+  fixed the same session — see below).
+- **The import chains peeled one symbol per build** until the FULL
+  unresolved lists were pulled from the dry-run audits and fixed in one
+  pass (build16): 5 midiOut (Close/Reset/ShortMsg/LongMsg/Prepare/Unprepare
+  — no-device MMSYSERR_BADDEVICEID(4) answers), `ImmGetProperty` (0), 7
+  gdi32 (CreatePalette/SelectPalette/RealizePalette — real handle-backed
+  palette objects in the existing GDI object table, RealizePalette answers
+  0 changed = truecolor identity map; SetDIBColorTable; GetGlyphIndicesW/
+  GetOutlineTextMetricsW/GetGlyphOutlineW — no font engine: error glyph
+  0xFFFF, empty-but-valid metrics, GDI_ERROR for outline rasterization),
+  16 msvcrt (_close with fd-table detachment so a stale FILE gets EOF not
+  a use-after-close; _telli64; _wfullpath; _wopen with VFS + fd-table
+  integration; _wutime64 via /proc/self/fd utimensat; _fpreset no-op —
+  guest FPU state is per-thread host state; _localtime64 with guest tm
+  layout; _onexit through a captureless-trampoline atexit registry —
+  guest fn pointers must go through the guest-call gate even at process
+  exit; strspn; acosf/asinf/atanf/ceilf/coshf/log10f/sinhf/tanf 1:1
+  libm delegates), 4 crypt32 (CertFreeCertificateChainEngine no-op on
+  the empty store; CertGetEnhancedKeyUsage/CertSetCertificateContextProperty
+  CRYPT_E_NOT_FOUND; CertVerifyTimeValidity -1).
+- **winmm timer bug caught by the guest contract, not by inspection:**
+  mm_timer_thread passed the raw epoch-ns deadline to nanosleep, which
+  wants a RELATIVE delta — the timer thread slept ~1.7 billion seconds and
+  never fired. The guest PE's fixed iteration-count spins could never catch
+  it (they expired before the 20ms timer); the guest now waits on
+  timeGetTime deadlines (500ms oneshot / 120ms periodic windows). Suite
+  11/11 ALL PASS, guest returned 0xff: oneshot fires the guest TimeProc
+  from a host thread through trt_call_guest with the real timer id as
+  arg0; timeKillEvent freezes a periodic within ≤1 in-flight fire.
+- **CDDA false-negative fixed (report-format):** the ehfix livelock
+  terminator logs its named verdict THEN aborts; the corpus-run child
+  installed fault handlers for SEGV/ILL/BUS/FPE/TRAP but not SIGABRT, so
+  the parent classified the boot "died on signal 6 without the named
+  report" even though the ring held the verdict. SIGABRT now routes
+  through the same fault_report (ring dump + _exit(42)).
+- **Diagnosis discipline note:** the stale-archive trap hit twice this
+  wave (test_winmm binary from 01:05 predating the 14:49 archive; guest
+  .obj not recompiled after a .c edit). Verify binary freshness via
+  stat, not via which binary you THINK the build script rebuilt. And a
+  probe that calls a TRT_GUEST_ABI (ms_abi) runtime function through a
+  SysV declaration reads its args from the wrong registers — probe
+  declares must carry the same ABI as the runtime surface.
+
 ### 2026-11-16 (later) — corpus grows to 8 families; named-gap fixes
 
 - **Three new engine families staged** (all open-source, SHA-verified,

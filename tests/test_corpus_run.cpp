@@ -148,6 +148,7 @@ static void fault_report(int sig, siginfo_t* si, void* uctx_v) {
   const char* signame = sig == SIGSEGV ? "SIGSEGV"
                       : sig == SIGILL  ? "SIGILL"
                       : sig == SIGTRAP ? "SIGTRAP"
+                      : sig == SIGABRT ? "SIGABRT"
                                        : "SIGBUS";
 
   char buf[TRT_RING_LINE];
@@ -191,6 +192,13 @@ static void install_fault_handlers(void) {
   sigaction(SIGBUS, &sa, nullptr);
   sigaction(SIGFPE, &sa, nullptr);
   sigaction(SIGTRAP, &sa, nullptr);
+  // SIGABRT: the ehfix livelock-terminator aborts AFTER logging its named
+  // verdict ("ehfix: BOUNCE-LIVELOCK cap hit -> guest terminated with named
+  // verdict"). Without this the parent classifies the boot as "died on
+  // signal 6 without the named report" even though the ring holds the
+  // verdict — the CDDA false-negative. fault_report is a SA_SIGINFO handler
+  // (same union slot as sa_handler), so one registration covers both.
+  sigaction(SIGABRT, &sa, nullptr);
 }
 
 static void hang_kill(int, siginfo_t*, void* uctx_v) {
