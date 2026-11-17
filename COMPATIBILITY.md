@@ -27,7 +27,7 @@
   All shaders compile (maxFragmentInputComponents=128).
 - **Gaps:** None known. First candidate for sustained-play testing.
 
-### RACCOIN (Unity 6 IL2CPP, Steam)
+### RACCOIN (Unity 6 IL2CPP, Steam) — **FIRST-ON-CONSOLE TARGET**
 - **Status:** Tier B (offline, mock-d3d11) / Tier C (plain --exe)
 - **Engine:** Unity 6000.3.0f1, IL2CPP, DirectX 11
 - **Depth (mock-d3d11):** CRT ✓ WINMAIN ✓ UNITYMAIN2 ✓ WINDOW ✓ D3D11 ✓ PUMP ✓ QUIT ✓ EXIT(0) ✓
@@ -36,6 +36,18 @@
   Unity CrashReporter insights-crash-report.json write (CreateFileW fails on the
   CrashReporter dir — guest never calls CreateDirectoryW). Named gap.
 - **Gaps:** CrashReporter shutdown exception attribution; insights JSON write path.
+- **Target selection (2026-11-16):** promoted to first-on-console candidate.
+  Rationale: deepest-proven boot in the corpus (7/7 ladder, clean
+  self-shutdown), Unity-IL2CPP+D3D11 path matches built bridge surface, small
+  footprint (~524 MB disk; est. <1 GB RAM resident — comfortable under the
+  Series S ~4 GB app-cap worry, which M0 measures with this game first).
+- **PROVENANCE CAVEAT (blocks console deploy):** the corpus copy traces to a
+  warez release (`RACCOIN-CPR-SteamRIP.com.rar` in user Downloads). The boot
+  evidence above remains valid as runtime engineering, but per contract
+  (own-copy-only, no DRM-circumvented binaries) the game cannot deploy to
+  console or appear in the catalog until replaced with a legitimate Steam
+  download. Engineering evidence transfers 1:1 to the legit copy (same app,
+  same IL2CPP build — re-verify ladder after swap).
 
 ### Go Next! Demo (Unity 6 IL2CPP, Steam)
 - **Status:** Tier C (offline) — named blocker, active investigation
@@ -82,6 +94,40 @@
 | cataclysm-bn-tiles.exe (0.13.0, 632MB) | Loads (all imports bound); boots to named EH bounce-cap at rip=1437258d1 (all-zero GPRs: its C++ throw machinery) |
 | veloren-voxygen.exe (weekly, Rust+wgpu) | Boots: CRT-STARTUP → WinMain entered → clean ExitProcess(2) (its own named exit before first wgpu surface request) |
 | veloren-server-cli.exe (headless server) | Loads; import chain through libgcc_s/libstdc++/libwinpthread fully bound (msvcrt/bcryptprimitives/crypt32 fixes) |
+
+### Wave-1 candidate board (2026-11-16)
+
+First-on-console order (all DX11, 64-bit, Steam DRM only, no anti-cheat/Denuvo):
+
+| # | Game | Engine/API | Disk | RAM est. | Why |
+|---|------|-----------|------|----------|-----|
+| 1 | **RACCOIN** | Unity 6 IL2CPP / DX11 | ~524 MB | <1 GB | Deepest-proven boot (7/7 ladder); blocked only by provenance swap → buy legit copy |
+| 2 | **Stardew Valley** | MonoGame / DX11 | <1 GB | <1 GB | Lightest popular target; trivial 60 fps |
+| 3 | **Celeste** | MonoGame / DX11 | ~1.2 GB | <1 GB | Light, beloved, cheap |
+| 4 | **Hollow Knight** | Unity / DX11 | ~9 GB | 1–2 GB | Original Wave-1 pick; fits disk after cleanup |
+| 5 | **Cuphead** | Unity / DX11 | ~4 GB | 1–2 GB | Best traction-clip value |
+
+PC-only flagship candidate: **Dyson Sphere Program** (Unity IL2CPP / DX11,
+~4 GB) — free Steam demo gives a legitimate no-purchase first probe of the
+same proven path; demo boot gates full-game purchase.
+
+**Vulkan-gated (excluded until a Vulkan→D3D12 story exists):**
+- **BOTW via SavageWindRecomp** (4.6k★ static recomp, native x64, DRM-free,
+  BYO-dump legitimate) — renderer is Vulkan 1.3-only; no Tiramisu Vulkan
+  surface exists. Unlock paths (either): vkd3d-proton-class Vulkan→D3D12 shim
+  post-d3d12-lane-proof, or fork the MIT-licensed recomp and port its renderer
+  to D3D12 (weeks-scale, makes it a port rather than a Tiramisu win).
+  Cemu route additionally excluded (emulator guest class + Vulkan-only).
+- Decision recorded so this is not re-litigated. Revisit after sibling's
+  d3d12 lane is proven on console.
+
+**Wave-2 flagships (unchanged, in feasibility order):** Sekiro (DX11-only,
+60-capped, 25 GB, top pick — PCGamingWiki verified: no Denuvo, no AC,
+Havok/FMOD/Scaleform/Bink statically linked) > Witcher 3 classic (pin
+classic; next-gen update is DX12) > Kakarot (40 GB, avoid `-d3d12`) >
+Sparking! Zero (D3D12-only + framerate-tied = 60-or-nothing, last).
+RDR2 excluded (DX12/150 GB/12 GB RAM). All gated on: user ownership,
+disk cleanup (~60 GB free needed), Dev Mode creds, M0 memory measurement.
 
 ### Wave-2 engine-family entries (2026-11-16)
 - **OpenTTD 15.3 — Tier C+ (offline):** full boot through window creation with
