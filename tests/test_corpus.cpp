@@ -231,9 +231,10 @@ const console_dll k_console_dlls[] = {
     //      been converted (bridge_wininet/psapi/iphlpapi/imm32/crypt32/
     //      dbghelp) and LEFT this whitelist entirely, like comctl32/gdi32/
     //      shlwapi before them. The whitelist keeps ONLY P and U classes.
-    {"dstorage.dll", 'C'}, {"dstoragecore.dll", 'C'},  // GDK-class, the demo
-                            // ships its own copy anyway (game-dir search
-                            // hits first)
+    // dstorage/dstoragecore: converted to BUILTIN (bridge_dstorage) — the
+    // C->BUILTIN rule below. UnityPlayer 6 imports DStorageGetFactory even
+    // when the game does not ship the DLL, so a SYSTEM(C) route made the
+    // boot depend on unproven console presence.
     // NOTE: gdi32 / comctl32 / shlwapi are NOT here — desktop-shell DLLs,
     // console LoadLibrary fails in an AppContainer. They are BUILTIN
     // bridges now; whitelisting them would fake the bind.
