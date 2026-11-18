@@ -1509,6 +1509,10 @@ struct tiramisu_host
     longan::swapchain_bind_d3d9();
     trt_input_set_cursor_pos(static_cast<int>(sc.width / 2),
                              static_cast<int>(sc.height / 2));
+    try {
+      window.PointerCursor(
+          CoreCursor(CoreCursorType::Arrow, 0));
+    } catch (...) {}
 
     m_kd = window.KeyDown([](CoreWindow const&, KeyEventArgs const& a) {
       static bool logged = false;
@@ -1531,6 +1535,39 @@ struct tiramisu_host
       trt_input_key_event2(vk, false, (u16)s.ScanCode,
                            s.IsExtendedKey ? 1 : 0, 0);
     });
+    try {
+      m_aka = window.Dispatcher().AcceleratorKeyActivated(
+          [](CoreDispatcher const&, AcceleratorKeyEventArgs const& a) {
+            const auto et = a.EventType();
+            const bool down = (et == CoreAcceleratorKeyEventType::KeyDown ||
+                               et == CoreAcceleratorKeyEventType::SystemKeyDown);
+            const bool up = (et == CoreAcceleratorKeyEventType::KeyUp ||
+                             et == CoreAcceleratorKeyEventType::SystemKeyUp);
+            if (!down && !up) return;
+            const u16 raw_vk = static_cast<u16>(a.VirtualKey());
+            if (raw_vk == 0 || raw_vk >= TRT_MAX_VK) return;
+            if (raw_vk >= 195 && raw_vk <= 218) return;  // Xbox Gamepad VKs
+            const auto s = a.KeyStatus();
+            const u16 vk = disambiguate_modifier_vk(raw_vk, (u16)s.ScanCode,
+                                                    s.IsExtendedKey);
+            if (down) {
+              if (!trt_key_down(vk)) {
+                static bool logged = false;
+                if (!logged) {
+                  logged = true;
+                  longan::log_line("input: AcceleratorKeyActivated keydown received");
+                }
+                trt_input_key_event2(vk, true, (u16)s.ScanCode,
+                                     s.IsExtendedKey ? 1 : 0, s.WasKeyDown ? 1 : 0);
+              }
+            } else if (up) {
+              if (trt_key_down(vk)) {
+                trt_input_key_event2(vk, false, (u16)s.ScanCode,
+                                     s.IsExtendedKey ? 1 : 0, 0);
+              }
+            }
+          });
+    } catch (...) {}
     m_cr = window.CharacterReceived(
         [](CoreWindow const&, CharacterReceivedEventArgs const& a) {
           trt_input_char_event((u32)a.KeyCode());
@@ -1807,16 +1844,55 @@ struct tiramisu_host
 
   void Run() {
     g_ui_tid = GetCurrentThreadId();
-    CoreWindow::GetForCurrentThread().Activate();
+    auto window = CoreWindow::GetForCurrentThread();
+    window.Activate();
+    try {
+      window.PointerCursor(CoreCursor(CoreCursorType::Arrow, 0));
+    } catch (...) {}
+    namespace wdi = winrt::Windows::Devices::Input;
+    if (!m_mm) {
+      try {
+        if (const auto mouse = wdi::MouseDevice::GetForCurrentView()) {
+          m_mm = mouse.MouseMoved([](wdi::MouseDevice const&, wdi::MouseEventArgs const& a) {
+            if (!g_uwp_raw_mouse.exchange(true))
+              longan::log_line("input: physical relative mouse motion received");
+            const auto d = a.MouseDelta();
+            trt_input_mouse_delta_raw(static_cast<i32>(d.X), static_cast<i32>(d.Y));
+          });
+          longan::log_line("input: MouseDevice::GetForCurrentView bound after Activate");
+        }
+      } catch (...) {}
+    }
     if (!g_booted) { g_booted = true; boot_all(); }
 
     int mouse_vx = 960, mouse_vy = 540;
     while (!g_shutdown.load()) {
-      trt_input_frame_begin();
-      CoreWindow::GetForCurrentThread()
-          .Dispatcher()
-          .ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+      if (!g_guest_running.load()) trt_input_frame_begin();
+      window.Dispatcher().ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
       apply_web_controls();
+      {
+        using winrt::Windows::System::VirtualKey;
+        using winrt::Windows::UI::Core::CoreVirtualKeyStates;
+        static const VirtualKey k_mbtn_vk[5] = {
+            VirtualKey::LeftButton, VirtualKey::RightButton,
+            VirtualKey::MiddleButton, VirtualKey::XButton1,
+            VirtualKey::XButton2};
+        for (int btn = 0; btn < 5; ++btn) {
+          bool down = false;
+          try {
+            down = (window.GetAsyncKeyState(k_mbtn_vk[btn]) &
+                    CoreVirtualKeyStates::Down) == CoreVirtualKeyStates::Down;
+          } catch (...) {}
+          if (down) {
+            m_poll_buttons[btn] = true;
+            if (!trt_mouse_button(btn)) trt_input_mouse_button(btn, true);
+          } else if (m_poll_buttons[btn]) {
+            m_poll_buttons[btn] = false;
+            if (trt_mouse_button(btn)) trt_input_mouse_button(btn, false);
+            if (btn == 0) launcher_click();
+          }
+        }
+      }
 
       // ---- controller & keyboard launcher navigation ----
       XINPUT_STATE xs{};
@@ -2155,9 +2231,9 @@ struct tiramisu_host
                 g_mouse_mode = false;
               }
               trt_input_release_all();
-              // RACCOIN hides its native cursor. Its menu still needs a
-              // visible pointer on the console when using a physical mouse.
-              trt_input_reset_cursor_mode(_stricmp(want.c_str(), "raccoin") == 0);
+              // Always keep a visible, movable console cursor for all games
+              // unless the game actively pins ClipCursor to 1x1 for 3D mouselook.
+              trt_input_reset_cursor_mode(true);
               longan::webxfer_set_running_game(want);
               g_guest_running.store(true);
               const std::string exe = ge.exe;

@@ -221,6 +221,8 @@ static void post_mouse_move_locked() {
 }
 
 // ---------------- host feed ----------------
+extern "C" u32 TRT_STDCALL trt_MapVirtualKeyW(u32 code, u32 type);
+
 void trt_input_key_event(u16 vk, bool down) {
   trt_input_key_event2(vk, down, 0, 0, 0);
 }
@@ -228,6 +230,18 @@ void trt_input_key_event(u16 vk, bool down) {
 void trt_input_key_event2(u16 vk, bool down, u16 scan, u8 extended, u8 repeat) {
   if (vk >= TRT_MAX_VK) return;
   std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  if (!scan) {
+    if (g.scan[vk]) {
+      scan = g.scan[vk];
+      if (!extended) extended = g.extended[vk];
+    } else {
+      const u32 mv = trt_MapVirtualKeyW(vk, 4 /*MAPVK_VK_TO_VSC_EX*/);
+      if (mv) {
+        scan = (u16)(mv & 0xFFu);
+        if (!extended && (mv & 0xFF00u) == 0xE000u) extended = 1;
+      }
+    }
+  }
   const bool previous = g.down[vk] != 0;
   if (down && !previous) g.pressed[vk] = 1;
   g.down[vk] = down ? 1 : 0;
@@ -273,8 +287,7 @@ void trt_input_mouse_delta_raw(i32 dx, i32 dy) {
   g.mouse_init = true;
   // synthesize WM_INPUT for engines on the Raw Input path
   if (g.raw_mouse_reg) trt_raw_post_mouse(dx, dy, 0, 0);
-  if ((!g.cursor_hidden || g.cursor_force_visible) && (dx || dy))
-    post_mouse_move_locked();
+  if (dx || dy) post_mouse_move_locked();
 }
 
 void trt_input_set_cursor_pos(int x, int y) {
@@ -600,7 +613,7 @@ bool trt_cursor_snapshot(int* x, int* y) {
   *y = g.mouse_init ? g.my : (g.dh ? g.dh : 1080) / 2;
   const bool pinned = g_clip_active &&
       (g_clip_r - g_clip_l <= 1 || g_clip_b - g_clip_t <= 1);
-  return g.cursor_force_visible || (!g.cursor_hidden && !g.cursor_shape_hidden && !pinned);
+  return (g.cursor_force_visible || (!g.cursor_hidden && !g.cursor_shape_hidden)) && !pinned;
 }
 
 int trt_input_show_cursor(bool show) {
