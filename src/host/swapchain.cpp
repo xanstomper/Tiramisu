@@ -22,6 +22,7 @@
 #include <dxgi1_6.h>
 
 #include "settings.h"
+#include <atomic>
 #include <chrono>
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3d12.lib")
@@ -43,6 +44,7 @@ winrt::com_ptr<IDXGIFactory6> g_factory6;
 winrt::com_ptr<ID3D12Device> g_d3d12_device;
 winrt::com_ptr<IDXGISwapChain3> g_d3d12_swap;
 bool g_in_d3d12 = false;
+std::atomic<bool> g_pointer_kbm_active{false};
 unsigned g_w = 1280, g_h = 720;
 unsigned g_fl = D3D_FEATURE_LEVEL_11_0;
 
@@ -218,7 +220,7 @@ int TRT_GUEST_ABI get_d3d11_backbuffer(u32 index, const void* iid, void** out) {
 
 // Paint a small arrow on the presentation surface. ClearView writes just
 // these rectangles and leaves the guest's shaders and bindings intact.
-void draw_pointer(bool launcher) {
+void draw_pointer_impl(bool launcher) {
   if (!g_ctx || !g_rtv || !g_w || !g_h) return;
   int x, y;
   if (!trt_cursor_snapshot(&x, &y) && !launcher) return;
@@ -248,9 +250,14 @@ void draw_pointer(bool launcher) {
     }
   }
   const float black[4] = {0.015f, 0.015f, 0.015f, 1.f};
-  const float white[4] = {1.f, 1.f, 1.f, 1.f};
+  const float fill[4] = {
+      g_pointer_kbm_active.load() ? 0.13f : 1.f,
+      g_pointer_kbm_active.load() ? 0.83f : 1.f,
+      g_pointer_kbm_active.load() ? 0.93f : 1.f,
+      1.f,
+  };
   if (n_dark) g_ctx->ClearView(g_rtv.get(), black, dark, n_dark);
-  if (n_light) g_ctx->ClearView(g_rtv.get(), white, light, n_light);
+  if (n_light) g_ctx->ClearView(g_rtv.get(), fill, light, n_light);
 }
 
 void TRT_GUEST_ABI prepare_d3d11_present() {
@@ -260,7 +267,7 @@ void TRT_GUEST_ABI prepare_d3d11_present() {
     if (SUCCEEDED(g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), back.put_void())))
       g_ctx->CopyResource(back.get(), g_guest_backbuffer.get());
   }
-  draw_pointer(false);
+  draw_pointer_impl(false);
 }
 
 void publish_gpu_hooks() {
@@ -343,6 +350,11 @@ HRESULT create_d3d11_corewindow_swapchain() {
   return S_OK;
 }
 } // namespace
+
+void draw_pointer(bool launcher) { draw_pointer_impl(launcher); }
+void set_pointer_cursor_mode(bool kbm_active) {
+  g_pointer_kbm_active.store(kbm_active);
+}
 
 swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w) {
   swapchain_result r{};
@@ -484,7 +496,7 @@ void swapchain_present() {
     }
   }
   last_present = now;
-  draw_pointer(true);
+  draw_pointer_impl(true);
   g_swap->Present(vsync ? 1 : 0, 0);
 }
 

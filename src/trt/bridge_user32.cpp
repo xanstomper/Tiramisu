@@ -110,6 +110,8 @@ extern "C" void* trt_u32_windows(void) {
   return g_wins.empty() ? nullptr : (void*)g_wins.data();
 }
 extern "C" int* trt_u32_win_count(void) { return &g_win_count; }
+extern "C" i64 TRT_STDCALL trt_SetWindowLongPtrW(u64 hwnd, int idx, i64 value);
+extern "C" i64 TRT_STDCALL trt_GetWindowLongPtrW(u64 hwnd, int idx);
 
 i64 dispatch(u64 hwnd, u32 msg, u64 wp, i64 lp) {
   i64 proc = 0;
@@ -177,18 +179,21 @@ void* TRT_STDCALL trt_CreateWindowExW(u32 exstyle, const wchar_t* cls,
   u64 hwnd = 0;
   createstruct_w* cs_ptr = nullptr;
   const wchar_t* title_ptr = title;
+  bool sync_create = false;
   {
     std::lock_guard<std::mutex> lk(g_win_mu);
     if (g_wins.capacity() < 256) g_wins.reserve(256);
     const u64 target_atom = class_atom_from_arg(cls);
     i64 found_proc = 0;
     u64 found_atom = target_atom;
+    bool exact_class = false;
     for (size_t i = g_wins.size(); i > 0; --i) {
       const guest_window& gw = g_wins[i - 1];
       if (gw.handle == 0 && gw.proc &&
           (target_atom == 0 || gw.class_atom == target_atom)) {
         found_proc = gw.proc;
         found_atom = gw.class_atom;
+        exact_class = (target_atom != 0 && gw.class_atom == target_atom);
         break;
       }
     }
@@ -234,15 +239,24 @@ void* TRT_STDCALL trt_CreateWindowExW(u32 exstyle, const wchar_t* cls,
     cs_ptr->lpszClass = cls;
     cs_ptr->dwExStyle = exstyle;
     g_focus_window = (void*)(uintptr_t)hwnd;
+    sync_create = (exact_class && found_proc != 0 && param != nullptr);
   }
+
+  trt_SetWindowLongPtrW(hwnd, -16 /*GWL_STYLE*/, (i64)(i32)style);
+  trt_SetWindowLongPtrW(hwnd, -20 /*GWL_EXSTYLE*/, (i64)(i32)exstyle);
 
   char msg[96];
   snprintf(msg, sizeof(msg), "user32: CreateWindowExW -> hwnd=0x%llx",
            (unsigned long long)hwnd);
   log_line(msg);
-  trt_msg_post(0x0001, 0, (i64)(uintptr_t)cs_ptr);  // WM_CREATE
+  if (sync_create) {
+    dispatch(hwnd, 0x0081u /*WM_NCCREATE*/, 0, (i64)(uintptr_t)cs_ptr);
+    dispatch(hwnd, 0x0001u /*WM_CREATE*/, 0, (i64)(uintptr_t)cs_ptr);
+  } else {
+    trt_msg_post(0x0001, 0, (i64)(uintptr_t)cs_ptr);  // WM_CREATE
+  }
   trt_msg_post(0x0018, 1, 0);                        // WM_SHOWWINDOW
-  if (!parent && !(style & 0x40000000u /*WS_CHILD*/)) {
+  if (style != 0 && !parent && !(style & 0x40000000u /*WS_CHILD*/)) {
     // The console view already owns input focus. Deliver the activation
     // messages a desktop game receives for its foreground top-level window.
     trt_msg_post(0x001Cu /*WM_ACTIVATEAPP*/, 1, 0);
@@ -276,7 +290,7 @@ int TRT_STDCALL trt_UpdateWindow(void*) { return 1; }
 
 i64 TRT_STDCALL trt_DefWindowProcW(void* hwnd, u32 msg, u64 wp, i64 lp) {
   (void)hwnd; (void)wp; (void)lp;
-  return msg == 0x0010 ? 1 : 0;  // WM_CLOSE -> TRUE
+  return (msg == 0x0010u /*WM_CLOSE*/ || msg == 0x0081u /*WM_NCCREATE*/) ? 1 : 0;
 }
 
 void* TRT_STDCALL trt_GetActiveWindow(void);
@@ -452,8 +466,10 @@ i16 TRT_STDCALL trt_GetKeyState(int vk) { return trt_key_sync((u16)vk); }
 int TRT_STDCALL trt_GetKeyboardState(u8* state) {
   if (!state) return 0;
   memset(state, 0, TRT_MAX_VK);
-  for (int i = 0; i < TRT_MAX_VK; ++i)
-    if (trt_key_down((u16)i)) state[i] = 0x80;
+  for (int i = 0; i < TRT_MAX_VK; ++i) {
+    const i16 ks = trt_key_sync((u16)i);
+    state[i] = (u8)(((ks < 0) ? 0x80 : 0) | (ks & 0x01));
+  }
   return 1;
 }
 
@@ -640,7 +656,7 @@ extern "C" u32 trt_vk_to_char_ex(u32 vk, const u8* ks) {
   const bool alt = ks ? (((ks[0x12] | ks[0xA4] | ks[0xA5]) & 0x80) != 0)
                       : (trt_key_down(0x12) || trt_key_down(0xA4) ||
                          trt_key_down(0xA5));
-  const bool caps = ks ? ((ks[0x14] & 0x01) != 0) : false;
+  const bool caps = ks ? ((ks[0x14] & 0x01) != 0) : ((trt_key_sync(0x14) & 1) != 0);
   if (ctrl && !alt) {
     if (vk >= 'A' && vk <= 'Z') return vk - 'A' + 1;
     if (vk == 0xDB) return 0x1B;
@@ -963,8 +979,7 @@ int TRT_STDCALL trt_EndDialog(void* dlg, i64 result) {
 }
 
 void* TRT_STDCALL trt_GetWindowLongA(void* hwnd, int idx) {
-  (void)hwnd; (void)idx;
-  return nullptr;  // record windows carry no GWL_* data
+  return (void*)(uintptr_t)trt_GetWindowLongPtrW((u64)(uintptr_t)hwnd, idx);
 }
 
 i64 TRT_STDCALL trt_SetWindowTextW(void* hwnd, const u16* text) {

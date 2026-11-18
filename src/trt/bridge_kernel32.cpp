@@ -5309,11 +5309,14 @@ static LONG CALLBACK trt_win32_os_veh(PEXCEPTION_POINTERS ep) {
 
 // RaiseException: run registered guest VEHs first, then native OS RaiseException on UWP.
 void TRT_STDCALL trt_RaiseException(u32 code, u32 flags, u32 count, u64* args) {
-  char line[192];
-  snprintf(line, sizeof(line),
-           "kernel32: RaiseException(code=0x%08x flags=%u count=%u arg0=0x%llx)",
-           code, flags, count, count ? (unsigned long long)args[0] : 0ull);
-  boot_log(line);
+  static unsigned s_cpp_eh_logged = 0;
+  if (code != 0xe06d7363u || ++s_cpp_eh_logged <= 4) {
+    char line[192];
+    snprintf(line, sizeof(line),
+             "kernel32: RaiseException(code=0x%08x flags=%u count=%u arg0=0x%llx)",
+             code, flags, count, count ? (unsigned long long)args[0] : 0ull);
+    boot_log(line);
+  }
   if (trt_boot_raise_trap) { trt_boot_raise_trap(code); }
 #ifdef _WIN32
   std::vector<void*> vehs;

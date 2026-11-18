@@ -1525,6 +1525,7 @@ inline void hk_clear(u32 flags, u32 color, float z, u32 stencil, void*) {
 
 inline void hk_present(void*) {
   if (!g_rt.initialized || !g_rt.swap) return;
+  longan::draw_pointer(false);
   g_rt.swap->Present(1, 0);
 }
 

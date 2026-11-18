@@ -26,9 +26,11 @@
 #include <winrt/Windows.ApplicationModel.Core.h>
 #include <winrt/Windows.ApplicationModel.h>
 #include <winrt/Windows.Data.Json.h>
+#include <winrt/Windows.Devices.Enumeration.h>
 #include <winrt/Windows.Devices.Input.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Gaming.Input.h>
 #include <winrt/Windows.Networking.h>
 #include <winrt/Windows.Networking.Connectivity.h>
 #include <winrt/Windows.Storage.h>
@@ -36,6 +38,7 @@
 #include <winrt/Windows.System.h>
 #include <winrt/Windows.UI.Core.h>
 #include <winrt/Windows.UI.Input.h>
+#include <winrt/Windows.Devices.Input.h>
 #include <winrt/Windows.UI.ViewManagement.h>
 #include <winrt/Windows.Web.Http.h>
 
@@ -82,7 +85,13 @@ DWORD g_ui_tid = 0;
 std::thread g_guest_thread;
 std::string g_pending_launch;
 bool g_mouse_mode = false;
+bool g_kbd_mouse_mode = false;
 bool g_quick_menu_open = false;
+std::string g_control_code_cached;
+std::atomic<bool> g_f8_down{false};
+std::atomic<bool> g_f8_pressed{false};
+std::atomic<ULONGLONG> g_f8_edge_ms{0};
+std::atomic<bool> g_km_keys[256]{};
 bool g_booted = false;
 bool g_setup_done = false;      // first-run setup screen flag
 bool g_setup_active = false;    // currently showing the setup screen
@@ -204,13 +213,110 @@ int uwp_register_unwind(void* image_base, const void* pdata, u32 count) {
 void uwp_log(const char* line) { longan::log_line(line); }
 
 std::atomic<bool> g_uwp_raw_mouse{false};
+std::atomic<bool> g_interceptor_kbd_active{false};
 longan::native_gameinput g_native_input;
 bool g_input_focused = false;
 
 extern "C" u32 TRT_STDCALL trt_MapVirtualKeyW(u32 code, u32 type);
+extern "C" u32 trt_vk_to_char_ex(u32 vk, const u8* ks);
 
 bool launcher_key(u16 vk) {
   return trt_key_down(vk) || (trt_key_async(vk) & 1) != 0;
+}
+
+inline u16 normalize_numpad_vk(u16 vk, u16 scan, bool ext) {
+  switch (vk) {
+    case 0x60: case 0x61: case 0x62: case 0x63: case 0x64:
+    case 0x65: case 0x66: case 0x67: case 0x68: case 0x69:
+    case 0x6B: case 0x6D: case 0x6E:
+      return vk;
+    default:
+      break;
+  }
+  if (scan && !ext) {
+    switch (scan & 0xFFu) {
+      case 0x47: return 0x67;  // Numpad 7
+      case 0x48: return 0x68;  // Numpad 8
+      case 0x49: return 0x69;  // Numpad 9
+      case 0x4A: return 0x6D;  // Numpad -
+      case 0x4B: return 0x64;  // Numpad 4
+      case 0x4C: return 0x65;  // Numpad 5
+      case 0x4D: return 0x66;  // Numpad 6
+      case 0x4E: return 0x6B;  // Numpad +
+      case 0x4F: return 0x61;  // Numpad 1
+      case 0x50: return 0x62;  // Numpad 2
+      case 0x51: return 0x63;  // Numpad 3
+      case 0x52: return 0x60;  // Numpad 0
+      case 0x53: return 0x6E;  // Numpad .
+      default: break;
+    }
+  }
+  return vk;
+}
+
+inline bool is_numpad_cursor_vk(u16 nvk) {
+  switch (nvk) {
+    case 0x60: case 0x61: case 0x62: case 0x63: case 0x64:  // Numpad 0-4
+    case 0x65: case 0x66: case 0x67: case 0x68: case 0x69:  // Numpad 5-9
+    case 0x6B: case 0x6D: case 0x6E:                       // Numpad + / - / .
+      return true;
+    default:
+      return false;
+  }
+}
+
+inline bool is_f8_cursor_vk(u16 nvk) {
+  switch (nvk) {
+    case 0x25: case 0x26: case 0x27: case 0x28:  // Arrows
+    case 0x0D: case 0x20:                        // Enter / Space (LMB)
+    case 0xA3: case 0x5D:                        // RCtrl / Apps (RMB)
+    case 0x21: case 0x22:                        // PageUp / PageDown (Wheel)
+      return true;
+    default:
+      return false;
+  }
+}
+
+inline bool handle_host_cursor_key(u16 raw_vk, u16 scan, bool ext, bool down) {
+  if (raw_vk == 0x77 /*VK_F8*/) {
+    if (down) {
+      if (!g_f8_down.exchange(true)) {
+        const ULONGLONG now = GetTickCount64();
+        if (now - g_f8_edge_ms.load() >= 120) {
+          g_f8_edge_ms.store(now);
+          g_f8_pressed.store(true);
+        }
+      }
+    } else {
+      g_f8_down.store(false);
+    }
+    return true;
+  }
+  const u16 nvk = normalize_numpad_vk(raw_vk, scan, ext);
+  if (is_numpad_cursor_vk(nvk)) {
+    if (nvk < 256) g_km_keys[nvk].store(down);
+    return down || !trt_key_down(raw_vk);
+  }
+  if (!down && nvk < 256) g_km_keys[nvk].store(false);
+  if (g_kbd_mouse_mode && is_f8_cursor_vk(nvk)) {
+    if (down && nvk < 256) g_km_keys[nvk].store(true);
+    return down || !trt_key_down(raw_vk);
+  }
+  return false;
+}
+
+inline bool km_key_held(u16 vk) {
+  return (vk < 256 && g_km_keys[vk].load()) || trt_key_down(vk);
+}
+
+void refresh_control_hint() {
+  const std::string code_part = g_control_code_cached.empty()
+      ? std::string()
+      : ("  |  /controls " + g_control_code_cached);
+  const std::string text = g_kbd_mouse_mode
+      ? ("CURSOR ON (Cyan | F8: off | Arrows+Space | Numpad)" + code_part)
+      : ("F8: Cursor Mode | Numpad: Mouse" + code_part);
+  longan::ui_set_control_hint(u82ws(text));
 }
 
 inline u16 disambiguate_modifier_vk(u16 vk, u16 scan, bool ext) {
@@ -1481,6 +1587,7 @@ struct tiramisu_host
 
   void SetWindow(CoreWindow const& window) {
     m_window = window;
+    window.PointerCursor(CoreCursor(CoreCursorType::Arrow, 0));
     const auto sc = longan::swapchain_create(window);
     char line[256];
     snprintf(line, sizeof(line),
@@ -1525,6 +1632,7 @@ struct tiramisu_host
       const u16 vk = disambiguate_modifier_vk((u16)a.VirtualKey(),
                                               (u16)s.ScanCode,
                                               s.IsExtendedKey);
+      if (handle_host_cursor_key(vk, (u16)s.ScanCode, s.IsExtendedKey, true)) return;
       trt_input_key_event2(vk, true, (u16)s.ScanCode,
                            s.IsExtendedKey ? 1 : 0, s.WasKeyDown ? 1 : 0);
     });
@@ -1534,13 +1642,39 @@ struct tiramisu_host
       const u16 vk = disambiguate_modifier_vk((u16)a.VirtualKey(),
                                               (u16)s.ScanCode,
                                               s.IsExtendedKey);
+      if (handle_host_cursor_key(vk, (u16)s.ScanCode, s.IsExtendedKey, false)) return;
       trt_input_key_event2(vk, false, (u16)s.ScanCode,
                            s.IsExtendedKey ? 1 : 0, 0);
     });
     m_cr = window.CharacterReceived(
         [](CoreWindow const&, CharacterReceivedEventArgs const& a) {
-          if (g_native_input.keyboard_active()) return;
+          if (g_native_input.keyboard_active() || g_interceptor_kbd_active.load()) return;
           trt_input_char_event((u32)a.KeyCode());
+        });
+    m_pe = window.PointerEntered([](CoreWindow const&, PointerEventArgs const& a) {
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        char line[96];
+        std::snprintf(line, sizeof(line), "input: CoreWindow PointerEntered type=%u",
+                      static_cast<unsigned>(a.CurrentPoint().PointerDevice().PointerDeviceType()));
+        longan::log_line(line);
+      }
+    });
+    m_aka = window.Dispatcher().AcceleratorKeyActivated(
+        [](CoreDispatcher const&, AcceleratorKeyEventArgs const& a) {
+          const auto t = a.EventType();
+          const u16 vk = static_cast<u16>(a.VirtualKey());
+          if (vk >= 195 && vk <= 218) return;
+          static bool logged = false;
+          if (!logged) {
+            logged = true;
+            char line[96];
+            std::snprintf(line, sizeof(line),
+                          "input: AcceleratorKeyActivated type=%u vk=0x%x",
+                          static_cast<unsigned>(t), vk);
+            longan::log_line(line);
+          }
         });
     m_pp = window.PointerPressed([](CoreWindow const& sender,
                                     PointerEventArgs const& a) {
@@ -1574,7 +1708,28 @@ struct tiramisu_host
         logged = true;
         longan::log_line("input: physical pointer motion received");
       }
-      feed_core_pointer(sender, a.CurrentPoint().Position());
+      const auto point = a.CurrentPoint();
+      feed_core_pointer(sender, point.Position());
+      const auto properties = point.Properties();
+      const bool held[5] = {properties.IsLeftButtonPressed(),
+                            properties.IsRightButtonPressed(),
+                            properties.IsMiddleButtonPressed(),
+                            properties.IsXButton1Pressed(),
+                            properties.IsXButton2Pressed()};
+      for (unsigned button = 0; button < 5; ++button) {
+        if (trt_mouse_button(button) != held[button])
+          trt_input_mouse_button(button, held[button]);
+      }
+      static bool type_logged = false;
+      if (!type_logged) {
+        type_logged = true;
+        const auto type = point.PointerDevice().PointerDeviceType();
+        char line[96];
+        std::snprintf(line, sizeof(line),
+                      "input: physical pointer motion type=%u",
+                      static_cast<unsigned>(type));
+        longan::log_line(line);
+      }
     });
     m_pw = window.PointerWheelChanged([](CoreWindow const& sender,
                                          PointerEventArgs const& a) {
@@ -1602,21 +1757,6 @@ struct tiramisu_host
       }
     });
 
-    // Relative events reach the guest even when PointerMoved stops at a screen edge.
-    namespace wdi = winrt::Windows::Devices::Input;
-    try {
-      if (const auto mouse = wdi::MouseDevice::GetForCurrentView()) {
-        m_mm = mouse.MouseMoved([](wdi::MouseDevice const&, wdi::MouseEventArgs const& a) {
-          if (g_native_input.mouse_active()) return;
-          if (!g_uwp_raw_mouse.exchange(true))
-            longan::log_line("input: physical relative mouse motion received");
-          const auto d = a.MouseDelta();
-          trt_input_mouse_delta_raw(static_cast<i32>(d.X), static_cast<i32>(d.Y));
-        });
-      }
-    } catch (...) {
-      longan::log_line("input: CoreWindow pointer events active");
-    }
   }
 
   void apply_web_controls() {
@@ -1645,6 +1785,10 @@ struct tiramisu_host
           const u32 scan = trt_MapVirtualKeyW(vk, 4 /*MAPVK_VK_TO_VSC_EX*/);
           const bool repeat = down && m_web_keys[vk];
           m_web_keys[vk] = down;
+          if (handle_host_cursor_key(vk, static_cast<u16>(scan & 0xff),
+                                     (scan >> 8) != 0, down)) {
+            break;
+          }
           trt_input_key_event2(vk, down, static_cast<u16>(scan & 0xff),
                                (scan >> 8) != 0, repeat);
           break;
@@ -1656,6 +1800,8 @@ struct tiramisu_host
           trt_input_char_event(static_cast<u32>(event.first));
           break;
         case 'r':
+          g_f8_down.store(false);
+          for (auto& k : g_km_keys) k.store(false);
           for (unsigned i = 0; i < 5; ++i) {
             if (m_web_buttons[i]) trt_input_mouse_button(i, false);
             m_web_buttons[i] = false;
@@ -1703,8 +1849,9 @@ struct tiramisu_host
         break;
       case longan::ui_click_type::select_setting:
         if (hit.index >= 0 && hit.index < g_set_count) {
+          const bool same = (g_set_selected == hit.index);
           g_set_selected = hit.index;
-          if (g_set_rows[hit.index].is_bool && edit_setting_row(1))
+          if ((g_set_rows[hit.index].is_bool || same) && edit_setting_row(1))
             apply_settings_rows();
           longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
         }
@@ -1784,8 +1931,8 @@ struct tiramisu_host
     longan::log_line(line);
     longan::ui_set_qr(url);
     const auto code = longan::webxfer_control_code();
-    if (!url.empty() && !code.empty())
-      longan::ui_set_control_hint(L"PC controls: /controls   Code: " + u82ws(code));
+    if (!url.empty() && !code.empty()) g_control_code_cached = code;
+    refresh_control_hint();
     namespace wdi = winrt::Windows::Devices::Input;
     int keyboard = -1, mouse = -1;
     try { keyboard = wdi::KeyboardCapabilities().KeyboardPresent(); } catch (...) {}
@@ -1793,6 +1940,38 @@ struct tiramisu_host
     snprintf(line, sizeof(line), "input: Xbox device query keyboard=%d mouse=%d (-1 unavailable)",
              keyboard, mouse);
     longan::log_line(line);
+    try {
+      const auto pdevs = wdi::PointerDevice::GetPointerDevices();
+      snprintf(line, sizeof(line), "input: PointerDevices count=%u",
+               static_cast<unsigned>(pdevs.Size()));
+      longan::log_line(line);
+      for (const auto& pd : pdevs) {
+        const auto rc = pd.ScreenRect();
+        snprintf(line, sizeof(line), "input: PointerDevice type=%u integrated=%u rect=%.0fx%.0f",
+                 static_cast<unsigned>(pd.PointerDeviceType()),
+                 pd.IsIntegrated() ? 1u : 0u, rc.Width, rc.Height);
+        longan::log_line(line);
+      }
+    } catch (...) {
+      longan::log_line("input: PointerDevice::GetPointerDevices failed");
+    }
+    try {
+      const auto rgc = winrt::Windows::Gaming::Input::RawGameController::RawGameControllers();
+      snprintf(line, sizeof(line), "input: RawGameControllers count=%u",
+               static_cast<unsigned>(rgc.Size()));
+      longan::log_line(line);
+    } catch (...) {
+      longan::log_line("input: RawGameControllers failed");
+    }
+    try {
+      const auto hids = winrt::Windows::Devices::Enumeration::DeviceInformation::FindAllAsync(
+          L"System.Devices.InterfaceClassGuid:=\"{4D1E55B2-F16F-11CF-88CB-001111000030}\"").get();
+      snprintf(line, sizeof(line), "input: WinRT HID interfaces count=%u",
+               static_cast<unsigned>(hids.Size()));
+      longan::log_line(line);
+    } catch (...) {
+      longan::log_line("input: WinRT HID enum unavailable");
+    }
     const std::wstring url_step = url.empty() ? L"Transfer unavailable"
                                               : L"Transfer server ready";
     setup_steps({L"Storage ready", L"Direct3D 11 ready", L"Gamepads probed",
@@ -1837,11 +2016,31 @@ struct tiramisu_host
         m_ikd = m_keyboard_interceptor.KeyDown(
             [](wui::KeyboardDeliveryInterceptor const&, KeyEventArgs const& a) {
           const auto status = a.KeyStatus();
-          const u16 vk = disambiguate_modifier_vk((u16)a.VirtualKey(),
-                                                  (u16)status.ScanCode,
-                                                  status.IsExtendedKey);
-          trt_input_key_event2(vk, true, (u16)status.ScanCode,
-                               status.IsExtendedKey ? 1 : 0, status.WasKeyDown ? 1 : 0);
+          u16 scan = static_cast<u16>(status.ScanCode);
+          bool ext = status.IsExtendedKey;
+          const u16 raw_vk = static_cast<u16>(a.VirtualKey());
+          if (!scan) {
+            const u32 mv = trt_MapVirtualKeyW(raw_vk, 4 /*MAPVK_VK_TO_VSC_EX*/);
+            if (mv) {
+              scan = static_cast<u16>(mv & 0xFFu);
+              if ((mv & 0xFF00u) == 0xE000u) ext = true;
+            }
+          }
+          const u16 vk = disambiguate_modifier_vk(raw_vk, scan, ext);
+          g_interceptor_kbd_active.store(true);
+          g_native_input.notify_interceptor_key(vk);
+          g_native_input.notify_interceptor_key(raw_vk);
+          if (handle_host_cursor_key(vk, scan, ext, true)) {
+            a.Handled(true);
+            return;
+          }
+          trt_input_key_event2(vk, true, scan, ext ? 1 : 0, status.WasKeyDown ? 1 : 0);
+          const bool shortcut = trt_key_down(0x11) || trt_key_down(0x12);
+          if (!shortcut) {
+            const u32 ch = trt_vk_to_char_ex(vk, nullptr);
+            if (ch == '\b' || ch == '\t' || ch == '\r' || ch >= 32)
+              trt_input_char_event(ch);
+          }
           a.Handled(true);
           static bool logged = false;
           if (!logged) {
@@ -1852,11 +2051,25 @@ struct tiramisu_host
         m_iku = m_keyboard_interceptor.KeyUp(
             [](wui::KeyboardDeliveryInterceptor const&, KeyEventArgs const& a) {
           const auto status = a.KeyStatus();
-          const u16 vk = disambiguate_modifier_vk((u16)a.VirtualKey(),
-                                                  (u16)status.ScanCode,
-                                                  status.IsExtendedKey);
-          trt_input_key_event2(vk, false, (u16)status.ScanCode,
-                               status.IsExtendedKey ? 1 : 0, 0);
+          u16 scan = static_cast<u16>(status.ScanCode);
+          bool ext = status.IsExtendedKey;
+          const u16 raw_vk = static_cast<u16>(a.VirtualKey());
+          if (!scan) {
+            const u32 mv = trt_MapVirtualKeyW(raw_vk, 4 /*MAPVK_VK_TO_VSC_EX*/);
+            if (mv) {
+              scan = static_cast<u16>(mv & 0xFFu);
+              if ((mv & 0xFF00u) == 0xE000u) ext = true;
+            }
+          }
+          const u16 vk = disambiguate_modifier_vk(raw_vk, scan, ext);
+          g_interceptor_kbd_active.store(true);
+          g_native_input.notify_interceptor_key(vk);
+          g_native_input.notify_interceptor_key(raw_vk);
+          if (handle_host_cursor_key(vk, scan, ext, false)) {
+            a.Handled(true);
+            return;
+          }
+          trt_input_key_event2(vk, false, scan, ext ? 1 : 0, 0);
           a.Handled(true);
         });
         longan::log_line(m_keyboard_interceptor.IsInterceptionEnabledWhenInForeground()
@@ -1870,6 +2083,31 @@ struct tiramisu_host
     }
   }
 
+  void setup_mouse_device() {
+    namespace wdi = winrt::Windows::Devices::Input;
+    try {
+      m_mouse_device = wdi::MouseDevice::GetForCurrentView();
+      if (m_mouse_device) {
+        m_mm = m_mouse_device.MouseMoved(
+            [](wdi::MouseDevice const&, wdi::MouseEventArgs const& a) {
+          if (g_native_input.mouse_active()) return;
+          if (!g_uwp_raw_mouse.exchange(true))
+            longan::log_line("input: physical relative mouse motion received");
+          const auto d = a.MouseDelta();
+          trt_input_mouse_delta_raw(static_cast<i32>(d.X), static_cast<i32>(d.Y));
+        });
+        m_mouse_device_available = true;
+        longan::log_line("input: MouseDevice relative listener registered");
+      } else {
+        m_mouse_device_available = false;
+        longan::log_line("input: MouseDevice unavailable; CoreWindow pointer listener active");
+      }
+    } catch (...) {
+      m_mouse_device_available = false;
+      longan::log_line("input: MouseDevice registration failed; CoreWindow pointer listener active");
+    }
+  }
+
   void Run() {
     g_ui_tid = GetCurrentThreadId();
     auto active_window = CoreWindow::GetForCurrentThread();
@@ -1877,11 +2115,17 @@ struct tiramisu_host
     if (!g_booted) {
       g_booted = true;
       boot_all();
+      g_native_input.set_host_key_handler(&handle_host_cursor_key);
       g_native_input.open();
+      longan::set_pointer_cursor_mode(false);
     }
+    setup_mouse_device();
     longan::log_line(active_window.IsInputEnabled()
                          ? "input: CoreWindow initially enabled"
                          : "input: CoreWindow initially disabled");
+    longan::log_line(m_mouse_device_available
+                         ? "input: MouseDevice relative listener registered"
+                         : "input: MouseDevice unavailable; CoreWindow pointer listener active");
     enable_keyboard_interceptor();
 
     int mouse_vx = 960, mouse_vy = 540;
@@ -1938,18 +2182,118 @@ struct tiramisu_host
             }
           } else if (!want_lb) lb_btn = false;
         }
+        static bool km_was_lmb = false, km_was_rmb = false,
+                    km_was_mmb = false, alt_f4_was = false;
+        static int km_wheel_tick = 0;
+        static ULONGLONG km_last_ms = 0;
+        static float km_rem_x = 0.0f, km_rem_y = 0.0f;
+        const ULONGLONG km_now_ms = GetTickCount64();
+        const float km_dt = km_last_ms
+            ? std::min(0.05f, static_cast<float>(km_now_ms - km_last_ms) / 1000.0f)
+            : (1.0f / 60.0f);
+        km_last_ms = km_now_ms;
+        if (g_f8_pressed.exchange(false)) {
+          g_kbd_mouse_mode = !g_kbd_mouse_mode;
+          for (auto& k : g_km_keys) k.store(false);
+          km_rem_x = km_rem_y = 0.0f;
+          longan::set_pointer_cursor_mode(g_kbd_mouse_mode);
+          refresh_control_hint();
+          longan::log_line(g_kbd_mouse_mode ? "input: keyboard-mouse cursor mode ON (F8)"
+                                            : "input: keyboard-mouse cursor mode OFF (F8)");
+        }
+        {
+          const bool shift_held = trt_key_down(0x10 /*VK_SHIFT*/) ||
+                                  trt_key_down(0xA0) || trt_key_down(0xA1);
+          const bool ctrl_held = trt_key_down(0xA2 /*VK_LCONTROL*/) ||
+                                 (!g_kbd_mouse_mode && trt_key_down(0x11));
+          const float speed = shift_held ? 1100.0f : (ctrl_held ? 180.0f : 560.0f);
+          float sx = 0.0f, sy = 0.0f;
+          if (km_key_held(0x64 /*VK_NUMPAD4*/) || km_key_held(0x67 /*VK_NUMPAD7*/) ||
+              km_key_held(0x61 /*VK_NUMPAD1*/) ||
+              (g_kbd_mouse_mode && km_key_held(0x25 /*VK_LEFT*/)))
+            sx -= 1.0f;
+          if (km_key_held(0x66 /*VK_NUMPAD6*/) || km_key_held(0x69 /*VK_NUMPAD9*/) ||
+              km_key_held(0x63 /*VK_NUMPAD3*/) ||
+              (g_kbd_mouse_mode && km_key_held(0x27 /*VK_RIGHT*/)))
+            sx += 1.0f;
+          if (km_key_held(0x68 /*VK_NUMPAD8*/) || km_key_held(0x67 /*VK_NUMPAD7*/) ||
+              km_key_held(0x69 /*VK_NUMPAD9*/) ||
+              (g_kbd_mouse_mode && km_key_held(0x26 /*VK_UP*/)))
+            sy -= 1.0f;
+          if (km_key_held(0x62 /*VK_NUMPAD2*/) || km_key_held(0x61 /*VK_NUMPAD1*/) ||
+              km_key_held(0x63 /*VK_NUMPAD3*/) ||
+              (g_kbd_mouse_mode && km_key_held(0x28 /*VK_DOWN*/)))
+            sy += 1.0f;
+          if (sx != 0.0f || sy != 0.0f) {
+            const float diag = (sx != 0.0f && sy != 0.0f) ? 0.7071f : 1.0f;
+            km_rem_x += sx * diag * speed * km_dt;
+            km_rem_y += sy * diag * speed * km_dt;
+            const int dx = static_cast<int>(km_rem_x);
+            const int dy = static_cast<int>(km_rem_y);
+            km_rem_x -= static_cast<float>(dx);
+            km_rem_y -= static_cast<float>(dy);
+            if (dx || dy) trt_input_mouse_delta_raw(dx, dy);
+          } else {
+            km_rem_x = km_rem_y = 0.0f;
+          }
+
+          const bool lmb = km_key_held(0x60 /*VK_NUMPAD0*/) ||
+                           (g_kbd_mouse_mode &&
+                            (km_key_held(0x0D /*VK_RETURN*/) || km_key_held(0x20 /*VK_SPACE*/)));
+          const bool rmb = km_key_held(0x6E /*VK_DECIMAL*/) ||
+                           (g_kbd_mouse_mode &&
+                            (km_key_held(0xA3 /*VK_RCONTROL*/) || km_key_held(0x5D /*VK_APPS*/)));
+          const bool mmb = km_key_held(0x65 /*VK_NUMPAD5*/);
+          if (lmb != km_was_lmb) {
+            trt_input_mouse_button(0, lmb);
+            if (!lmb && !g_guest_running.load()) launcher_click();
+            km_was_lmb = lmb;
+          }
+          if (rmb != km_was_rmb) {
+            trt_input_mouse_button(1, rmb);
+            km_was_rmb = rmb;
+          }
+          if (mmb != km_was_mmb) {
+            trt_input_mouse_button(2, mmb);
+            km_was_mmb = mmb;
+          }
+          const bool wheel_up = km_key_held(0x6B /*VK_ADD*/) ||
+                                (g_kbd_mouse_mode && km_key_held(0x21 /*VK_PRIOR*/));
+          const bool wheel_dn = km_key_held(0x6D /*VK_SUBTRACT*/) ||
+                                (g_kbd_mouse_mode && km_key_held(0x22 /*VK_NEXT*/));
+          if (wheel_up) {
+            if (km_wheel_tick <= 0) { trt_input_wheel(120); km_wheel_tick = 10; }
+            else --km_wheel_tick;
+          } else if (wheel_dn) {
+            if (km_wheel_tick <= 0) { trt_input_wheel(-120); km_wheel_tick = 10; }
+            else --km_wheel_tick;
+          } else {
+            km_wheel_tick = 0;
+          }
+        }
+        const bool alt_f4 = g_guest_running.load() &&
+                            trt_key_down(0x12 /*VK_MENU*/) &&
+                            trt_key_down(0x73 /*VK_F4*/);
+        if (alt_f4 && !alt_f4_was) {
+          alt_f4_was = true;
+          request_guest_stop();
+        } else if (!alt_f4) {
+          alt_f4_was = false;
+        }
+
+        const bool km_lock = g_kbd_mouse_mode;
         const bool want_up = (b & XINPUT_GAMEPAD_DPAD_UP) ||
-                             launcher_key(0x26 /*VK_UP*/) || launcher_key('W');
+                             (!km_lock && (launcher_key(0x26 /*VK_UP*/) || launcher_key('W')));
         const bool want_dn = (b & XINPUT_GAMEPAD_DPAD_DOWN) ||
-                             launcher_key(0x28 /*VK_DOWN*/) || launcher_key('S');
+                             (!km_lock && (launcher_key(0x28 /*VK_DOWN*/) || launcher_key('S')));
         const bool want_lt = (b & XINPUT_GAMEPAD_DPAD_LEFT) ||
-                             launcher_key(0x25 /*VK_LEFT*/);
+                             (!km_lock && launcher_key(0x25 /*VK_LEFT*/));
         const bool want_rt = (b & XINPUT_GAMEPAD_DPAD_RIGHT) ||
-                             launcher_key(0x27 /*VK_RIGHT*/);
+                             (!km_lock && launcher_key(0x27 /*VK_RIGHT*/));
         const bool want_go = (b & XINPUT_GAMEPAD_A) ||
-                             launcher_key(0x0D /*VK_RETURN*/) ||
-                             launcher_key(0x20 /*VK_SPACE*/);
-        const bool want_st = (b & XINPUT_GAMEPAD_Y) || launcher_key('Y');
+                             (!km_lock && (launcher_key(0x0D /*VK_RETURN*/) ||
+                                           launcher_key(0x20 /*VK_SPACE*/)));
+        const bool want_st = (b & XINPUT_GAMEPAD_Y) || (!km_lock && launcher_key('Y'));
         const bool pad_vm = (b & XINPUT_GAMEPAD_BACK) && (b & XINPUT_GAMEPAD_START);
         if (g_guest_running.load()) {
           if (longan::webxfer_poll_stop()) request_guest_stop();
@@ -2230,9 +2574,9 @@ struct tiramisu_host
                 g_mouse_mode = false;
               }
               trt_input_release_all();
-              // RACCOIN hides its native cursor. Its menu still needs a
-              // visible pointer on the console when using a physical mouse.
-              trt_input_reset_cursor_mode(_stricmp(want.c_str(), "raccoin") == 0);
+              // Keep the visible console cursor active for all games unless
+              // the guest explicitly pins it to a 1x1 mouselook trap.
+              trt_input_reset_cursor_mode(true);
               longan::webxfer_set_running_game(want);
               g_guest_running.store(true);
               const std::string exe = ge.exe;
@@ -2350,7 +2694,8 @@ struct tiramisu_host
         lines.push_back(u82ws(longan::webxfer_status_line()));
         lines.push_back(u82ws(get_guest_status()));
         lines.push_back(u82ws(g_steam_status +
-                              (g_mouse_mode ? "  |  MOUSE/KBM MODE" : "")));
+                              (g_mouse_mode ? "  |  PAD MOUSE (F1)" : "") +
+                              (g_kbd_mouse_mode ? "  |  KBM CURSOR (F8)" : "")));
         char audio_line[128];
         longan::audio_status(audio_line, sizeof(audio_line));
         lines.push_back(u82ws(audio_line));
@@ -2359,9 +2704,9 @@ struct tiramisu_host
           lines.push_back(u82ws(g_games[g_selected].compat));
         }
         lines.push_back(
-            L"RB/LB or Tab: screens  U/D: game  L/R: exe  A: launch  Y: steam");
+            L"RB/LB or Tab: screens  U/D: game  L/R: exe  A/Enter: launch  Y: steam");
         lines.push_back(
-            L"R3/F1: mouse mode  Back+X: keyboard  Hold View+Menu: stop");
+            L"F8: KBM cursor (Arrows+Space)  R3/F1: pad mouse  Hold View+Menu: stop");
         longan::ui_set_lines(lines);
       }
       if (g_screen == longan::UI_LOG && !g_setup_active) {
@@ -2389,9 +2734,11 @@ struct tiramisu_host
 
   bool m_web_keys[256]{};
   bool m_web_buttons[5]{};
+  bool m_mouse_device_available = false;
+  winrt::Windows::Devices::Input::MouseDevice m_mouse_device{nullptr};
   winrt::Windows::UI::Input::KeyboardDeliveryInterceptor m_keyboard_interceptor{nullptr};
   winrt::event_token m_kd{}, m_ku{}, m_cr{}, m_pp{}, m_pr{}, m_pm{}, m_pw{},
-      m_mm{}, m_focus{}, m_input_enabled{}, m_ikd{}, m_iku{};
+      m_pe{}, m_mm{}, m_focus{}, m_input_enabled{}, m_ikd{}, m_iku{}, m_aka{};
 };
 
 } // namespace

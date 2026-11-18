@@ -1008,7 +1008,10 @@ inline void hk_copy_buf_to_img(u64 src_buf, u64 dst_img, u64 buf_off, u32 w,
 }
 
 inline void hk_present(u64, u32, void*) {
-  if (g_vkrt.swap) g_vkrt.swap->Present(1, 0);
+  if (g_vkrt.swap) {
+    longan::draw_pointer(false);
+    g_vkrt.swap->Present(1, 0);
+  }
 }
 
 inline void shutdown() {

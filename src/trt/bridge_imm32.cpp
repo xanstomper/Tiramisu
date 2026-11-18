@@ -22,10 +22,13 @@ static void line(const char* s) { trt_core_log(s); }
 extern "C" {
 
 void* TRT_GUEST_ABI imm_ImmGetContext(void* hwnd) {
-  char line[128];
-  snprintf(line, sizeof(line),
-           "imm32: ImmGetContext -> NULL (no IME on console; %s)", hwnd ? "hwnd" : "null hwnd");
-  log_line(line);
+  static unsigned s_logged = 0;
+  if (++s_logged <= 3) {
+    char line[128];
+    snprintf(line, sizeof(line),
+             "imm32: ImmGetContext -> NULL (no IME on console; %s)", hwnd ? "hwnd" : "null hwnd");
+    log_line(line);
+  }
   return nullptr;
 }
 

@@ -26,6 +26,8 @@ void* swapchain_d3d();                  // ID3D11Device1* for the UI layer
 void swapchain_bind_d3d9();             // bind the D3D9->D3D11 drawing backend
 void swapchain_restore_d3d11();         // rebind D3D11 CoreWindow swapchain if guest used D3D12
 void swapchain_restore_launcher_format();
+void draw_pointer(bool launcher);
+void set_pointer_cursor_mode(bool kbm_active);
 void swapchain_present();
 void swapchain_shutdown();
 

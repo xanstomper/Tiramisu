@@ -475,7 +475,8 @@ void ui_render() {
       draw_qr_overlay(m + 20);
       if (g_setup_finished) {
         text_out(g_small, m, g_h * 0.89f, left, g_h * 0.05f,
-                 g_first_run ? L"Enter / A  Open Home" : L"LB  Live Log    RB  Home", g_teal);
+                 g_first_run ? L"Enter / A  Open Home     F8  Cursor Mode"
+                             : L"LB  Live Log    RB  Home     F8  Cursor Mode", g_teal);
       }
       g_ctx->EndDraw();
       bmp->Release();
@@ -563,7 +564,7 @@ void ui_render() {
       text_out(g_small, m, status_y + i * g_h * 0.036f, width, g_h * 0.036f,
                g_lines[i].c_str(), g_dim);
     text_out(g_small, m, g_h * 0.88f, width, g_h * 0.045f,
-             L"Up / Down  Select game     LB / RB  Switch screen     Y  Steam", g_dim);
+             L"Up/Down: Select   Tab: Screen   Enter: Play   F8: Cursor Mode   Y: Steam", g_dim);
     draw_qr_overlay(m);
     draw_lan_link(m);
 

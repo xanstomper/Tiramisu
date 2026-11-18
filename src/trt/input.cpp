@@ -11,6 +11,7 @@ struct input_state {
   // keyboard
   u8  down[TRT_MAX_VK];      // current
   u8  pressed[TRT_MAX_VK];   // transitioned down this frame
+  u8  toggle[TRT_MAX_VK];    // toggled bit0 (Caps/Num/Scroll)
   u16 scan[TRT_MAX_VK];      // last scan code per VK (games read lParam)
   u8 extended[TRT_MAX_VK];   // extended scan flag for synthesized releases
   u16 last_vk;               // for GetAsyncKeyState bit15
@@ -82,6 +83,7 @@ int clamp_axis(i16 v) {  // deadzone from settings (default ~8k), normalize
 }
 
 // raw-blob feeders (defined below; used by the host-feed section)
+u32 TRT_STDCALL trt_MapVirtualKeyW(u32 code, u32 type);
 void trt_raw_post_mouse(i32 dx, i32 dy, u16 btn_flags, u16 btn_data);
 void trt_raw_post_key(u16 vk, u16 scan, bool down, u8 extended);
 
@@ -229,11 +231,25 @@ void trt_input_key_event2(u16 vk, bool down, u16 scan, u8 extended, u8 repeat) {
   if (vk >= TRT_MAX_VK) return;
   std::lock_guard<std::recursive_mutex> lk(g_input_mu);
   const bool previous = g.down[vk] != 0;
-  if (down && !previous) g.pressed[vk] = 1;
+  if (down && !previous) {
+    g.pressed[vk] = 1;
+    if (vk == 0x14 /*VK_CAPITAL*/ || vk == 0x90 /*VK_NUMLOCK*/ || vk == 0x91 /*VK_SCROLL*/)
+      g.toggle[vk] ^= 1u;
+  }
   g.down[vk] = down ? 1 : 0;
+  if (scan == 0) {
+    const u32 mv = trt_MapVirtualKeyW(vk, 4 /*MAPVK_VK_TO_VSC_EX*/);
+    if (mv) {
+      scan = (u16)(mv & 0xFFu);
+      if ((mv & 0xFF00u) == 0xE000u) extended = 1;
+    }
+  }
   if (scan) {
     g.scan[vk] = scan;
     g.extended[vk] = extended;
+  } else {
+    scan = g.scan[vk];
+    extended = g.extended[vk];
   }
   sync_modifier_vk(vk, down, scan, extended);
   if (down) g.last_vk = vk;
@@ -273,8 +289,7 @@ void trt_input_mouse_delta_raw(i32 dx, i32 dy) {
   g.mouse_init = true;
   // synthesize WM_INPUT for engines on the Raw Input path
   if (g.raw_mouse_reg) trt_raw_post_mouse(dx, dy, 0, 0);
-  if ((!g.cursor_hidden || g.cursor_force_visible) && (dx || dy))
-    post_mouse_move_locked();
+  if (dx || dy) post_mouse_move_locked();
 }
 
 void trt_input_set_cursor_pos(int x, int y) {
@@ -459,7 +474,9 @@ i16 trt_key_async(u16 vk) {
 i16 trt_key_sync(u16 vk) {
   if (vk >= TRT_MAX_VK) return 0;
   std::lock_guard<std::recursive_mutex> lk(g_input_mu);
-  return (i16)((g.down[vk] ? -0x8000 : 0) | (g.pressed[vk] ? 1 : 0));
+  const i16 tog = (vk == 0x14 || vk == 0x90 || vk == 0x91) ? (i16)(g.toggle[vk] & 1u)
+                                                            : (i16)(g.pressed[vk] ? 1 : 0);
+  return (i16)((g.down[vk] ? -0x8000 : 0) | tog);
 }
 
 int trt_mouse_pos(int* x, int* y) {
@@ -600,7 +617,7 @@ bool trt_cursor_snapshot(int* x, int* y) {
   *y = g.mouse_init ? g.my : (g.dh ? g.dh : 1080) / 2;
   const bool pinned = g_clip_active &&
       (g_clip_r - g_clip_l <= 1 || g_clip_b - g_clip_t <= 1);
-  return g.cursor_force_visible || (!g.cursor_hidden && !g.cursor_shape_hidden && !pinned);
+  return (g.cursor_force_visible || (!g.cursor_hidden && !g.cursor_shape_hidden)) && !pinned;
 }
 
 int trt_input_show_cursor(bool show) {
