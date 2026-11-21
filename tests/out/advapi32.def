@@ -1,0 +1,12 @@
+LIBRARY advapi32
+EXPORTS
+    RegOpenKeyExW
+    RegCreateKeyExW
+    RegQueryValueExW
+    RegSetValueExW
+    RegCloseKey
+    RegEnumKeyExW
+    OpenProcessToken
+    GetTokenInformation
+    ConvertStringSecurityDescriptorToSecurityDescriptorW
+    ConvertSidToStringSidW
