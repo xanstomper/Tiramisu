@@ -104,6 +104,7 @@ extern "C" int trt_pe_is_managed(const u8* file, size_t file_size) {
 // Console-verification-pending: this wiring is buildable + linkable,
 // but whether Celeste runs under it on the Series S needs a console
 // test (no UWP runtime exists on Linux).
+#include <mono/utils/mono-logger.h>  // mono_trace_set_* — route Mono stderr/log into tiramisu.log
 #include <windows.h>  // GetModuleFileNameW, SetEnvironmentVariableW,
 // GetFileAttributesA, WideCharToMultiByte
 
@@ -132,6 +133,50 @@ namespace {
 // process is the contract).
 const trt_mono_dllmap* g_hook_dllmaps_uwp = nullptr;
 int g_hook_dllmap_count_uwp = 0;
+
+// --- UWP Mono diagnostics: the console has no stderr, so a fault inside
+// mono_jit_init used to kill the app with no log line and no crash dump.
+// Route Mono's own print/log output into tiramisu.log, guard mono_jit_init
+// with SEH, and record the fault address + stack so the failing native
+// function can be identified from the console log alone.
+void mono_print_to_log(const char* str, mono_bool is_stdout) {
+  (void)is_stdout;
+  if (str && *str) mono_log(str);
+}
+void mono_log_to_log(const char* domain, const char* level,
+                     const char* message, mono_bool fatal, void* user_data) {
+  (void)user_data;
+  char line[1024];
+  std::snprintf(line, sizeof(line), "mono[%s/%s]%s %s",
+                domain ? domain : "?", level ? level : "?",
+                fatal ? " FATAL" : "", message ? message : "");
+  mono_log(line);
+}
+struct JitInitFault {
+  DWORD code = 0;
+  void* address = nullptr;
+  void* module_base = nullptr;
+  DWORD flags = 0;
+  ULONG_PTR info0 = 0;
+  ULONG_PTR info1 = 0;
+  USHORT frames = 0;
+  void* stack[24] = {};
+};
+JitInitFault g_jit_fault;
+int jit_init_filter(EXCEPTION_POINTERS* ep) {
+  if (ep && ep->ExceptionRecord) {
+    const EXCEPTION_RECORD* r = ep->ExceptionRecord;
+    g_jit_fault.code = r->ExceptionCode;
+    g_jit_fault.address = r->ExceptionAddress;
+    g_jit_fault.flags = r->ExceptionFlags;
+    if (r->NumberParameters > 0) g_jit_fault.info0 = r->ExceptionInformation[0];
+    if (r->NumberParameters > 1) g_jit_fault.info1 = r->ExceptionInformation[1];
+  }
+  g_jit_fault.module_base = reinterpret_cast<void*>(GetModuleHandleW(nullptr));
+  g_jit_fault.frames =
+      CaptureStackBackTrace(0, 24, g_jit_fault.stack, nullptr);
+  return EXCEPTION_EXECUTE_HANDLER;
+}
 
 void assembly_load_hook_uwp(MonoAssembly* assembly, void* user_data) {
   (void)user_data;
@@ -192,6 +237,12 @@ extern "C" int trt_mono_run(const trt_mono_config* cfg,
   if (!cfg || !cfg->exe_path || !cfg->exe_path[0])
     return fail("trt_mono_run: no exe_path");
   if (cfg->log) g_log = cfg->log;
+
+  // Install Mono diagnostic handlers FIRST: on the console there is no
+  // console, so Mono's stderr/log vanishes — route it into tiramisu.log.
+  mono_trace_set_print_handler(mono_print_to_log);
+  mono_trace_set_printerr_handler(mono_print_to_log);
+  mono_trace_set_log_handler(mono_log_to_log, nullptr);
 
   // FNA platform selection via environment variables, as on Linux —
   // but through SetEnvironmentVariableW (the UCRT setenv/unsetenv are
@@ -271,9 +322,41 @@ extern "C" int trt_mono_run(const trt_mono_config* cfg,
     std::snprintf(line, sizeof(line), "opening %s", cfg->exe_path);
     mono_log(line);
   }
-  MonoDomain* domain = mono_jit_init(
-      cfg->domain_name ? cfg->domain_name : "tiramisu-mono");
+  mono_log("mono_jit_init: calling (SEH-guarded)");
+  MonoDomain* domain = nullptr;
+  __try {
+    domain = mono_jit_init(
+        cfg->domain_name ? cfg->domain_name : "tiramisu-mono");
+  } __except (jit_init_filter(GetExceptionInformation())) {
+    domain = nullptr;
+  }
+  if (g_jit_fault.code != 0) {
+    const auto base = reinterpret_cast<ULONG_PTR>(g_jit_fault.module_base);
+    const auto addr = reinterpret_cast<ULONG_PTR>(g_jit_fault.address);
+    char detail[512];
+    std::snprintf(detail, sizeof(detail),
+                  "mono_jit_init SEH 0x%08lX at %p (modbase=%p rva=0x%llX) "
+                  "flags=0x%lX info0=0x%llX info1=0x%llX frames=%u",
+                  (unsigned long)g_jit_fault.code, g_jit_fault.address,
+                  g_jit_fault.module_base,
+                  (unsigned long long)(addr >= base ? addr - base : 0),
+                  (unsigned long)g_jit_fault.flags,
+                  (unsigned long long)g_jit_fault.info0,
+                  (unsigned long long)g_jit_fault.info1,
+                  (unsigned)g_jit_fault.frames);
+    mono_log(detail);
+    for (USHORT i = 0; i < g_jit_fault.frames; ++i) {
+      const auto fa = reinterpret_cast<ULONG_PTR>(g_jit_fault.stack[i]);
+      char frame[160];
+      std::snprintf(frame, sizeof(frame), "  jit_frame[%u] %p rva=0x%llX",
+                    (unsigned)i, g_jit_fault.stack[i],
+                    (unsigned long long)(fa >= base ? fa - base : 0));
+      mono_log(frame);
+    }
+    return fail("mono_jit_init raised SEH");
+  }
   if (!domain) return fail("mono_jit_init returned NULL");
+  mono_log("mono_jit_init: domain ok");
 
   // Register the Tiramisu backend's native internal calls now, before
   // any managed code runs (same as Linux).
