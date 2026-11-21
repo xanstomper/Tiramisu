@@ -149,6 +149,9 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   -o "$out/test_libload"
 "$out/test_libload" "$out/guest_libload.exe" "$out"
 
+# Circular sibling DLL imports must fail without recursive remapping.
+"$here/tests/test_cycle_loader.sh"
+
 # --- 8. the graphics bridge: the guest's D3D11 calls must reach the host's GPU ---
 SDK="$HOME/.cache/uwp-crossbuild/xwin/sdk/include"
 XCRT="$HOME/.cache/uwp-crossbuild/xwin/crt/include"

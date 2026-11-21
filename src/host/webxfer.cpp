@@ -750,27 +750,30 @@ bool recv_exact_all(sock_t s, const char* pre, size_t pre_len, uint64_t len,
 uint64_t stream_to_file(sock_t s, const char* pre, size_t pre_len,
                         const char* path, uint64_t len) {
   FILE* f = fopen(path, "wb");
-  if (!f) return 0;
+  if (!f) return UINT64_MAX;
   uint64_t got = 0;
+  bool failed = false;
   if (pre && pre_len) {
-    size_t wr = std::min<size_t>(pre_len, (size_t)std::min<uint64_t>(len, pre_len));
+    const size_t wr = std::min<size_t>(pre_len, (size_t)std::min<uint64_t>(len, pre_len));
     if (wr) {
-      fwrite(pre, 1, wr, f);
-      got += wr;
-      g_upload_done += wr;
+      const size_t written = fwrite(pre, 1, wr, f);
+      got += written;
+      g_upload_done += written;
+      failed = written != wr;
     }
   }
   char buf[65536];
-  while (got < len && !g_stop) {
+  while (!failed && got < len && !g_stop) {
     const int want = (int)std::min<uint64_t>(len - got, sizeof(buf));
     const int n = recv(s, buf, want, 0);
     if (n <= 0) break;
-    fwrite(buf, 1, (size_t)n, f);
-    got += (uint64_t)n;
-    g_upload_done += (uint64_t)n;
+    const size_t written = fwrite(buf, 1, (size_t)n, f);
+    got += written;
+    g_upload_done += written;
+    if (written != (size_t)n) failed = true;
   }
-  fclose(f);
-  return got;
+  if (fclose(f) != 0) failed = true;
+  return failed ? UINT64_MAX : got;
 }
 
 void send_all(sock_t s, const char* data, size_t len) {
@@ -1144,11 +1147,22 @@ void handle_client(sock_t s) {
     const std::string out_path = gdir + sep + rel;
     const size_t sl = out_path.rfind(XFER_SEP);
     if (sl != std::string::npos) mkdirs(out_path.substr(0, sl));
+    // Stage beside the destination. An interrupted upload must never destroy
+    // an existing complete game file. Rename only after all bytes are on disk.
+    static std::atomic<uint64_t> upload_id{0};
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::string staged = out_path + ".tiramisu-part-" +
+        std::to_string(stamp) + "-" + std::to_string(upload_id.fetch_add(1));
     g_upload_total += content_len;
-    uint64_t got = stream_to_file(s, pre, pre_len, out_path.c_str(), content_len);
+    uint64_t got = stream_to_file(s, pre, pre_len, staged.c_str(), content_len);
     if (got != content_len) {
-      remove(out_path.c_str());
-      respond(s, "500 Server Error", "text/plain", "incomplete file");
+      remove(staged.c_str());
+      respond(s, "500 Server Error", "text/plain", "incomplete file or storage write failed");
+      return;
+    }
+    if (rename(staged.c_str(), out_path.c_str()) != 0) {
+      remove(staged.c_str());
+      respond(s, "500 Server Error", "text/plain", "could not commit uploaded file");
       return;
     }
     {

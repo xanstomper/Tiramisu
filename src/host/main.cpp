@@ -73,6 +73,14 @@ using namespace winrt::Windows::UI::Core;
 
 namespace {
 
+// The documented package debugging COM interface is desktop-partition only.
+// This minimal ABI is used solely by an opt-in diagnostic to record whether
+// the AppContainer can activate it; normal Tiramisu does not call it.
+struct diagnostic_package_debug : IUnknown {
+  virtual HRESULT STDMETHODCALLTYPE EnableDebugging(LPCWSTR, LPCWSTR, LPCWSTR) = 0;
+  virtual HRESULT STDMETHODCALLTYPE DisableDebugging(LPCWSTR) = 0;
+};
+
 std::string g_local_state;
 std::string g_games_dir;
 std::mutex g_status_mu;
@@ -1301,6 +1309,9 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     r.map_rc = trt_map_pe(&be, runtime_rs, buf.data(), buf.size(), &img);
   }
   log_guest_memory("after image load");
+  snprintf(line, sizeof(line), "guest trace: map rc=%d image=%p", r.map_rc,
+           static_cast<void*>(img));
+  longan::log_line(line);
   if (r.map_rc != TRT_OK) {
     strncpy(r.detail, trt_errstr(r.map_rc), sizeof(r.detail) - 1);
     return r;
@@ -1310,10 +1321,20 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     return r;
   }
   trt_images_register_main(img, exe.c_str());
+  snprintf(line, sizeof(line), "guest trace: base=%p entry_rva=0x%llx tls=%d",
+           static_cast<void*>(img->base),
+           static_cast<unsigned long long>(img->entry_rva), img->tls_callback_count);
+  longan::log_line(line);
   for (int i = 0; i < img->tls_callback_count; ++i) {
+    snprintf(line, sizeof(line), "guest trace: TLS callback %d enter rva=0x%llx",
+             i, static_cast<unsigned long long>(img->tls_callback_rvas[i]));
+    longan::log_line(line);
     trt_call_guest_img((void*)(img->base + img->tls_callback_rvas[i]), img,
                        (u64)(uintptr_t)img->base, 1, 0, 0);
+    snprintf(line, sizeof(line), "guest trace: TLS callback %d returned", i);
+    longan::log_line(line);
   }
+  longan::log_line("guest trace: entering executable entrypoint");
   run_guest_trapped(img, r.detail, sizeof(r.detail));
   return r;
 }
@@ -1918,6 +1939,71 @@ struct tiramisu_host
              install.c_str(), g_local_state.c_str());
     longan::log_line(line);
 
+    // Opt-in diagnostic only. Never request a new cap in normal launches.
+    // The marker lives in this package's LocalState, not in the game folder.
+    if (FILE* probe = fopen((g_local_state + "\\memory-probe.enable").c_str(), "rb")) {
+      fclose(probe);
+      try {
+        using winrt::Windows::System::MemoryManager;
+        constexpr u64 mib = 1024ULL * 1024ULL;
+        const u64 before = MemoryManager::AppMemoryUsageLimit();
+        const u64 expected = MemoryManager::ExpectedAppMemoryUsageLimit();
+        // Probe modest increases too: refusal of 8 GiB alone doesn't prove that
+        // all smaller increases are refused. Read back after every request.
+        const u64 requested_mib[] = {5121, 5376, 5632, 6144, 7168, 8192};
+        for (const u64 req : requested_mib) {
+          const bool accepted = MemoryManager::TrySetAppMemoryUsageLimit(req * mib);
+          const u64 after = MemoryManager::AppMemoryUsageLimit();
+          snprintf(line, sizeof(line),
+                   "memory probe: before=%llu MiB expected=%llu MiB request=%llu MiB accepted=%d after=%llu MiB",
+                   (unsigned long long)(before / mib), (unsigned long long)(expected / mib),
+                   (unsigned long long)req, accepted ? 1 : 0,
+                   (unsigned long long)(after / mib));
+          longan::log_line(line);
+        }
+      } catch (const winrt::hresult_error& ex) {
+        snprintf(line, sizeof(line), "memory probe: HRESULT 0x%08lx",
+                 (unsigned long)ex.code().value);
+        longan::log_line(line);
+      }
+    }
+
+    // Separate opt-in test for the documented package-debugging COM class.
+    // Immediately pair a successful enable with disable; this is not a VS
+    // debugger attachment and cannot establish the debugger exception.
+    if (FILE* probe = fopen((g_local_state + "\\debug-probe.enable").c_str(), "rb")) {
+      fclose(probe);
+      const GUID cls = {0xb1aec16f, 0x2383, 0x4852, {0xb0, 0xe9, 0x8f, 0x0b, 0x1d, 0xc6, 0x6b, 0x4d}};
+      const GUID iid = {0xf27c3930, 0x8029, 0x4ad1, {0x94, 0xe3, 0x3d, 0xba, 0x41, 0x78, 0x10, 0xc1}};
+      MULTI_QI query = {&iid, nullptr, 0};
+      const HRESULT activation = CoCreateInstanceFromApp(
+          cls, nullptr, CLSCTX_LOCAL_SERVER, nullptr, 1, &query);
+      snprintf(line, sizeof(line), "debug probe: activation=0x%08lx query=0x%08lx",
+               (unsigned long)activation, (unsigned long)query.hr);
+      longan::log_line(line);
+      if (SUCCEEDED(activation) && SUCCEEDED(query.hr) && query.pItf) {
+        auto* debug = reinterpret_cast<diagnostic_package_debug*>(query.pItf);
+        try {
+          const auto name = winrt::Windows::ApplicationModel::Package::Current().Id().FullName();
+          const HRESULT enabled = debug->EnableDebugging(name.c_str(), nullptr, nullptr);
+          snprintf(line, sizeof(line), "debug probe: enable=0x%08lx", (unsigned long)enabled);
+          longan::log_line(line);
+          if (SUCCEEDED(enabled)) {
+            try {
+              const auto limit = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
+              snprintf(line, sizeof(line), "debug probe: enabled limit=%llu MiB",
+                       (unsigned long long)(limit / (1024ULL * 1024ULL)));
+              longan::log_line(line);
+            } catch (...) { longan::log_line("debug probe: memory query failed"); }
+            const HRESULT disabled = debug->DisableDebugging(name.c_str());
+            snprintf(line, sizeof(line), "debug probe: disable=0x%08lx", (unsigned long)disabled);
+            longan::log_line(line);
+          }
+        } catch (...) { longan::log_line("debug probe: exception"); }
+        query.pItf->Release();
+      }
+    }
+
     // ---- persisted settings (dashboard-editable; consumed by bridges) ----
     const int applied = longan::settings_load(g_local_state);
     snprintf(line, sizeof(line), "settings: %d keys applied from settings.ini",
@@ -2179,7 +2265,7 @@ struct tiramisu_host
         const auto now = std::chrono::steady_clock::now();
         if (now >= next_guest_memory_sample) {
           log_guest_memory("running");
-          next_guest_memory_sample = now + std::chrono::seconds(2);
+          next_guest_memory_sample = now + std::chrono::seconds(30);
         }
       }
       trt_input_frame_begin();

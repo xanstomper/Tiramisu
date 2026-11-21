@@ -18,3 +18,15 @@ third_party/gl4es/.git/
 third_party/d3d8to9/.git/
 third_party/mojoshader/.git/
 .mochi/
+out-*/
+# diagnostic artifacts: logs, binaries, generated uploads (keep only .md analysis)
+docs/progress/*.log
+docs/progress/*.rc
+docs/progress/*.txt
+docs/progress/*.py
+docs/progress/*.dll
+docs/progress/*.bak
+docs/progress/*.msix
+docs/progress/*.xml
+docs/progress/fna-dlls/
+docs/progress/out-*/

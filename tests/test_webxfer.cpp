@@ -14,6 +14,8 @@
 #include <netinet/in.h>
 #include <string>
 #include <sys/socket.h>
+#include <sys/resource.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
@@ -190,6 +192,45 @@ int main() {
               read_str_file(root + "/games/HollowDemo/HollowDemo_Data/resources.assets") == asset_bytes,
           "Uploaded folder hierarchy & bytes persisted identically on disk");
     CHECK(longan::webxfer_poll_rescan(), "Folder upload flagged host rescan");
+
+    // Interrupt a replacement after sending fewer bytes than Content-Length.
+    // The already uploaded executable must remain intact.
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bool connected = fd >= 0 && connect(fd, (sockaddr*)&addr, sizeof(addr)) == 0;
+    if (connected) {
+      const std::string request =
+          "PUT /api/upload-file?game=HollowDemo&rel=HollowDemo.exe HTTP/1.1\r\n"
+          "Host: localhost\r\nContent-Length: 100\r\nConnection: close\r\n\r\npartial";
+      send(fd, request.data(), request.size(), 0);
+      shutdown(fd, SHUT_WR);
+      char reply[512];
+      while (recv(fd, reply, sizeof(reply), 0) > 0) {}
+    }
+    if (fd >= 0) close(fd);
+    CHECK(connected && read_str_file(root + "/games/HollowDemo/HollowDemo.exe") == exe_bytes,
+          "Interrupted replacement preserves previously uploaded file");
+
+    // Limit process file writes to force fwrite/fclose failure without filling
+    // the test machine's disk. A failed write must never return success.
+    struct rlimit old_limit{};
+    const bool got_limit = getrlimit(RLIMIT_FSIZE, &old_limit) == 0;
+    struct rlimit small_limit = old_limit;
+    small_limit.rlim_cur = 1;
+    auto old_handler = signal(SIGXFSZ, SIG_IGN);
+    const bool limited = got_limit && setrlimit(RLIMIT_FSIZE, &small_limit) == 0;
+    std::string failed_reply;
+    if (limited)
+      failed_reply = http_req(port, "PUT",
+          "/api/upload-file?game=HollowDemo&rel=diskfull.bin", "more than one byte");
+    if (limited) setrlimit(RLIMIT_FSIZE, &old_limit);
+    signal(SIGXFSZ, old_handler);
+    CHECK(limited && failed_reply.find("500 Server Error") != std::string::npos &&
+              !file_exists(root + "/games/HollowDemo/diskfull.bin"),
+          "Storage write failure returns error and leaves no committed file");
   }
 
   // 6. .zip streaming upload + Expect: 100-continue + zip-slip protection

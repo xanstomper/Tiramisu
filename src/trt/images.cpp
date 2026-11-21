@@ -55,7 +55,7 @@ struct extra_dll_dir {
 extra_dll_dir g_extra_dll_dirs[32] = {};
 char g_load_dir_stack[16][512] = {};
 int g_load_dir_depth = 0;
-int g_load_depth = 0;
+thread_local int g_load_depth = 0;
 // Load-only mode (corpus dry-run): map + bind + seal guest DLLs but do NOT
 // run their TLS callbacks or DllMain — the corpus test proves the load
 // path, it does not execute game code. Default 1 = full boot semantics.
@@ -82,9 +82,11 @@ bool path_ieq(const char* a, const char* b) {
 }
 
 const char* base_name(const char* path) {
-  const char* slash = strrchr(path, '\\');
-  if (!slash) slash = strrchr(path, '/');
-  return slash ? slash + 1 : path;
+  const char* backslash = strrchr(path, '\\');
+  const char* slash = strrchr(path, '/');
+  const char* last = !backslash ? slash : !slash ? backslash
+                                               : (backslash > slash ? backslash : slash);
+  return last ? last + 1 : path;
 }
 
 u8* read_whole_file(const char* path, size_t* size) {
@@ -491,6 +493,32 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
       trt_core_log(line);
       return g_images[i].img;
     }
+  // Cover every loader entry point, including module_table's native override.
+  // Images are registered after binding imports, so fail explicitly if a DLL
+  // is requested again before its first mapping completes. Actual Windows
+  // cyclic import support requires deferred entry calls and two-phase binding.
+  struct loading_guard {
+    const char** stack;
+    unsigned* count;
+    loading_guard(const char** s, unsigned* n, const char* name)
+        : stack(s), count(n) { stack[(*count)++] = name; }
+    ~loading_guard() { stack[--(*count)] = nullptr; }
+  };
+  static thread_local const char* loading[16] = {};
+  static thread_local unsigned loading_count = 0;
+  for (unsigned i = 0; i < loading_count; ++i) {
+    if (ieq(loading[i], req_base)) {
+      char line[192];
+      snprintf(line, sizeof(line), "trt: cyclic guest DLL import: %s", req_base);
+      trt_core_log(line);
+      return nullptr;
+    }
+  }
+  if (loading_count == 16) {
+    trt_core_log("trt: guest DLL dependency depth exceeded");
+    return nullptr;
+  }
+  loading_guard guard(loading, &loading_count, req_base);
   size_t size = 0;
   u8* file = read_whole_file(host_path, &size);
   if (!file) {

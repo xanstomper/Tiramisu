@@ -232,6 +232,10 @@ int main(int argc, char** argv) {
   // tag 0xD10, value 0x1111 - and come from the DLL's own code
   bool dll_main_called_host = false;
   trt_image* dll = trt_images_find("guestdll.dll");
+  CHECK(dll && trt_images_find("C:\\Games/guestdll.dll") == dll,
+        "mixed path separators resolve to the loaded DLL");
+  CHECK(dll && trt_images_find("C:/Games\\guestdll.dll") == dll,
+        "reverse mixed path separators resolve to the loaded DLL");
   const u64 dll_lo = dll ? (u64)(uintptr_t)dll->base : 0;
   const u64 dll_hi = dll ? dll_lo + dll->size_of_image : 0;
   for (unsigned i = 0; i < g_ring_n && i < 8; ++i)
