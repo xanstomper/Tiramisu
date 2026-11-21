@@ -1,13 +1,9 @@
 // tiramisu/src/trt/pe_loader.cpp
-// Tiramisu Runtime PE32/PE64 loader core. Wine-style in-process mapping:
+// Tiramisu Runtime PE64 loader core. Wine-style in-process mapping:
 //   validate -> alloc -> headers+sections -> relocate -> bind imports -> TLS
 // Zero RWX: everything maps RW; trt_seal_image() flips code to RX.
 // Bounds-checked throughout: a malformed PE must fail with a named error,
 // never crash the host process (the host IS the console app).
-// M7 Phase 1: PE32 (32-bit) images map through trt_map_pe32 — same stages,
-// 4-byte thunks, HIGHLOW relocations against a GUEST-VA base, trap-address
-// import binding. LOAD-ONLY: nothing 32-bit executes (no x86 engine until
-// Phase 2); the entry point and TLS callbacks are collected, never called.
 #include "trt.h"
 #include "thunk.h"
 
@@ -31,6 +27,76 @@ extern "C" int trt_mem_budget_charge_commit(u64 bytes);
 extern "C" void trt_mem_budget_discharge_commit(u64 bytes);
 extern "C" int trt_mem_budget_charge_va(u64 bytes);
 extern "C" void trt_mem_budget_discharge_va(u64 bytes);
+
+#if defined(_WIN32)
+namespace {
+struct RecentImport {
+  volatile u32 site;
+  volatile u32 tid;
+  volatile uintptr_t caller;
+};
+static_assert(sizeof(RecentImport) == 16);
+struct ImportLocation { char module[72]; char function[96]; };
+std::atomic<u32> g_recent_import_tick{0};
+std::atomic<u32> g_import_sites_count{0};
+RecentImport g_recent_imports[64]{};
+ImportLocation g_import_sites[4096]{};
+
+void* trace_guest_import(const trt_backend* be, const char* module,
+                         const char* function, u16 ordinal, void* fn) {
+  const u32 site_index = g_import_sites_count.fetch_add(1, std::memory_order_relaxed);
+  if (site_index >= sizeof(g_import_sites) / sizeof(g_import_sites[0])) return fn;
+  ImportLocation& where = g_import_sites[site_index];
+  snprintf(where.module, sizeof(where.module), "%s", module);
+  if (function) snprintf(where.function, sizeof(where.function), "%s", function);
+  else snprintf(where.function, sizeof(where.function), "#%u", (unsigned)ordinal);
+  // Transparent tail trampoline. Records the native TEB thread id and the
+  // guest return address, preserves incoming registers and calls the target.
+  constexpr u8 kTrace[] = {
+      0x9c, 0x50, 0x41, 0x52, 0x41, 0x53, 0x48, 0xb8, 0x81, 0x70, 0x60, 0x50,
+      0x40, 0x30, 0x20, 0x10, 0x41, 0xba, 0x01, 0x00, 0x00, 0x00, 0xf0, 0x44,
+      0x0f, 0xc1, 0x10, 0x41, 0x83, 0xe2, 0x3f, 0x41, 0xc1, 0xe2, 0x04, 0x48,
+      0xb8, 0x82, 0x70, 0x60, 0x50, 0x40, 0x30, 0x20, 0x10, 0x4c, 0x01, 0xd0,
+      0xc7, 0x00, 0x83, 0x30, 0x20, 0x10, 0x65, 0x44, 0x8b, 0x14, 0x25, 0x48,
+      0x00, 0x00, 0x00, 0x44, 0x89, 0x50, 0x04, 0x4c, 0x8b, 0x54, 0x24, 0x20,
+      0x4c, 0x89, 0x50, 0x08, 0x41, 0x5b, 0x41, 0x5a, 0x58, 0x9d, 0xff, 0x25,
+      0x00, 0x00, 0x00, 0x00, 0x84, 0x70, 0x60, 0x50, 0x40, 0x30, 0x20, 0x10,
+  };
+  auto* executable = static_cast<u8*>(be->alloc(sizeof(kTrace), 0));
+  if (!executable) return fn;
+  memcpy(executable, kTrace, sizeof(kTrace));
+  const u64 patch_8 = reinterpret_cast<uintptr_t>(&g_recent_import_tick);
+  memcpy(executable + 8, &patch_8, sizeof(patch_8));
+  const u64 patch_37 = reinterpret_cast<uintptr_t>(g_recent_imports);
+  memcpy(executable + 37, &patch_37, sizeof(patch_37));
+  const u32 patch_50 = site_index;
+  memcpy(executable + 50, &patch_50, sizeof(patch_50));
+  const u64 patch_88 = reinterpret_cast<uintptr_t>(fn);
+  memcpy(executable + 88, &patch_88, sizeof(patch_88));
+  if (be->protect(executable, sizeof(kTrace), TRT_PROT_R | TRT_PROT_X) != 0) {
+    be->release(executable, sizeof(kTrace));
+    return fn;
+  }
+  return executable;
+}
+}
+
+extern "C" void trt_log_recent_imports(u32 tid) {
+  const u32 end = g_recent_import_tick.load(std::memory_order_relaxed);
+  const u32 begin = end > 64 ? end - 64 : 0;
+  for (u32 i = begin; i < end; ++i) {
+    const RecentImport& event = g_recent_imports[i & 63u];
+    if (event.tid != tid) continue;
+    const u32 site = event.site;
+    if (site >= sizeof(g_import_sites) / sizeof(g_import_sites[0])) continue;
+    const ImportLocation& where = g_import_sites[site];
+    char line[230];
+    snprintf(line, sizeof(line), "recent guest import: %s!%s caller=%p",
+             where.module, where.function, reinterpret_cast<void*>(event.caller));
+    trt_core_log(line);
+  }
+}
+#endif
 
 #if defined(__has_feature)
 #  if __has_feature(address_sanitizer)
@@ -295,227 +361,6 @@ void* trt_guest_teb_acquire(u32* out_index) {
   return t_tls_state.teb;
 }
 
-// ---------------------------------------------------------------------------
-// M7 Phase 1: 32-bit guest address space + import trap registry.
-//
-// A 32-bit guest lives in its own 4 GB VA space: its preferred ImageBase
-// (0x400000, 0x10000000, ...) is a GUEST address, not a host address. The
-// host mapping can sit anywhere (be->alloc picks); the guest base is
-// tracked separately so relocations and IAT guest-VAs are computed against
-// the address the EMULATOR will use (Phase 2), not the host pointer.
-// Guest images live below 0x70000000 (well under the 2 GB user-space split
-// and far from the 0xF0000000 trap range). The extent table also answers
-// host-pointer -> guest-VA translation for sibling-DLL export binding.
-// ---------------------------------------------------------------------------
-struct pe32_guest_extent {
-  u8* host_base;   // host mapping (nullptr = free slot)
-  u64 host_size;
-  u32 guest_base;  // guest-VA base
-};
-static pe32_guest_extent g_pe32_extents[1024];
-static int g_pe32_extent_count = 0;
-static std::mutex g_pe32_mu;
-
-#define TRT_PE32_GUEST_ALIGN 0x10000u   // 64 KiB allocation granularity
-#define TRT_PE32_GUEST_FLOOR 0x10000000u  // bump-alloc scan starts here
-#define TRT_PE32_GUEST_CEIL  0x70000000u
-
-static bool pe32_guest_overlaps(u32 base, u64 size) {
-  const u64 end = (u64)base + size;
-  for (int i = 0; i < g_pe32_extent_count; ++i) {
-    if (!g_pe32_extents[i].host_base) continue;
-    const u64 b = g_pe32_extents[i].guest_base;
-    const u64 e = b + g_pe32_extents[i].host_size;
-    if ((u64)base < e && b < end) return true;
-  }
-  return false;
-}
-
-// Reserve a guest-VA range for a new PE32 image: preferred base first,
-// else the lowest free 64 KiB-aligned slot at/above the floor. Records the
-// (host, guest) pair for host->guest translation. Returns 0 on success.
-static int pe32_guest_reserve(u8* host_base, u64 size, u32 preferred,
-                              u32* out_guest_base) {
-  std::lock_guard<std::mutex> lk(g_pe32_mu);
-  const u64 span =
-      (size + TRT_PE32_GUEST_ALIGN - 1) & ~(u64)(TRT_PE32_GUEST_ALIGN - 1);
-  u32 chosen = 0;
-  if (preferred && (u64)preferred + span <= TRT_PE32_GUEST_CEIL &&
-      !pe32_guest_overlaps(preferred, span)) {
-    chosen = preferred;
-  } else {
-    for (u64 cand = TRT_PE32_GUEST_FLOOR;
-         cand + span <= TRT_PE32_GUEST_CEIL;
-         cand += TRT_PE32_GUEST_ALIGN) {
-      if (!pe32_guest_overlaps((u32)cand, span)) {
-        chosen = (u32)cand;
-        break;
-      }
-    }
-    if (!chosen) return -1;
-  }
-  int slot = -1;
-  for (int i = 0; i < g_pe32_extent_count; ++i)
-    if (!g_pe32_extents[i].host_base) {
-      slot = i;
-      break;
-    }
-  if (slot < 0) {
-    if (g_pe32_extent_count >= 1024) return -1;
-    slot = g_pe32_extent_count++;
-  }
-  g_pe32_extents[slot].host_base = host_base;
-  g_pe32_extents[slot].host_size = size;
-  g_pe32_extents[slot].guest_base = chosen;
-  *out_guest_base = chosen;
-  return 0;
-}
-
-static void pe32_guest_release_by_host(u8* host_base) {
-  std::lock_guard<std::mutex> lk(g_pe32_mu);
-  for (int i = 0; i < g_pe32_extent_count; ++i)
-    if (g_pe32_extents[i].host_base == host_base) {
-      g_pe32_extents[i].host_base = nullptr;
-      g_pe32_extents[i].host_size = 0;
-      g_pe32_extents[i].guest_base = 0;
-    }
-}
-
-// Translate a host pointer inside a mapped PE32 image to its guest VA.
-// Returns 1 on success, 0 when the pointer is not inside any PE32 image.
-static int pe32_guest_va_for_host(const void* p, u32* out_va) {
-  const uintptr_t hp = (uintptr_t)p;
-  std::lock_guard<std::mutex> lk(g_pe32_mu);
-  for (int i = 0; i < g_pe32_extent_count; ++i) {
-    if (!g_pe32_extents[i].host_base) continue;
-    const uintptr_t b = (uintptr_t)g_pe32_extents[i].host_base;
-    const uintptr_t e = b + g_pe32_extents[i].host_size;
-    if (hp >= b && hp < e) {
-      *out_va = g_pe32_extents[i].guest_base + (u32)(hp - b);
-      return 1;
-    }
-  }
-  return 0;
-}
-
-extern "C" void trt_pe32_guest_reset(void) {
-  std::lock_guard<std::mutex> lk(g_pe32_mu);
-  for (int i = 0; i < g_pe32_extent_count; ++i) {
-    g_pe32_extents[i].host_base = nullptr;
-    g_pe32_extents[i].host_size = 0;
-    g_pe32_extents[i].guest_base = 0;
-  }
-  g_pe32_extent_count = 0;
-}
-
-// ---------------------------------------------------------------------------
-// M7 Phase 1: 32-bit import trap registry.
-// One entry per unique bound module!symbol (deduped, case-insensitive
-// module). Trap N lives at TRT_PE32_TRAP_BASE + 4*N. The registry is
-// process-global and never reset (like the TLS templates): trap addresses
-// recorded in already-mapped IATs stay valid for the process lifetime.
-// A delay-import binding starts with host_fn == nullptr (unresolved at
-// load); a later static bind of the same symbol upgrades it.
-// ---------------------------------------------------------------------------
-struct pe32_trap_binding {
-  char module[64];
-  char symbol[128];  // "" when by ordinal
-  u16 ordinal;       // 0 when by name
-  u32 trap_va;
-  void* host_fn;     // the 64-bit bridge address (Phase 2 dispatcher input)
-  int is_delay;      // 1 = delay-import binding (fail-visible at load)
-};
-static std::vector<pe32_trap_binding> g_pe32_traps;
-
-static bool pe32_mod_ieq(const char* a, const char* b) {
-  while (*a && *b) {
-    char ca = *a, cb = *b;
-    if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
-    if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
-    if (ca != cb) return false;
-    ++a;
-    ++b;
-  }
-  return *a == *b;
-}
-
-// Allocate (or reuse) the trap address for one bound import. Returns 0 on
-// success, -1 when the trap table is full.
-static int pe32_trap_alloc(const char* module, const char* symbol, u16 ordinal,
-                           void* host_fn, int is_delay, u32* out_trap) {
-  std::lock_guard<std::mutex> lk(g_pe32_mu);
-  for (auto& t : g_pe32_traps) {
-    if (!pe32_mod_ieq(t.module, module)) continue;
-    if (symbol && t.symbol[0] && strcmp(t.symbol, symbol) == 0) {
-      if (!t.host_fn && host_fn) t.host_fn = host_fn;  // upgrade delay stub
-      *out_trap = t.trap_va;
-      return 0;
-    }
-    if (!symbol && !t.symbol[0] && t.ordinal == ordinal) {
-      if (!t.host_fn && host_fn) t.host_fn = host_fn;
-      *out_trap = t.trap_va;
-      return 0;
-    }
-  }
-  if (g_pe32_traps.size() >= TRT_PE32_TRAP_MAX) return -1;
-  pe32_trap_binding t;
-  memset(&t, 0, sizeof(t));
-  snprintf(t.module, sizeof(t.module), "%s", module);
-  if (symbol) snprintf(t.symbol, sizeof(t.symbol), "%s", symbol);
-  t.ordinal = ordinal;
-  t.trap_va = TRT_PE32_TRAP_BASE + 4u * (u32)g_pe32_traps.size();
-  t.host_fn = host_fn;
-  t.is_delay = is_delay;
-  *out_trap = t.trap_va;
-  g_pe32_traps.push_back(t);
-  return 0;
-}
-
-// Bind one resolved 32-bit import to its 4-byte IAT value:
-//   - a host pointer inside a mapped PE32 image (a sibling DLL export)
-//     becomes the export's GUEST VA (emulated code calls emulated code);
-//   - anything else (a 64-bit bridge address) becomes a trap address from
-//     the reserved range (Phase 2 dispatches it to the bridge).
-// Returns 0 on success, -1 when the trap table is full.
-static int pe32_bind_value(void* host_fn, const char* module,
-                           const char* symbol, u16 ordinal, int is_delay,
-                           u32* out_slot, int* out_is_trap) {
-  u32 va = 0;
-  if (host_fn && pe32_guest_va_for_host(host_fn, &va)) {
-    *out_slot = va;
-    *out_is_trap = 0;
-    return 0;
-  }
-  u32 trap = 0;
-  if (pe32_trap_alloc(module, symbol, ordinal, host_fn, is_delay, &trap) != 0)
-    return -1;
-  *out_slot = trap;
-  *out_is_trap = 1;
-  return 0;
-}
-
-extern "C" int trt_pe32_trap_count(void) {
-  std::lock_guard<std::mutex> lk(g_pe32_mu);
-  return (int)g_pe32_traps.size();
-}
-
-extern "C" int trt_pe32_trap_info(int index, char* mod_out, size_t mod_cap,
-                                  char* sym_out, size_t sym_cap,
-                                  u16* ordinal_out, u32* trap_va_out) {
-  std::lock_guard<std::mutex> lk(g_pe32_mu);
-  if (index < 0 || (size_t)index >= g_pe32_traps.size()) return -1;
-  const pe32_trap_binding& t = g_pe32_traps[(size_t)index];
-  if (mod_out && mod_cap) snprintf(mod_out, mod_cap, "%s", t.module);
-  if (sym_out && sym_cap) snprintf(sym_out, sym_cap, "%s", t.symbol);
-  if (ordinal_out) *ordinal_out = t.ordinal;
-  if (trap_va_out) *trap_va_out = t.trap_va;
-  return 0;
-}
-
-extern "C" int trt_pe32_is_trap(u32 guest_va) {
-  return guest_va >= TRT_PE32_TRAP_BASE && guest_va < TRT_PE32_TRAP_END;
-}
-
 // fail: record stage detail, release mapping, return error code
 int fail(trt_image* img, const trt_backend* be, int code, const char* detail) {
   if (detail && img) {
@@ -527,7 +372,6 @@ int fail(trt_image* img, const trt_backend* be, int code, const char* detail) {
            detail ? detail : "");
   logf_be(be, line);
   if (img && img->base && be) {
-    if (img->is_pe32) pe32_guest_release_by_host(img->base);
     be->release(img->base, (size_t)img->size_of_image);
     trt_mem_budget_discharge_commit(img->size_of_image);
     trt_mem_budget_discharge_va(img->size_of_image);
@@ -546,7 +390,7 @@ extern "C" const char* trt_errstr(int code) {
     case TRT_OK: return "OK";
     case TRT_ERR_BAD_DOS: return "BAD_DOS (not MZ / e_lfanew out of file)";
     case TRT_ERR_BAD_PE: return "BAD_PE (no PE signature)";
-    case TRT_ERR_NOT_PE64: return "NOT_PE64 (machine/magic mismatch: neither PE64 (0x8664/0x020b) nor PE32 (0x014c/0x010b))";
+    case TRT_ERR_NOT_PE64: return "NOT_PE64 (machine/magic mismatch, 32-bit needs the x86 engine, not this path)";
     case TRT_ERR_NO_SECTIONS: return "NO_SECTIONS";
     case TRT_ERR_SIZE_OVERFLOW: return "SIZE_OVERFLOW (SizeOfImage missing or over 2 GB cap)";
     case TRT_ERR_SECTION_BOUNDS: return "SECTION_BOUNDS (section points outside file/image)";
@@ -558,9 +402,6 @@ extern "C" const char* trt_errstr(int code) {
     case TRT_ERR_TLS_BOUNDS: return "TLS_BOUNDS";
     case TRT_ERR_SEAL: return "SEAL (final protect failed)";
     case TRT_ERR_DELAY_IMPORT: return "DELAY_IMPORT (delay-load directory not processed in v0)";
-    case TRT_ERR_MANAGED: return "MANAGED (.NET assembly: CLR header present, no .NET Framework CLR on console)";
-    case TRT_ERR_MONO: return "MONO (Mono embedding failure; see trt_mono_last_error)";
-    case TRT_ERR_FNA3D: return "FNA3D (FNA3D host-device handoff failure; see trt_fna3d_last_error)";
     default: return "UNKNOWN";
   }
 }
@@ -585,18 +426,9 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
   const trt_nt_headers64* nt = (const trt_nt_headers64*)(file + nt_off);
   if (rd32((const u8*)&nt->signature) != 0x00004550)
     return fail(&img, be, TRT_ERR_BAD_PE, "no PE\\0\\0");
-  // M7 Phase 1: 32-bit images route to the PE32 path (same loader stages,
-  // 4-byte thunks, guest-VA base, trap-address imports). Machine and magic
-  // live at the same offsets in both optional headers, so these reads are
-  // width-safe. (The nt_off + sizeof(nt_headers64) bound above is
-  // conservative for PE32: a valid PE32 needs nt_off + 248 + 40*nsec bytes
-  // anyway, so no valid PE32 is rejected by it.)
-  const u16 machine = rd16((const u8*)&nt->file_header.machine);
-  const u16 magic = rd16((const u8*)&nt->optional_header.magic);
-  if (machine == TRT_PE_MACHINE_I386 && magic == TRT_PE_OPT32_MAGIC)
-    return trt_map_pe32(be, rs, file, file_size, out);
-  if (machine != TRT_PE_MACHINE_X64 || magic != TRT_PE_OPT64_MAGIC)
-    return fail(&img, be, TRT_ERR_NOT_PE64, "neither PE64 (0x8664/0x020b) nor PE32 (0x014c/0x010b)");
+  if (rd16((const u8*)&nt->file_header.machine) != TRT_PE_MACHINE_X64 ||
+      rd16((const u8*)&nt->optional_header.magic) != TRT_PE_OPT64_MAGIC)
+    return fail(&img, be, TRT_ERR_NOT_PE64, "only PE64 (0x8664/0x020b) on this path");
   u32 nsec = rd16((const u8*)&nt->file_header.number_of_sections);
   if (nsec == 0 || nsec > 96)
     return fail(&img, be, TRT_ERR_NO_SECTIONS, "section count 0 or >96");
@@ -610,20 +442,6 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
   const u64 entry_rva = rd32((const u8*)&nt->optional_header.address_of_entry_point);
   const u64 size_headers = rd32((const u8*)&nt->optional_header.size_of_headers);
   const trt_data_directory* dirs = nt->optional_header.directories;
-
-  // ---- 2b. managed (.NET) assemblies ----
-  // A PE with a COM descriptor (data directory 14) is a .NET assembly: its
-  // entry point is a stub that jumps to mscoree.dll!_CorExeMain, and there
-  // is no .NET Framework CLR on the console (no mscoree/clr.dll, no GAC,
-  // no fusion, no XNA redist). Fail fast with a dedicated code instead of
-  // dying later at import bind with an unexplained mscoree.dll error.
-  // Deliberately NOT a STUB: binding _CorExeMain to a thunk that returns 0
-  // would make the game "exit 0" silently, which is worse than failing.
-  if (rd32((const u8*)&nt->optional_header.number_of_rva_and_sizes) >
-          TRT_PE_DIR_COM_DESCRIPTOR &&
-      dirs[TRT_PE_DIR_COM_DESCRIPTOR].virtual_address != 0)
-    return fail(&img, be, TRT_ERR_MANAGED,
-                "managed .NET assembly (COM descriptor present); no CLR on console");
 
   // section headers live right after optional header, in the file
   const u8* sec_base = (const u8*)&nt->optional_header +
@@ -764,7 +582,6 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
       }
       off += block_size;
     }
-      img.reloc_fixups = n_fixed;
       char line[96];
       snprintf(line, sizeof(line), "trt: reloc delta=%llx fixed=%u",
                (unsigned long long)delta, n_fixed);
@@ -774,20 +591,35 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
     logf_be(be, "trt: loaded at preferred base, no reloc pass");
   }
 
+  // Publish the allocated, section-mapped, relocated image to *out BEFORE
+  // walking imports so circular DLL dependencies (e.g. libSceGnm.dll <->
+  // libSceGpuAddress.dll) can resolve exports against this in-progress image
+  // without re-entering trt_map_pe recursively.
+  *out = (trt_image*)malloc(sizeof(trt_image));
+  if (!*out) return fail(&img, be, TRT_ERR_ALLOC, "image struct alloc");
+  memcpy(*out, &img, sizeof(img));
+  auto fail_out = [&](int code, const char* detail) -> int {
+    if (*out) {
+      free(*out);
+      *out = nullptr;
+    }
+    return fail(&img, be, code, detail);
+  };
+
   // ---- 6. imports ----
   const u64 imp_va = dirs[TRT_PE_DIR_IMPORT].virtual_address;
   const u64 imp_sz = dirs[TRT_PE_DIR_IMPORT].size;
   u32 n_modules = 0, n_symbols = 0;
   if (imp_va && imp_sz) {
     if (imp_va + imp_sz > size_of_image)
-      return fail(&img, be, TRT_ERR_IMPORT, "import dir out of image");
+      return fail_out(TRT_ERR_IMPORT, "import dir out of image");
     for (u64 d = 0; d + sizeof(trt_import_descriptor) <= imp_sz;
          d += sizeof(trt_import_descriptor)) {
       const trt_import_descriptor* desc =
           (const trt_import_descriptor*)(img.base + imp_va + d);
       if (!desc->first_thunk && !desc->name) break;  // terminator
       if (desc->name >= size_of_image || desc->first_thunk >= size_of_image)
-        return fail(&img, be, TRT_ERR_IMPORT, "import descriptor out of image");
+        return fail_out(TRT_ERR_IMPORT, "import descriptor out of image");
       const char* mod_name = (const char*)(img.base + desc->name);
       const u64 int_rva = desc->original_first_thunk ? desc->original_first_thunk
                                                      : desc->first_thunk;
@@ -796,7 +628,7 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
       for (u64 t = iat_rva;; t += 8) {
         const u64 lt = int_rva + (t - iat_rva);
         if (t + 8 > size_of_image || lt + 8 > size_of_image)
-          return fail(&img, be, TRT_ERR_IMPORT, "IAT runs off image");
+          return fail_out(TRT_ERR_IMPORT, "IAT runs off image");
         const u64 thunk = rd64(img.base + lt);
         if (thunk == 0) break;  // terminator
         const char* sym_name = nullptr;
@@ -805,20 +637,23 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
           ordinal = (u16)(thunk & 0xFFFF);
         } else {
           if (thunk + 2 >= size_of_image)
-            return fail(&img, be, TRT_ERR_IMPORT, "hint/name out of image");
+            return fail_out(TRT_ERR_IMPORT, "hint/name out of image");
           sym_name = (const char*)(img.base + thunk + 2);
           if (strnlen(sym_name, 256) == 256)
-            return fail(&img, be, TRT_ERR_IMPORT, "symbol name not terminated");
+            return fail_out(TRT_ERR_IMPORT, "symbol name not terminated");
         }
         void* fn = rs->resolve(rs->user, mod_name, sym_name, ordinal);
         if (!fn) {
           char det[224];
           snprintf(det, sizeof(det), "%s!%s", mod_name,
                    sym_name ? sym_name : "#ordinal");
-          return fail(&img, be, TRT_ERR_IMPORT, det);
+          return fail_out(TRT_ERR_IMPORT, det);
         }
+#if defined(_WIN32)
+        fn = trace_guest_import(be, mod_name, sym_name, ordinal, fn);
+#endif
         memcpy(img.base + t, &fn, 8);  // bind IAT
-        if (n_symbols == 0) {
+        if (n_symbols == 0 || strncmp(mod_name, "steam_api", 9) == 0) {
           char line[256];
           snprintf(line, sizeof(line), "trt: bind %s!%s -> %p", mod_name,
                    sym_name ? sym_name : "#ordinal", fn);
@@ -840,7 +675,7 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
   const u64 tls_va = dirs[TRT_PE_DIR_TLS].virtual_address;
   if (tls_va) {
     if (tls_va + sizeof(trt_tls_directory64) > size_of_image)
-      return fail(&img, be, TRT_ERR_TLS_BOUNDS, "tls dir out of image");
+      return fail_out(TRT_ERR_TLS_BOUNDS, "tls dir out of image");
     const trt_tls_directory64* tls = (const trt_tls_directory64*)(img.base + tls_va);
     // A TLS directory with AddressOfCallbacks == 0 is legal (TLS data, no
     // callbacks): zero callbacks, NOT a load failure. Without this guard
@@ -858,7 +693,7 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
       const u64 arr_rva =
           (u64)tls->address_of_callbacks - (u64)(uintptr_t)img.base;
       if (arr_rva + 8 > size_of_image)
-        return fail(&img, be, TRT_ERR_TLS_BOUNDS, "tls callback array out of image");
+        return fail_out(TRT_ERR_TLS_BOUNDS, "tls callback array out of image");
       u64 c = arr_rva;
       for (; c + 8 <= size_of_image &&
              img.tls_callback_count < TRT_MAX_TLS_CALLBACKS; c += 8) {
@@ -866,7 +701,7 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
         if (cb == 0) break;
         const u64 cb_rva = cb - (u64)(uintptr_t)img.base;
         if (cb_rva >= size_of_image)
-          return fail(&img, be, TRT_ERR_TLS_BOUNDS, "tls callback out of image");
+          return fail_out(TRT_ERR_TLS_BOUNDS, "tls callback out of image");
         img.tls_callback_rvas[img.tls_callback_count++] = cb_rva;
       }
       // the cap is a real limit, not a silent drop: say so when entries remain
@@ -958,10 +793,10 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
                                     : (u64)dd->module_handle_rva - preferred;
       if (name_rva >= size_of_image || iat_rva >= size_of_image ||
           int_rva >= size_of_image)
-        return fail(&img, be, TRT_ERR_DELAY_IMPORT, "delay descriptor out of image");
+        return fail_out(TRT_ERR_DELAY_IMPORT, "delay descriptor out of image");
       const char* mod_name = (const char*)(img.base + name_rva);
       if (strnlen(mod_name, 256) == 256)
-        return fail(&img, be, TRT_ERR_DELAY_IMPORT, "delay dll name unterminated");
+        return fail_out(TRT_ERR_DELAY_IMPORT, "delay dll name unterminated");
       for (u64 t = 0;; t += 8) {
         if (int_rva + t + 8 > size_of_image || iat_rva + t + 8 > size_of_image)
           break;
@@ -1007,8 +842,6 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
     logf_be(be, line);
   }
 
-  *out = (trt_image*)malloc(sizeof(trt_image));
-  if (!*out) return fail(&img, be, TRT_ERR_ALLOC, "image struct alloc");
   memcpy(*out, &img, sizeof(img));
   char line[160];
   snprintf(line, sizeof(line),
@@ -1030,469 +863,6 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
   return TRT_OK;
 }
 
-// ---------------------------------------------------------------------------
-// M7 Phase 1: PE32 (32-bit) mapping. Same stages as trt_map_pe, with the
-// 32-bit differences called out at each stage:
-//   headers:  trt_nt_headers32 (ImageBase/stack/heap are u32; dirs at +96)
-//   alloc:    host mapping anywhere; the GUEST base is reserved separately
-//             (preferred guest base first, else the lowest free 64 KiB slot
-//             at/above 0x10000000) — relocation is a guest-space concept
-//   relocs:   HIGHLOW only (DIR64 in a PE32 image is malformed); the delta
-//             is guest_base - preferred, NOT host_base - preferred
-//   imports:  4-byte thunks, ordinal flag bit 31; a resolved import binds
-//             to a sibling export's GUEST VA or to a reserved trap address
-//   TLS:      32-bit TLS directory; callbacks collected as RVAs; the TLS
-//             template is RECORDED (tls_*_rva fields) and the index slot
-//             left unwritten — the Phase 2 emulator assigns FS-based TLS
-//   seal:     trt_seal_image handles PE32 (no .pdata unwind registration)
-// LOAD-ONLY: the entry point and TLS callbacks are never called here.
-// ---------------------------------------------------------------------------
-extern "C" int trt_map_pe32(const trt_backend* be, const trt_resolver* rs,
-                            const u8* file, size_t file_size, trt_image** out) {
-  if (!be || !rs || !file || !out || file_size < sizeof(trt_dos_header))
-    return TRT_ERR_BAD_ARGS;
-  *out = nullptr;
-
-  trt_image img;
-  memset(&img, 0, sizeof(img));
-  img.is_pe32 = 1;
-
-  // ---- 1. DOS header ----
-  const trt_dos_header* dos = (const trt_dos_header*)file;
-  if (rd16(file) != 0x5A4D) return fail(&img, be, TRT_ERR_BAD_DOS, "no MZ");
-  u64 nt_off = dos->e_lfanew;
-  if (nt_off < sizeof(trt_dos_header) || nt_off + sizeof(trt_nt_headers32) > file_size)
-    return fail(&img, be, TRT_ERR_BAD_DOS, "e_lfanew out of file");
-
-  // ---- 2. NT headers (PE32) ----
-  const trt_nt_headers32* nt = (const trt_nt_headers32*)(file + nt_off);
-  if (rd32((const u8*)&nt->signature) != 0x00004550)
-    return fail(&img, be, TRT_ERR_BAD_PE, "no PE\\0\\0");
-  if (rd16((const u8*)&nt->file_header.machine) != TRT_PE_MACHINE_I386 ||
-      rd16((const u8*)&nt->optional_header.magic) != TRT_PE_OPT32_MAGIC)
-    return fail(&img, be, TRT_ERR_NOT_PE64, "not PE32 (0x014c/0x010b) on this path");
-  // The optional header must at least cover its fixed part (96 bytes) plus
-  // the data directories it claims; otherwise the directory reads below
-  // would silently consume section-header bytes as RVAs.
-  const u16 opt_size = rd16((const u8*)&nt->file_header.size_of_optional_header);
-  if (opt_size < 96)
-    return fail(&img, be, TRT_ERR_SECTION_BOUNDS, "optional header < 96 bytes");
-  const u32 num_dirs = rd32((const u8*)&nt->optional_header.number_of_rva_and_sizes);
-  if (num_dirs > TRT_PE_NUM_DIRECTORIES ||
-      (u32)opt_size < 96 + 8 * num_dirs)
-    return fail(&img, be, TRT_ERR_SECTION_BOUNDS,
-                "optional header too small for data directories");
-  u32 nsec = rd16((const u8*)&nt->file_header.number_of_sections);
-  if (nsec == 0 || nsec > 96)
-    return fail(&img, be, TRT_ERR_NO_SECTIONS, "section count 0 or >96");
-  u64 size_of_image = rd32((const u8*)&nt->optional_header.size_of_image);
-  u64 section_alignment = rd32((const u8*)&nt->optional_header.section_alignment);
-  if (size_of_image == 0 || size_of_image > TRT_PE_MAX_IMAGE_BYTES ||
-      section_alignment < 4096)
-    return fail(&img, be, TRT_ERR_SIZE_OVERFLOW, "SizeOfImage/alignment insane");
-
-  const u32 preferred32 = rd32((const u8*)&nt->optional_header.image_base);
-  const u64 preferred = preferred32;
-  const u64 entry_rva = rd32((const u8*)&nt->optional_header.address_of_entry_point);
-  const u64 size_headers = rd32((const u8*)&nt->optional_header.size_of_headers);
-  // Directories beyond number_of_rva_and_sizes do not exist: copy the
-  // claimed entries into a zeroed local array so a short directory table
-  // can never be misread as section-header bytes.
-  trt_data_directory dirs_buf[TRT_PE_NUM_DIRECTORIES];
-  memset(dirs_buf, 0, sizeof(dirs_buf));
-  memcpy(dirs_buf, nt->optional_header.directories,
-         sizeof(trt_data_directory) * num_dirs);
-  const trt_data_directory* dirs = dirs_buf;
-
-  // section headers live right after optional header, in the file
-  const u8* sec_base = (const u8*)&nt->optional_header + opt_size;
-  if ((size_t)(sec_base - file) + (size_t)nsec * sizeof(trt_section_header) > file_size)
-    return fail(&img, be, TRT_ERR_SECTION_BOUNDS, "section headers out of file");
-
-  // ---- 3. allocate (host) + reserve (guest) ----
-  const u16 file_chars = rd16((const u8*)&nt->file_header.characteristics);
-  const u16 dll_chars = rd16((const u8*)&nt->optional_header.dll_characteristics);
-  const bool has_relocs = dirs[TRT_PE_DIR_RELOC].virtual_address != 0 &&
-                          dirs[TRT_PE_DIR_RELOC].size != 0;
-  const bool can_relocate =
-      has_relocs ||
-      ((dll_chars & 0x0040u /*IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE*/) &&
-       !(file_chars & 0x0001u /*IMAGE_FILE_RELOCS_STRIPPED*/));
-  // PE32 host allocation NEVER requests a fixed address: the host mapping
-  // address is arbitrary (all fixups use the guest-VA delta, and 32-bit
-  // code never executes on the host). Requesting the preferred base would
-  // be actively dangerous — 0x400000 is both the classic PE32 EXE base
-  // AND the Linux non-PIE load address, so a MAP_FIXED there overwrites
-  // the running process (segfault, found by the Celeste.exe corpus run).
-  // The guest base is reserved independently below.
-  void* base = be->alloc((size_t)size_of_image, 0);
-  if (!base)
-    return fail(&img, be, TRT_ERR_ALLOC, "VirtualAlloc/map failed");
-  if (trt_mem_budget_charge_va(size_of_image) != 0) {
-    be->release(base, (size_t)size_of_image);
-    return fail(&img, be, TRT_ERR_ALLOC, "VA budget refused image");
-  }
-  if (trt_mem_budget_charge_commit(size_of_image) != 0) {
-    trt_mem_budget_discharge_va(size_of_image);
-    be->release(base, (size_t)size_of_image);
-    return fail(&img, be, TRT_ERR_ALLOC, "memory budget refused image");
-  }
-  memset(base, 0, (size_t)size_of_image);
-
-  img.base = (u8*)base;
-  img.preferred_base = preferred;
-  img.size_of_image = size_of_image;
-  img.entry_rva = entry_rva;
-  img.section_count = nsec;
-
-  // Guest-VA reservation: independent of the host mapping. Two DLLs that
-  // share a preferred base (every 0x10000000 DLL in the Celeste corpus)
-  // get distinct guest bases; the loser relocates (HIGHLOW pass below).
-  u32 guest_base = 0;
-  if (pe32_guest_reserve((u8*)base, size_of_image, preferred32, &guest_base) != 0)
-    return fail(&img, be, TRT_ERR_ALLOC, "guest VA space exhausted (PE32)");
-  img.guest_base = guest_base;
-  // PE32 has no .pdata unwind tables (SEH is the FS:0 chain); leave pdata
-  // null so no caller tries to register unwind ranges for this image.
-  img.pdata = nullptr;
-  img.pdata_count = 0;
-
-  // ---- 4. headers + sections (section headers are width-agnostic) ----
-  if (size_headers > size_of_image || size_headers > file_size)
-    return fail(&img, be, TRT_ERR_SECTION_BOUNDS, "SizeOfHeaders out of bounds");
-  memcpy(img.base, file, (size_t)size_headers);
-
-  u64 max_end = size_headers;
-  for (u32 i = 0; i < nsec; ++i) {
-    const trt_section_header* sh =
-        (const trt_section_header*)(sec_base + (size_t)i * sizeof(trt_section_header));
-    const u64 va = rd32((const u8*)&sh->virtual_address);
-    const u64 vsize = rd32((const u8*)&sh->virtual_size);
-    const u64 rsize = rd32((const u8*)&sh->size_of_raw_data);
-    const u64 roff = rd32((const u8*)&sh->pointer_to_raw_data);
-    const u64 mem_sz = vsize ? vsize : rsize;
-    if (va + mem_sz > size_of_image)
-      return fail(&img, be, TRT_ERR_SECTION_BOUNDS, "section VA+VSize > SizeOfImage");
-    if (rsize) {
-      if (roff + rsize > file_size)
-        return fail(&img, be, TRT_ERR_SECTION_BOUNDS, "section raw data out of file");
-      u64 copy_sz = (vsize && rsize > vsize) ? vsize : rsize;
-      if (copy_sz > size_of_image - va) copy_sz = size_of_image - va;
-      memcpy(img.base + va, file + roff, (size_t)copy_sz);
-    }
-    // BSS tail already zero from memset
-    if (va + mem_sz > max_end) max_end = va + mem_sz;
-    char line[96];
-    snprintf(line, sizeof(line), "trt: PE32 sec[%u] %.8s va=%llx sz=%llx%s",
-             i, (const char*)sh->name, (unsigned long long)va,
-             (unsigned long long)vsize, (rd32((const u8*)&sh->characteristics) & TRT_SCN_MEM_EXEC) ? " exec" : "");
-    logf_be(be, line);
-  }
-  if (max_end > size_of_image)
-    return fail(&img, be, TRT_ERR_SECTION_BOUNDS, "sections exceed SizeOfImage");
-
-  // The relocation delta is a GUEST-space delta: the host mapping address
-  // is invisible to guest code, so a host-side relocation needs no fixups.
-  const u32 delta32 = guest_base - preferred32;
-
-  // ---- 5. relocations (only when the guest base differs from preferred) ----
-  if (delta32 != 0) {
-    if (!can_relocate)
-      return fail(&img, be, TRT_ERR_NO_BASE, "guest delta != 0 and no reloc directory");
-    if (!has_relocs) {
-      logf_be(be, "trt: PE32 dynamic-base image has empty .reloc (0 fixups); relocated");
-    } else {
-      const u64 dir_va = dirs[TRT_PE_DIR_RELOC].virtual_address;
-      const u64 dir_sz = dirs[TRT_PE_DIR_RELOC].size;
-      if (dir_va + dir_sz > size_of_image)
-        return fail(&img, be, TRT_ERR_RELOC_BOUNDS, "reloc dir out of image");
-      u64 off = 0;
-      u32 n_fixed = 0;
-      while (off + 8 <= dir_sz) {
-        const u8* blk = img.base + dir_va + off;
-        const u32 page_rva = rd32(blk);
-        const u32 block_size = rd32(blk + 4);
-        if (block_size < 8 || off + block_size > dir_sz)
-          return fail(&img, be, TRT_ERR_RELOC_BOUNDS, "reloc block size corrupt");
-        const u32 n_entries = (block_size - 8) / 2;
-        for (u32 e = 0; e < n_entries; ++e) {
-          const u16 entry = rd16(blk + 8 + (size_t)e * 2);
-          const u32 type = entry >> 12;
-          const u32 fo = entry & 0x0FFF;
-          if (type == TRT_RELOC_ABSOLUTE) continue;
-          const u64 tgt_rva = page_rva + fo;
-          if (tgt_rva + 4 > size_of_image)
-            return fail(&img, be, TRT_ERR_RELOC_BOUNDS, "reloc target out of image");
-          u8* p = img.base + tgt_rva;
-          if (type == TRT_RELOC_HIGHLOW) {
-            u32 v = rd32(p); v += delta32; memcpy(p, &v, 4);
-          } else if (type == TRT_RELOC_DIR64) {
-            return fail(&img, be, TRT_ERR_RELOC_BADTYPE,
-                        "DIR64 reloc in a PE32 image (malformed)");
-          } else {
-            char d[64]; snprintf(d, sizeof(d), "reloc type %u unsupported", type);
-            return fail(&img, be, TRT_ERR_RELOC_BADTYPE, d);
-          }
-          ++n_fixed;
-        }
-        off += block_size;
-      }
-      img.reloc_fixups = n_fixed;
-      char line[96];
-      snprintf(line, sizeof(line), "trt: PE32 reloc guest_delta=%x fixed=%u",
-               delta32, n_fixed);
-      logf_be(be, line);
-    }
-  } else {
-    logf_be(be, "trt: PE32 loaded at preferred guest base, no reloc pass");
-  }
-
-  // Publish the allocated, section-mapped, relocated image to *out BEFORE
-  // walking imports so circular DLL dependencies can resolve exports
-  // against this in-progress image without re-entering trt_map_pe.
-  *out = (trt_image*)malloc(sizeof(trt_image));
-  if (!*out) return fail(&img, be, TRT_ERR_ALLOC, "image struct alloc");
-  memcpy(*out, &img, sizeof(img));
-  auto fail_out = [&](int code, const char* detail) -> int {
-    if (*out) {
-      free(*out);
-      *out = nullptr;
-    }
-    return fail(&img, be, code, detail);
-  };
-
-  // ---- 6. imports (4-byte thunks; ordinal flag is bit 31) ----
-  const u64 imp_va = dirs[TRT_PE_DIR_IMPORT].virtual_address;
-  const u64 imp_sz = dirs[TRT_PE_DIR_IMPORT].size;
-  u32 n_modules = 0, n_symbols = 0;
-  if (imp_va && imp_sz) {
-    if (imp_va + imp_sz > size_of_image)
-      return fail_out(TRT_ERR_IMPORT, "import dir out of image");
-    for (u64 d = 0; d + sizeof(trt_import_descriptor) <= imp_sz;
-         d += sizeof(trt_import_descriptor)) {
-      const trt_import_descriptor* desc =
-          (const trt_import_descriptor*)(img.base + imp_va + d);
-      if (!desc->first_thunk && !desc->name) break;  // terminator
-      if (desc->name >= size_of_image || desc->first_thunk >= size_of_image)
-        return fail_out(TRT_ERR_IMPORT, "import descriptor out of image");
-      const char* mod_name = (const char*)(img.base + desc->name);
-      const u64 int_rva = desc->original_first_thunk ? desc->original_first_thunk
-                                                     : desc->first_thunk;
-      const u64 iat_rva = desc->first_thunk;
-      u32 bound = 0;
-      for (u64 t = iat_rva;; t += 4) {
-        const u64 lt = int_rva + (t - iat_rva);
-        if (t + 4 > size_of_image || lt + 4 > size_of_image)
-          return fail_out(TRT_ERR_IMPORT, "IAT runs off image");
-        const u32 thunk = rd32(img.base + lt);
-        if (thunk == 0) break;  // terminator
-        const char* sym_name = nullptr;
-        u16 ordinal = 0;
-        if (thunk & 0x80000000u) {
-          ordinal = (u16)(thunk & 0xFFFF);
-        } else {
-          if (thunk + 2 >= size_of_image)
-            return fail_out(TRT_ERR_IMPORT, "hint/name out of image");
-          sym_name = (const char*)(img.base + thunk + 2);
-          if (strnlen(sym_name, 256) == 256)
-            return fail_out(TRT_ERR_IMPORT, "symbol name not terminated");
-        }
-        void* fn = rs->resolve(rs->user, mod_name, sym_name, ordinal);
-        if (!fn) {
-          char det[224];
-          snprintf(det, sizeof(det), "%s!%s", mod_name,
-                   sym_name ? sym_name : "#ordinal");
-          return fail_out(TRT_ERR_IMPORT, det);
-        }
-        u32 slot = 0;
-        int is_trap = 0;
-        if (pe32_bind_value(fn, mod_name, sym_name, ordinal, 0, &slot, &is_trap) != 0)
-          return fail_out(TRT_ERR_IMPORT, "PE32 trap table full");
-        memcpy(img.base + t, &slot, 4);  // bind IAT (4 bytes)
-        if (is_trap) ++img.pe32_trap_count; else ++img.pe32_guestva_count;
-        if (n_symbols == 0) {
-          char line[256];
-          snprintf(line, sizeof(line), "trt: PE32 bind %s!%s -> %08x%s",
-                   mod_name, sym_name ? sym_name : "#ordinal", slot,
-                   is_trap ? " (trap)" : " (guest VA)");
-          logf_be(be, line);
-        }
-        ++bound; ++n_symbols;
-      }
-      char line[160];
-      snprintf(line, sizeof(line), "trt: PE32 import %s bound=%u", mod_name, bound);
-      logf_be(be, line);
-      ++n_modules;
-    }
-  } else {
-    logf_be(be, "trt: PE32 no import directory");
-  }
-  (void)n_modules; (void)n_symbols;
-
-  // ---- 7. TLS (32-bit directory; callbacks collected as RVAs) ----
-  const u64 tls_va = dirs[TRT_PE_DIR_TLS].virtual_address;
-  if (tls_va) {
-    if (tls_va + sizeof(trt_tls_directory32) > size_of_image)
-      return fail_out(TRT_ERR_TLS_BOUNDS, "tls dir out of image");
-    const trt_tls_directory32* tls = (const trt_tls_directory32*)(img.base + tls_va);
-    // The TLS directory's VAs are GUEST VAs: the reloc pass above already
-    // adjusted them by delta32 (when fixups cover them), so translate
-    // through the guest base — never the host base.
-    const u32 cb_va = tls->address_of_callbacks;
-    if (cb_va == 0) {
-      img.tls_callback_count = 0;
-      logf_be(be, "trt: PE32 tls dir: AddressOfCallbacks==0, no callbacks");
-    } else {
-      const u64 arr_rva = (u64)cb_va - (u64)guest_base;
-      if (arr_rva + 4 > size_of_image)
-        return fail_out(TRT_ERR_TLS_BOUNDS, "tls callback array out of image");
-      u64 c = arr_rva;
-      for (; c + 4 <= size_of_image &&
-             img.tls_callback_count < TRT_MAX_TLS_CALLBACKS; c += 4) {
-        const u32 cb = rd32(img.base + c);
-        if (cb == 0) break;
-        const u64 cb_rva = (u64)cb - (u64)guest_base;
-        if (cb_rva >= size_of_image)
-          return fail_out(TRT_ERR_TLS_BOUNDS, "tls callback out of image");
-        img.tls_callback_rvas[img.tls_callback_count++] = cb_rva;
-      }
-      if (img.tls_callback_count >= TRT_MAX_TLS_CALLBACKS &&
-          c + 4 <= size_of_image && rd32(img.base + c) != 0) {
-        logf_be(be, "trt: PE32 tls callbacks truncated at cap (more entries present)");
-      }
-    }
-    // TLS template: RECORDED for the Phase 2 emulator's FS-based TLS
-    // (32-bit code reads fs:[0x2C], not gs:[0x58]). The index slot is
-    // LEFT UNWRITTEN — the 64-bit gs-based TEB machinery is the wrong
-    // model here, and writing a 64-bit TLS index into a 32-bit image
-    // would be a lie the emulator would have to undo.
-    {
-      const u64 raw_start_rva =
-          (u64)tls->start_address_of_raw_data - (u64)guest_base;
-      const u64 raw_end_rva =
-          (u64)tls->end_address_of_raw_data - (u64)guest_base;
-      const u64 index_rva = (u64)tls->address_of_index - (u64)guest_base;
-      const u64 raw_size =
-          raw_end_rva > raw_start_rva ? raw_end_rva - raw_start_rva : 0;
-      if (raw_start_rva <= size_of_image && index_rva + 4 <= size_of_image) {
-        img.tls_data_rva = (u32)raw_start_rva;
-        img.tls_data_size = (u32)raw_size;
-        img.tls_zero_fill = tls->size_of_zero_fill;
-        img.tls_index_rva = (u32)index_rva;
-      }
-    }
-    char line[128];
-    snprintf(line, sizeof(line),
-             "trt: PE32 tls callbacks=%d data_rva=%x size=%u zerofill=%u",
-             img.tls_callback_count, img.tls_data_rva, img.tls_data_size,
-             img.tls_zero_fill);
-    logf_be(be, line);
-  }
-
-  // ---- 8. delay imports (4-byte thunks; unresolvable -> trap, not fatal) ----
-  // Same eager-bind discipline as the 64-bit path: resolvable symbols get
-  // their guest VA / trap, unresolvable ones get a trap address recorded
-  // with a NULL host fn — the Phase 2 dispatcher logs the call
-  // fail-visible instead of calling. A delay import never fails the load.
-  if (dirs[TRT_PE_DIR_DELAY_IMPORT].virtual_address) {
-    const u64 dd_va = dirs[TRT_PE_DIR_DELAY_IMPORT].virtual_address;
-    const u64 dd_sz = dirs[TRT_PE_DIR_DELAY_IMPORT].size;
-    u32 n_delay_mods = 0, n_delay_bound = 0, n_delay_stub = 0;
-    for (u64 d = 0; d + sizeof(trt_delayload_descriptor) <= (dd_sz ? dd_sz : 4096);
-         d += sizeof(trt_delayload_descriptor)) {
-      if (dd_va + d + sizeof(trt_delayload_descriptor) > size_of_image) break;
-      const trt_delayload_descriptor* dd =
-          (const trt_delayload_descriptor*)(img.base + dd_va + d);
-      if (!dd->name_rva && !dd->iat_rva) break;  // terminator
-      const int rva_based = (dd->attributes & 1u) != 0;
-      // Legacy descriptors store VAs, not RVAs. The value read from the
-      // mapped image is post-reloc: a guest VA when fixups cover the
-      // field, a preferred-base VA when they do not. Try the guest base
-      // first, fall back to the preferred base; the bounds check below
-      // rejects anything that lands outside the image either way.
-      auto va_to_rva = [&](u32 field) -> u64 {
-        if (rva_based) return field;
-        const u64 rg = (u64)field - (u64)guest_base;
-        if (rg < size_of_image) return rg;
-        return (u64)field - preferred;
-      };
-      const u64 name_rva = va_to_rva(dd->name_rva);
-      const u64 iat_rva = va_to_rva(dd->iat_rva);
-      const u64 int_rva = va_to_rva(dd->int_rva);
-      const u64 mod_rva = va_to_rva(dd->module_handle_rva);
-      if (name_rva >= size_of_image || iat_rva >= size_of_image ||
-          int_rva >= size_of_image)
-        return fail_out(TRT_ERR_DELAY_IMPORT, "delay descriptor out of image");
-      const char* mod_name = (const char*)(img.base + name_rva);
-      if (strnlen(mod_name, 256) == 256)
-        return fail_out(TRT_ERR_DELAY_IMPORT, "delay dll name unterminated");
-      for (u64 t = 0;; t += 4) {
-        if (int_rva + t + 4 > size_of_image || iat_rva + t + 4 > size_of_image)
-          break;
-        const u32 thunk = rd32(img.base + int_rva + t);
-        if (thunk == 0) break;
-        const char* sym_name = nullptr;
-        u16 ordinal = 0;
-        if (thunk & 0x80000000u) {
-          ordinal = (u16)(thunk & 0xFFFF);
-        } else {
-          if (thunk + 2 >= size_of_image) break;
-          sym_name = (const char*)(img.base + thunk + 2);
-          if (strnlen(sym_name, 256) == 256) break;
-        }
-        void* fn = rs->resolve(rs->user, mod_name, sym_name, ordinal);
-        u32 slot = 0;
-        int is_trap = 0;
-        if (fn) {
-          if (pe32_bind_value(fn, mod_name, sym_name, ordinal, 1, &slot,
-                              &is_trap) != 0)
-            return fail_out(TRT_ERR_DELAY_IMPORT, "PE32 trap table full");
-          memcpy(img.base + iat_rva + t, &slot, 4);
-          if (is_trap) ++img.pe32_trap_count; else ++img.pe32_guestva_count;
-          ++n_delay_bound;
-        } else {
-          if (pe32_trap_alloc(mod_name, sym_name, ordinal, nullptr, 1,
-                              &slot) != 0)
-            return fail_out(TRT_ERR_DELAY_IMPORT, "PE32 trap table full");
-          memcpy(img.base + iat_rva + t, &slot, 4);
-          ++img.pe32_trap_count;
-          ++n_delay_stub;
-        }
-      }
-      // the guest may ask for the module handle: give it a non-null sentinel
-      if (mod_rva && mod_rva + 4 <= size_of_image) {
-        u32 sentinel = 0x1000;
-        memcpy(img.base + mod_rva, &sentinel, 4);
-      }
-      char line[160];
-      snprintf(line, sizeof(line), "trt: PE32 DELAY import %s bound=%u stub=%u",
-               mod_name, n_delay_bound, n_delay_stub);
-      logf_be(be, line);
-      ++n_delay_mods;
-    }
-    char line[128];
-    snprintf(line, sizeof(line),
-             "trt: PE32 delay imports modules=%u bound=%u stub=%u",
-             n_delay_mods, n_delay_bound, n_delay_stub);
-    logf_be(be, line);
-  }
-
-  memcpy(*out, &img, sizeof(img));
-  char line[192];
-  snprintf(line, sizeof(line),
-           "trt: PE32 MAPPED host=%llx guest=%08x preferred=%08x size=%llx entry=%llx traps=%u guestva=%u",
-           (unsigned long long)(uintptr_t)img.base, guest_base, preferred32,
-           (unsigned long long)size_of_image, (unsigned long long)entry_rva,
-           img.pe32_trap_count, img.pe32_guestva_count);
-  logf_be(be, line);
-#if defined(__has_feature)
-#  if __has_feature(address_sanitizer)
-  if (asan_unpoison) asan_unpoison(img.base, size_of_image);
-#  endif
-#endif
-  return TRT_OK;
-}
-
 extern "C" int trt_seal_image(const trt_backend* be, trt_image* img) {
   if (!be || !img || !img->base) return TRT_ERR_BAD_ARGS;
   // walk section table in the mapped copy of the headers (NT headers sit at
@@ -1500,11 +870,6 @@ extern "C" int trt_seal_image(const trt_backend* be, trt_image* img) {
   const trt_dos_header* dos = (const trt_dos_header*)img->base;
   const trt_nt_headers64* nt =
       (const trt_nt_headers64*)(img->base + dos->e_lfanew);
-  // The section table is located via size_of_optional_header, which is
-  // width-agnostic — but the exception directory is NOT (PE32 dirs start
-  // 16 bytes earlier), so read the magic first.
-  const u16 magic = rd16((const u8*)&nt->optional_header.magic);
-  const int is_pe32 = (magic == TRT_PE_OPT32_MAGIC);
   const u8* sec_base = (const u8*)&nt->optional_header +
                        rd16((const u8*)&nt->file_header.size_of_optional_header);
   for (u32 i = 0; i < img->section_count; ++i) {
@@ -1523,19 +888,11 @@ extern "C" int trt_seal_image(const trt_backend* be, trt_image* img) {
   }
   logf_be(be, "trt: SEALED (W^X: code pages now RX, no RWX ever)");
 
-  // PE32 has no .pdata unwind tables: 32-bit SEH is the runtime FS:0
-  // chain, and register_unwind (RtlAddFunctionTable) has no 32-bit
-  // meaning. The Phase 2 emulator owns fault mapping. Seal is complete.
-  if (is_pe32) {
-    logf_be(be, "trt: PE32: no .pdata unwind (SEH is the FS:0 chain; Phase 2 owns it)");
-    return TRT_OK;
-  }
-
   // ---- unwind registration: the OS unwinder cannot see VirtualAlloc'd code
   // until its .pdata is registered. Without this, the FIRST guest C++
   // exception kills the whole process. This is boot-critical, not optional.
   const trt_data_directory* ex =
-      trt_pe_directories(&nt->optional_header, magic) + TRT_PE_DIR_EXCEPTION;
+      &nt->optional_header.directories[TRT_PE_DIR_EXCEPTION];
   if (ex->virtual_address && ex->size && be->register_unwind) {
     const u32 count = ex->size / 12;  // RUNTIME_FUNCTION = 12 bytes (3 x u32)
     const int rc = be->register_unwind(img->base, img->base + ex->virtual_address,
@@ -1555,7 +912,6 @@ extern "C" int trt_seal_image(const trt_backend* be, trt_image* img) {
 extern "C" void trt_unmap(const trt_backend* be, trt_image* img) {
   if (!be || !img) return;
   if (img->base) {
-    if (img->is_pe32) pe32_guest_release_by_host(img->base);
     be->release(img->base, (size_t)img->size_of_image);
     trt_mem_budget_discharge_commit(img->size_of_image);
     trt_mem_budget_discharge_va(img->size_of_image);
@@ -1597,34 +953,31 @@ bool fv_rva2off(const file_view& fv, u64 rva, u64* out_off) {
 
 using ::trt_resolve_module;
 
-// Width-parameterized audit core: is_pe32 selects 4-byte thunks (ordinal
-// flag bit 31) and the PE32 header layout; otherwise 8-byte thunks
-// (ordinal flag bit 63) and PE64. The resolver is width-independent:
-// bindability of a module!symbol does not depend on the caller's width.
-// The audit allocates NO trap addresses (it is side-effect-free file
-// inspection; traps are allocated at map time).
-static int audit_imports_impl(const u8* file, size_t file_size,
-                              std::vector<std::string>* missing, int is_pe32) {
+extern "C" int trt_audit_imports(const u8* file, size_t file_size,
+                                  void* missing_out) {
+  if (!file || file_size < sizeof(trt_dos_header) || !missing_out)
+    return TRT_ERR_BAD_ARGS;
+  std::vector<std::string>* missing = (std::vector<std::string>*)missing_out;
+  missing->clear();
+
   const trt_dos_header* dos = (const trt_dos_header*)file;
+  if (rd16(file) != 0x5A4D) return TRT_ERR_BAD_DOS;
   const u64 nt_off = dos->e_lfanew;
-  // Machine/magic were validated by the dispatcher; the optional header
-  // starts at nt_off + 24 in both widths. SizeOfImage is at optional + 56
-  // in both; ImageBase is at +28 (PE32, u32) vs +24 (PE64, u64).
-  const u8* opt = file + nt_off + 24;
-  const u16 magic = is_pe32 ? TRT_PE_OPT32_MAGIC : TRT_PE_OPT64_MAGIC;
-  const u32 nsec = rd16(file + nt_off + 6);  // number_of_sections
+  if (nt_off + sizeof(trt_nt_headers64) > file_size) return TRT_ERR_BAD_DOS;
+  const trt_nt_headers64* nt = (const trt_nt_headers64*)(file + nt_off);
+  if (rd32((const u8*)&nt->signature) != 0x00004550) return TRT_ERR_BAD_PE;
+  if (rd16((const u8*)&nt->file_header.machine) != TRT_PE_MACHINE_X64 ||
+      rd16((const u8*)&nt->optional_header.magic) != TRT_PE_OPT64_MAGIC)
+    return TRT_ERR_NOT_PE64;
+  const u32 nsec = rd16((const u8*)&nt->file_header.number_of_sections);
   if (nsec == 0 || nsec > 96) return TRT_ERR_NO_SECTIONS;
-  const u64 size_of_image = rd32(opt + 56);
-  const u64 preferred = is_pe32 ? rd32(opt + 28) : rd64(opt + 24);
-  const trt_data_directory* dirs = trt_pe_directories(opt, magic);
-  // Managed (.NET) assemblies never reach import bind: the CLR header is
-  // the verdict.
-  const u32 num_dirs = is_pe32 ? rd32(opt + 92) : rd32(opt + 108);
-  if (num_dirs > TRT_PE_DIR_COM_DESCRIPTOR &&
-      dirs[TRT_PE_DIR_COM_DESCRIPTOR].virtual_address != 0)
-    return TRT_ERR_MANAGED;
-  const u64 sec_off =
-      nt_off + 24 + rd16(file + nt_off + 20);  // size_of_optional_header
+  const u64 size_of_image =
+      rd32((const u8*)&nt->optional_header.size_of_image);
+  const u64 preferred =
+      rd64((const u8*)&nt->optional_header.image_base);
+  const trt_data_directory* dirs = nt->optional_header.directories;
+  const u64 sec_off = (u64)((const u8*)&nt->optional_header +
+      rd16((const u8*)&nt->file_header.size_of_optional_header) - file);
   file_view fv{file, file_size, sec_off, nsec};
 
   // the real resolver — identical to trt_map_pe's import bind
@@ -1658,16 +1011,15 @@ static int audit_imports_impl(const u8* file, size_t file_size,
       if (strnlen(mod_name, 256) == 256) break;
       const u32 ilt_rva = desc.original_first_thunk ? desc.original_first_thunk
                                                     : desc.first_thunk;
-      const u64 stride = is_pe32 ? 4 : 8;
-      for (u64 t = 0;; t += stride) {
+      for (u64 t = 0;; t += 8) {
         u64 toff;
         if (!fv_rva2off(fv, ilt_rva + t, &toff)) break;
-        if (toff + stride > file_size) break;
-        const u64 thunk = is_pe32 ? rd32(file + toff) : rd64(file + toff);
+        if (toff + 8 > file_size) break;
+        const u64 thunk = rd64(file + toff);
         if (thunk == 0) break;
         const char* sym_name = nullptr;
         u16 ordinal = 0;
-        if (is_pe32 ? (thunk & 0x80000000u) : (thunk >> 63)) {
+        if (thunk >> 63) {
           ordinal = (u16)(thunk & 0xFFFF);
         } else {
           u64 hoff;
@@ -1716,16 +1068,15 @@ static int audit_imports_impl(const u8* file, size_t file_size,
         break;
       const char* mod_name = (const char*)(file + name_off);
       if (strnlen(mod_name, 256) == 256) break;
-      const u64 stride = is_pe32 ? 4 : 8;
-      for (u64 t = 0;; t += stride) {
+      for (u64 t = 0;; t += 8) {
         u64 toff;
         if (!fv_rva2off(fv, int_rva + t, &toff)) break;
-        if (toff + stride > file_size) break;
-        const u64 thunk = is_pe32 ? rd32(file + toff) : rd64(file + toff);
+        if (toff + 8 > file_size) break;
+        const u64 thunk = rd64(file + toff);
         if (thunk == 0) break;
         const char* sym_name = nullptr;
         u16 ordinal = 0;
-        if (is_pe32 ? (thunk & 0x80000000u) : (thunk >> 63)) {
+        if (thunk >> 63) {
           ordinal = (u16)(thunk & 0xFFFF);
         } else {
           u64 hoff;
@@ -1752,31 +1103,8 @@ static int audit_imports_impl(const u8* file, size_t file_size,
     }
   }
 
-  snprintf(line, sizeof(line), "audit%s: %llu/%llu imports resolve",
-           is_pe32 ? " (PE32)" : "",
+  snprintf(line, sizeof(line), "audit: %llu/%llu imports resolve",
            (unsigned long long)resolved, (unsigned long long)total);
   trt_core_log(line);
   return TRT_OK;
-}
-
-extern "C" int trt_audit_imports(const u8* file, size_t file_size,
-                                  void* missing_out) {
-  if (!file || file_size < sizeof(trt_dos_header) || !missing_out)
-    return TRT_ERR_BAD_ARGS;
-  std::vector<std::string>* missing = (std::vector<std::string>*)missing_out;
-  missing->clear();
-
-  const trt_dos_header* dos = (const trt_dos_header*)file;
-  if (rd16(file) != 0x5A4D) return TRT_ERR_BAD_DOS;
-  const u64 nt_off = dos->e_lfanew;
-  if (nt_off + sizeof(trt_nt_headers64) > file_size) return TRT_ERR_BAD_DOS;
-  const trt_nt_headers64* nt = (const trt_nt_headers64*)(file + nt_off);
-  if (rd32((const u8*)&nt->signature) != 0x00004550) return TRT_ERR_BAD_PE;
-  const u16 machine = rd16((const u8*)&nt->file_header.machine);
-  const u16 magic = rd16((const u8*)&nt->optional_header.magic);
-  if (machine == TRT_PE_MACHINE_X64 && magic == TRT_PE_OPT64_MAGIC)
-    return audit_imports_impl(file, file_size, missing, 0);
-  if (machine == TRT_PE_MACHINE_I386 && magic == TRT_PE_OPT32_MAGIC)
-    return audit_imports_impl(file, file_size, missing, 1);
-  return TRT_ERR_NOT_PE64;
 }

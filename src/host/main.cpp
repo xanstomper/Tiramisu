@@ -12,11 +12,6 @@
 #include "webxfer.h"
 #include "settings.h"
 #include "../trt/trt.h"
-#include "../trt/mono_host.h"
-#include "../trt/fna_platform.h"
-#include "../trt/fna3d_host.h"
-#include "../trt/trt_trace.h"
-#include "FNA3D.h"
 #include "../trt/bridge_res.h"
 #include "../trt/bridge_nvapi.h"
 #include "../trt/iso.h"
@@ -51,8 +46,6 @@
 #include <dwrite.h>
 #include <d3d11.h>
 #include <xinput.h>
-#include <winrt/Windows.UI.Input.h>
-#include "native_gameinput.h"
 
 // timeBeginPeriod is desktop-partition in the SDK headers (not declared
 // under WINAPI_FAMILY_APP), but callable from the AppContainer at runtime —
@@ -63,6 +56,8 @@ extern "C" unsigned int __stdcall timeBeginPeriod(unsigned int uPeriod);
 // directly (item 5: the force-kill watchdog's last resort).
 extern "C" int __stdcall TerminateThread(void* hThread,
                                          unsigned long dwExitCode);
+#include <winrt/Windows.UI.Input.h>
+#include "native_gameinput.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1019,14 +1014,11 @@ void rescan_one_game(const std::string& name) {
   g_last_rescan_ms = (ULONGLONG)GetTickCount64();
 }
 
+extern "C" void trt_mem_budget_report(char* line, unsigned cap);
 extern "C" int trt_mem_budget_charge_va(u64 bytes);
 extern "C" void trt_mem_budget_discharge_va(u64 bytes);
 extern "C" void trt_mem_budget_reset(void);
 
-
-extern "C" void trt_mem_budget_report(char* line, unsigned cap);
-
-// Brown-line diagnostics: report guest/app memory at boot stages.
 void log_guest_memory(const char* stage) {
   constexpr u64 mib = 1024ULL * 1024ULL;
   char budget[192];
@@ -1190,6 +1182,25 @@ static int guest_seh_filter(EXCEPTION_POINTERS* ep) {
              (unsigned long)record.ExceptionCode, where);
   }
   longan::log_line(line);
+  if (ep->ContextRecord) {
+    const CONTEXT& c = *ep->ContextRecord;
+    snprintf(line, sizeof(line),
+             "guest fault regs: rip=%016llx rsp=%016llx rbp=%016llx rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx",
+             (unsigned long long)c.Rip, (unsigned long long)c.Rsp,
+             (unsigned long long)c.Rbp, (unsigned long long)c.Rax,
+             (unsigned long long)c.Rbx, (unsigned long long)c.Rcx,
+             (unsigned long long)c.Rdx);
+    longan::log_line(line);
+    snprintf(line, sizeof(line),
+             "guest fault regs: rsi=%016llx rdi=%016llx r8=%016llx r9=%016llx r10=%016llx r11=%016llx r12=%016llx r13=%016llx r14=%016llx r15=%016llx eflags=%08lx",
+             (unsigned long long)c.Rsi, (unsigned long long)c.Rdi,
+             (unsigned long long)c.R8, (unsigned long long)c.R9,
+             (unsigned long long)c.R10, (unsigned long long)c.R11,
+             (unsigned long long)c.R12, (unsigned long long)c.R13,
+             (unsigned long long)c.R14, (unsigned long long)c.R15,
+             (unsigned long)c.EFlags);
+    longan::log_line(line);
+  }
   DWORD64 frames[32];
   const int count = capture_fault_stack(ep->ContextRecord, frames, 32);
   for (int i = 1; i < count; ++i) {
@@ -1398,67 +1409,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   trt_runtime_init(&be, exe_dir.c_str());
   trt_resolver* runtime_rs = trt_runtime_resolver();
 
-  std::ifstream f(exe_path, std::ios::binary);
-  if (!f) {
-    snprintf(r.detail, sizeof(r.detail), "cannot open %s", exe_path.c_str());
-    return r;
-  }
-  std::vector<u8> buf((std::istreambuf_iterator<char>(f)),
-                      std::istreambuf_iterator<char>());
-
-  snprintf(line, sizeof(line), "trt: launching %s (%zu bytes)", exe_path.c_str(),
-           buf.size());
-  longan::log_line(line);
-
-  // Managed (.NET) games don't go through the native PE loader: their
-  // entry point is mscoree!_CorExeMain and their code is IL. Route them
-  // to the embedded Mono runtime instead (Path B). On UWP this fails
-  // NAMED until the Mono-for-UWP step lands (no runtime in-tree yet);
-  // offline it runs the game under Mono + the FNA stack.
-  if (trt_pe_is_managed(buf.data(), buf.size())) {
-    longan::log_line("trt: managed exe detected, routing to Mono");
-    trt_mono_config mcfg = {};
-    mcfg.exe_path = exe_path.c_str();
-    mcfg.log = [](const char* l) { longan::log_line(l); };
-    // Console managed games use the Tiramisu FNA backend (host
-    // CoreWindow + host input), never SDL.
-    mcfg.fna_platform = "tiramisu";
-    // FNA3D device handoff (Celeste hang fix): the Tiramisu backend
-    // never calls FNA3D_PrepareWindowAttributes, so selectedDriver
-    // stays -1 and FNA3D_CreateDevice returns NULL (silent no-render
-    // spin). Attach the host D3D device + install FNA3D log hooks,
-    // THEN select the driver. Both TOGETHER: PrepareWindowAttributes
-    // without the attach takes the stock D3D11 path (garbage-HWND
-    // swapchain -> AV).
-    trt_trace("TRACE fna3d attach enter");
-    {
-      int arc = trt_fna3d_attach_from_hooks(
-          [](const char* l) { longan::log_line(l); });
-      char ab[128];
-      snprintf(ab, sizeof(ab), "TRACE fna3d attach rc=%d attached=%d",
-               arc, trt_fna3d_is_attached());
-      trt_trace(ab);
-      if (!trt_fna3d_is_attached()) {
-        // FATAL guard: a failed attach must stop the launch here. Without
-        // it, PrepareWindowAttributes takes the stock D3D11 probe path
-        // (which succeeds on UWP) and CreateDevice builds a swapchain
-        // against a garbage window handle -> NULL deref AV.
-        longan::log_line("trt: FATAL fna3d attach failed - refusing stock D3D11 path");
-        r.map_rc = TRT_ERR_FNA3D;
-        strncpy(r.detail, trt_fna3d_last_error(), sizeof(r.detail) - 1);
-        return r;
-      }
-    }
-    trt_trace("TRACE PrepareWindowAttributes enter");
-    FNA3D_PrepareWindowAttributes();
-    trt_trace("TRACE PrepareWindowAttributes ok");
-    r.map_rc = trt_mono_run(&mcfg, nullptr, 0, nullptr);
-    if (r.map_rc != TRT_OK) {
-      strncpy(r.detail, trt_mono_last_error(), sizeof(r.detail) - 1);
-    }
-    return r;
-  }
-
+  log_guest_memory("before image load");
   trt_image* img = nullptr;
   {
     std::ifstream f(exe_path, std::ios::binary | std::ios::ate);
@@ -1801,7 +1752,7 @@ static void TRT_GUEST_ABI host_builtin_log_u32(unsigned tag, unsigned value) {
   longan::log_line(line);
 }
 static unsigned TRT_GUEST_ABI host_builtin_query_build(void) {
-  return 0x00020000u;  // runtime build 0.2.0
+  return 0x00020100u;  // runtime build 0.2.1
 }
 
 struct tiramisu_host
@@ -1830,10 +1781,7 @@ struct tiramisu_host
 
   void SetWindow(CoreWindow const& window) {
     m_window = window;
-    // The FNA backend renders into this CoreWindow: hand its ABI
-    // pointer to the native FNA layer (FNA's CreateWindow returns it;
-    // the FNA3D D3D11 driver consumes it later).
-    trt_fna_set_window_handle((void*)winrt::get_abi(window));
+    window.PointerCursor(CoreCursor(CoreCursorType::Arrow, 0));
     const auto sc = longan::swapchain_create(window);
     char line[256];
     snprintf(line, sizeof(line),
@@ -2113,8 +2061,6 @@ struct tiramisu_host
         ws2u8(winrt::Windows::Storage::ApplicationData::Current()
                   .LocalFolder()
                   .Path());
-    // Managed (FNA) games save under LocalState.
-    trt_fna_set_storage_root(g_local_state.c_str());
     g_games_dir = g_local_state + "\\games";
     longan::log_open(install);
     char line[256];
@@ -2382,9 +2328,17 @@ struct tiramisu_host
     enable_keyboard_interceptor();
 
     int mouse_vx = 960, mouse_vy = 540;
+    auto next_guest_memory_sample = std::chrono::steady_clock::now();
     auto next_heartbeat = std::chrono::steady_clock::now();
     g_boot_ms = (ULONGLONG)GetTickCount64();
     while (!g_shutdown.load()) {
+      if (g_guest_running.load()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_guest_memory_sample) {
+          log_guest_memory("running");
+          next_guest_memory_sample = now + std::chrono::seconds(2);
+        }
+      }
       // Heartbeat (item 10): a line every 60 s so a wedged app is
       // distinguishable from a quiet one in tiramisu.log. Wall clock, not
       // frame count — m_frames freezes while a guest runs (Sleep(4) +
@@ -2403,6 +2357,7 @@ struct tiramisu_host
           longan::log_line(hb);
         }
       }
+      trt_input_frame_begin();
       CoreWindow::GetForCurrentThread()
           .Dispatcher()
           .ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
@@ -2927,10 +2882,12 @@ struct tiramisu_host
                 snprintf(line, sizeof(line), "launch %s: rc=%s (%s)",
                          want.c_str(), trt_errstr(gr.map_rc), gr.detail);
                 longan::log_line(line);
-                set_guest_status(want + ": " + trt_errstr(gr.map_rc));
+                set_guest_status(want + ": " + (gr.map_rc == TRT_OK ? gr.detail
+                                                                   : trt_errstr(gr.map_rc)));
                 if (stack_charged)
                   trt_mem_budget_discharge_va(1024ull * 1024ull);
                 g_running_game_name.clear();
+                longan::webxfer_set_running_game("");
                 g_guest_running.store(false);
               });
               break;
@@ -3011,8 +2968,8 @@ struct tiramisu_host
         fps_last = now;
       }
       const std::string transfer_url = longan::webxfer_url();
-      longan::ui_set_transfer(u82ws(transfer_url),
-                               u82ws(longan::webxfer_status_line()));
+      const std::string status_line = longan::webxfer_status_line();
+      longan::ui_set_transfer(u82ws(transfer_url), u82ws(status_line));
       const bool showing_setup = g_setup_active || g_screen == longan::UI_SETUP;
       longan::ui_set_qr(showing_setup ? transfer_url
                         : g_steam_busy ? g_steam_qr
@@ -3031,7 +2988,7 @@ struct tiramisu_host
         }
         longan::ui_set_games(uig, g_selected);
         std::vector<std::wstring> lines;
-        lines.push_back(u82ws(longan::webxfer_status_line()));
+        lines.push_back(u82ws(status_line));
         lines.push_back(u82ws(get_guest_status()));
         lines.push_back(u82ws(g_steam_status +
                               (g_mouse_mode ? "  |  PAD MOUSE (F1)" : "") +

@@ -34,8 +34,12 @@ struct guest_image {
   char name[64];      // "engine.dll"
   char path[512];     // host path it came from
   trt_image* img;
+  trt_image** pending_img;
   void* handle;
   bool is_dll;
+  bool sealed;
+  bool want_entry;
+  bool init_dispatched;
   bool entry_called;
   bool thread_calls_disabled;
 };
@@ -47,7 +51,15 @@ int g_image_count = 0;
 // whichever image happened to register first (a DLL can register before
 // the exe while the exe's own imports bind).
 trt_image* g_main_image = nullptr;
+int g_init_order[TRT_MAX_GUEST_IMAGES];
+int g_init_order_count = 0;
 std::mutex g_img_mu;
+// Serializes a complete dependency graph, including reentrant loads.
+std::recursive_mutex g_loader_mu;
+
+inline trt_image* slot_image(const guest_image& g) {
+  return g.img ? g.img : (g.pending_img ? *g.pending_img : nullptr);
+}
 
 const trt_backend* g_be = nullptr;
 trt_resolver g_rs;
@@ -261,12 +273,14 @@ trt_image* trt_images_find(const char* name) {
   if (!name) return nullptr;
   const char* base = base_name(name);
   for (int i = 0; i < g_image_count; ++i)
-    if (ieq(g_images[i].name, base)) return g_images[i].img;
+    if (g_images[i].name[0] && ieq(g_images[i].name, base))
+      return slot_image(g_images[i]);
   if (!has_dot_in_base(base) && !ends_with_dot(base)) {
     char with_ext[128];
     if (snprintf(with_ext, sizeof(with_ext), "%s.dll", base) < (int)sizeof(with_ext)) {
       for (int i = 0; i < g_image_count; ++i)
-        if (ieq(g_images[i].name, with_ext)) return g_images[i].img;
+        if (g_images[i].name[0] && ieq(g_images[i].name, with_ext))
+          return slot_image(g_images[i]);
     }
   }
   return nullptr;
@@ -454,6 +468,7 @@ static trt_image* try_load_sibling(const char* module) {
 
 void* trt_resolve_full(void* user, const char* module, const char* symbol,
                        u16 ordinal) {
+  std::lock_guard<std::recursive_mutex> graph_lock(g_loader_mu);
   (void)user;
   if (!module) return nullptr;
 
@@ -482,6 +497,7 @@ void* trt_resolve_full(void* user, const char* module, const char* symbol,
 
 trt_image* trt_load_pe(const char* host_path, const char* guest_name,
                        int run_entry) {
+  std::lock_guard<std::recursive_mutex> graph_lock(g_loader_mu);
   if (!g_be || !host_path) return nullptr;
   // STAGE 7 guard: re-entrant trt_load_pe (the exe's static CRT init or a
   // DllMain loads a DLL) would run tls callbacks again for the SAME image
@@ -494,16 +510,22 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
   if (!has_dot_in_base(req_base) && !ends_with_dot(req_base)) {
     snprintf(req_with_ext, sizeof(req_with_ext), "%s.dll", req_base);
   }
-  for (int i = 0; i < g_image_count; ++i)
+  for (int i = 0; i < g_image_count; ++i) {
+    if (!g_images[i].name[0]) continue;
     if (path_ieq(g_images[i].path, host_path) ||
         ieq(g_images[i].name, req_base) ||
         (req_with_ext[0] && ieq(g_images[i].name, req_with_ext))) {
-      char line[320];
-      snprintf(line, sizeof(line), "trt: load_pe %s -> already mapped (slot %d), re-entry guard",
-               g_images[i].name, i);
-      trt_core_log(line);
-      return g_images[i].img;
+      trt_image* existing = slot_image(g_images[i]);
+      if (existing) {
+        if (run_entry) g_images[i].want_entry = true;
+        char line[320];
+        snprintf(line, sizeof(line), "trt: load_pe %s -> already mapped (slot %d), re-entry guard",
+                 g_images[i].name, i);
+        trt_core_log(line);
+        return existing;
+      }
     }
+  }
   size_t size = 0;
   u8* file = read_whole_file(host_path, &size);
   if (!file) {
@@ -513,13 +535,65 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
     return nullptr;
   }
 
-  LoadDirGuard load_dir_guard(host_path);
+  // Reserve slot BEFORE trt_map_pe so circular DLL dependencies (e.g.
+  // libSceGnm.dll <-> libSceGpuAddress.dll) find the in-progress image via
+  // pending_img as soon as its sections + relocations are mapped.
+  const char* base = base_name(guest_name ? guest_name : host_path);
   trt_image* img = nullptr;
+  int slot = -1;
+  {
+    std::lock_guard<std::mutex> lk(g_img_mu);
+    if (g_image_count < TRT_MAX_GUEST_IMAGES) {
+      slot = g_image_count++;
+      guest_image& g = g_images[slot];
+      memset(&g, 0, sizeof(g));
+      snprintf(g.name, sizeof(g.name), "%s", base);
+      snprintf(g.path, sizeof(g.path), "%s", host_path);
+      g.pending_img = &img;
+      g.is_dll = true;
+      g.want_entry = (run_entry != 0);
+    }
+  }
+
+  if (slot < 0) {
+    free(file);
+    trt_core_log("trt: guest image registry full");
+    return nullptr;
+  }
+
+  // Roll back this load and all descendants. They may hold import pointers
+  // into a failed ancestor, so none may remain reachable in the registry.
+  auto rollback_graph = [&]() {
+    trt_image* release[TRT_MAX_GUEST_IMAGES] = {};
+    int n_release = 0;
+    {
+      std::lock_guard<std::mutex> lk(g_img_mu);
+      for (int i = slot; i < g_image_count; ++i) {
+        guest_image& g = g_images[i];
+        if (g.img) {
+          // Once sealed, an OS unwind table may point into the image.
+          // Keep the allocation alive until an unregister hook is available.
+          if (g.sealed) trt_core_log("trt: retaining rolled-back sealed image");
+          else release[n_release++] = g.img;
+        }
+        memset(&g, 0, sizeof(g));
+      }
+      g_image_count = slot;
+      int keep = 0;
+      for (int i = 0; i < g_init_order_count; ++i)
+        if (g_init_order[i] < slot) g_init_order[keep++] = g_init_order[i];
+      g_init_order_count = keep;
+    }
+    for (int i = 0; i < n_release; ++i) trt_unmap(g_be, release[i]);
+  };
+
+  LoadDirGuard load_dir_guard(host_path);
   ++g_load_depth;
   const int rc = trt_map_pe(g_be, &g_rs, file, size, &img);
   --g_load_depth;
   free(file);
   if (rc != TRT_OK || !img) {
+    rollback_graph();
     char line[320];
     snprintf(line, sizeof(line), "trt: guest image %s failed to map (%s)",
              guest_name ? guest_name : host_path, trt_errstr(rc));
@@ -528,72 +602,94 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
     return nullptr;
   }
 
-  // register BEFORE the entry runs: the DLL may load another DLL that
-  // imports back into this one
-  const char* base = base_name(guest_name ? guest_name : host_path);
-  int slot = -1;
+  if (slot >= 0) {
+    std::lock_guard<std::mutex> lk(g_img_mu);
+    guest_image& g = g_images[slot];
+    g.img = img;
+    g.pending_img = nullptr;
+    // STAGE 7: HMODULE == image base (see trt_images_register_main)
+    g.handle = (void*)(uintptr_t)img->base;
+  }
+
   {
     std::lock_guard<std::mutex> lk(g_img_mu);
-    if (g_image_count < TRT_MAX_GUEST_IMAGES) {
-      slot = g_image_count;
-      guest_image& g = g_images[slot];
-      memset(&g, 0, sizeof(g));
-      snprintf(g.name, sizeof(g.name), "%s", base);
-      snprintf(g.path, sizeof(g.path), "%s", host_path);
-      g.img = img;
-      // STAGE 7: HMODULE == image base (see trt_images_register_main).
-      // M7 Phase 1: a 32-bit HMODULE must be a 32-bit-safe value — the guest
-      // VA base, not the 64-bit host pointer (a 32-bit slot cannot hold it).
-      g.handle = img->is_pe32 ? (void*)(uintptr_t)img->guest_base
-                              : (void*)(uintptr_t)img->base;
-      g.is_dll = true;
-      ++g_image_count;
-    }
+    if (g_init_order_count < TRT_MAX_GUEST_IMAGES)
+      g_init_order[g_init_order_count++] = slot;
   }
 
-  if (trt_seal_image(g_be, img) != TRT_OK) {
-    char line[320];
-    snprintf(line, sizeof(line), "trt: seal failed for %s", base);
-    trt_core_log(line);
-    return nullptr;
-  }
-
-  // M7 Phase 1: 32-bit code cannot run natively (no x86 engine yet).
-  // A PE32 image's TLS callbacks / DllMain are collected at map time
-  // and deferred to the Phase 2 emulator — calling them through
-  // trt_call_guest_img (a 64-bit call) would execute 32-bit bytes as
-  // 64-bit code. Skip, loudly; load-only in Phase 1.
-  if (img->is_pe32) {
-    char line[320];
-    snprintf(line, sizeof(line),
-             "trt: %s is PE32: entry/TLS deferred to the M7 emulator "
-             "(Phase 2); load-only in Phase 1",
-             base);
-    trt_core_log(line);
-  }
-  // TLS callbacks, then the entry point (DllMain for a DLL) — skipped in
-  // load-only mode (corpus dry-run proves binding without executing code)
-  if (!img->is_pe32 && g_run_image_code)
-    for (int i = 0; i < img->tls_callback_count; ++i) {
-      void* cb = img->base + img->tls_callback_rvas[i];
-      trt_call_guest_img(cb, img, (u64)(uintptr_t)img->base, 1, 0, 0);
-    }
-  if (!img->is_pe32 && run_entry && g_run_image_code && img->entry_rva) {
-    void* handle = trt_images_handle(img);
-    char line[320];
-    snprintf(line, sizeof(line),
-             "trt: %s entry call handle=%p reason=1 (DLL_PROCESS_ATTACH)",
-             base, handle);
-    trt_core_log(line);
-    const u64 rc_entry = trt_call_guest_img(img->base + img->entry_rva, img,
-                                        (u64)(uintptr_t)handle, 1, 0, 0);
-    snprintf(line, sizeof(line), "trt: %s entry returned 0x%llx", base,
-             (unsigned long long)rc_entry);
-    trt_core_log(line);
-    if (rc_entry != 0 && slot >= 0) {
+  // Only seal after the outermost dependency graph binds successfully.
+  // No DLL initializer can run while an ancestor's imports are unresolved.
+  if (g_load_depth == 0) {
+    for (int i = 0; i < g_init_order_count; ++i) {
+      const int candidate = g_init_order[i];
+      trt_image* target = nullptr;
+      {
+        std::lock_guard<std::mutex> lk(g_img_mu);
+        if (candidate >= slot && candidate < g_image_count &&
+            !g_images[candidate].sealed)
+          target = g_images[candidate].img;
+      }
+      if (!target) continue;
+      if (trt_seal_image(g_be, target) != TRT_OK) {
+        trt_core_log("trt: dependency graph seal failed");
+        rollback_graph();
+        return nullptr;
+      }
       std::lock_guard<std::mutex> lk(g_img_mu);
-      if (slot < g_image_count && g_images[slot].img == img) {
-        g_images[slot].entry_called = true;
+      g_images[candidate].sealed = true;
+    }
+  }
+
+  // TLS callbacks, then the entry point (DllMain for a DLL) — deferred until
+  // g_load_depth == 0 so every DLL in a circular dependency graph has all its
+  // imports bound and code sections RX-sealed before any DllMain executes.
+  if (g_load_depth == 0 && g_run_image_code) {
+    for (int idx = 0;;) {
+      int s = -1;
+      trt_image* s_img = nullptr;
+      void* s_handle = nullptr;
+      bool s_want_entry = false;
+      char s_name[64] = "";
+      {
+        std::lock_guard<std::mutex> lk(g_img_mu);
+        while (idx < g_init_order_count) {
+          const int cand = g_init_order[idx++];
+          if (cand >= 0 && cand < g_image_count &&
+              g_images[cand].sealed && !g_images[cand].init_dispatched &&
+              g_images[cand].img) {
+            g_images[cand].init_dispatched = true;
+            s = cand;
+            s_img = g_images[cand].img;
+            s_handle = g_images[cand].handle;
+            s_want_entry = g_images[cand].want_entry;
+            snprintf(s_name, sizeof(s_name), "%s", g_images[cand].name);
+            break;
+          }
+        }
+      }
+      if (s < 0 || !s_img) break;
+      for (int i = 0; i < s_img->tls_callback_count; ++i) {
+        void* cb = s_img->base + s_img->tls_callback_rvas[i];
+        trt_call_guest_img(cb, s_img, (u64)(uintptr_t)s_img->base, 1, 0, 0);
+      }
+      if (s_want_entry && s_img->entry_rva) {
+        char line[320];
+        snprintf(line, sizeof(line),
+                 "trt: %s entry call handle=%p reason=1 (DLL_PROCESS_ATTACH)",
+                 s_name, s_handle);
+        trt_core_log(line);
+        const u64 rc_entry = trt_call_guest_img(s_img->base + s_img->entry_rva,
+                                                s_img, (u64)(uintptr_t)s_handle,
+                                                1, 0, 0);
+        snprintf(line, sizeof(line), "trt: %s entry returned 0x%llx", s_name,
+                 (unsigned long long)rc_entry);
+        trt_core_log(line);
+        if (rc_entry != 0) {
+          std::lock_guard<std::mutex> lk(g_img_mu);
+          if (s < g_image_count && g_images[s].img == s_img) {
+            g_images[s].entry_called = true;
+          }
+        }
       }
     }
   }
@@ -641,7 +737,6 @@ void trt_images_notify_thread(int reason) {
     for (int i = 0; i < snap_count; ++i) {
       trt_image* img = snap[i].img;
       if (!img) continue;
-      if (img->is_pe32) continue;  // M7 Phase 1: no 32-bit code runs natively
       for (int t = 0; t < img->tls_callback_count; ++t) {
         trt_call_guest_img(img->base + img->tls_callback_rvas[t], img,
                            (u64)(uintptr_t)img->base, 2, 0, 0);
@@ -655,7 +750,6 @@ void trt_images_notify_thread(int reason) {
     for (int i = snap_count - 1; i >= 0; --i) {
       trt_image* img = snap[i].img;
       if (!img) continue;
-      if (img->is_pe32) continue;  // M7 Phase 1: no 32-bit code runs natively
       if (snap[i].call_entry) {
         trt_call_guest_img(img->base + img->entry_rva, img,
                            (u64)(uintptr_t)snap[i].handle, 3, 0, 0);
@@ -673,14 +767,11 @@ void trt_images_notify_thread(int reason) {
 void trt_set_image_code_run(int enable) { g_run_image_code = enable ? 1 : 0; }
 
 void trt_images_reset(void) {
-  // M7 Phase 1: the guest-VA reservations belong to the registry's images;
-  // a reset orphans those images, so their guest ranges become free again.
-  // (The trap registry is NOT reset: trap addresses in already-mapped IATs
-  // stay valid for the process lifetime.)
-  trt_pe32_guest_reset();
   std::lock_guard<std::mutex> lk(g_img_mu);
   g_image_count = 0;
   g_main_image = nullptr;
+  g_init_order_count = 0;
+  g_load_depth = 0;
   g_set_dll_dir[0] = 0;
   memset(g_extra_dll_dirs, 0, sizeof(g_extra_dll_dirs));
   g_load_dir_depth = 0;
