@@ -9,7 +9,6 @@
 //   GET  /progress/<id>                         -> Fractional upload progress 0..1
 //   PUT  /upload/<name>.zip                     -> Streaming .zip upload -> extract to games\<stem>
 //   PUT  /api/upload-file?game=<n>&rel=<path>   -> Streaming unpacked folder file upload
-//   GET  /api/list-files?game=<n>              -> JSON array of {rel,size} for a game dir
 //   POST /launch/<name> | /api/launch/<name>    -> Launch game on TV
 //   POST /api/stop                              -> Request clean stop of active guest game
 //   POST /api/rescan                            -> Force immediate game library rescan
@@ -458,29 +457,6 @@ void scan_game_exes(const std::string& game_dir, const std::string& game_name,
   }
 }
 
-// ---------- recursive file listing (for /api/list-files) ----------
-struct file_item {
-  std::string rel;
-  uint64_t size = 0;
-};
-
-void collect_files_rec(const std::string& base_dir, const std::string& rel_dir,
-                       int depth, std::vector<file_item>* out) {
-  if (depth > 32) return;
-  const std::string sep(1, XFER_SEP);
-  const std::string dir = rel_dir.empty() ? base_dir : (base_dir + sep + rel_dir);
-  std::vector<dir_ent> ents;
-  list_dir_entries(dir, &ents);
-  for (const auto& e : ents) {
-    const std::string rel = rel_dir.empty() ? e.name : (rel_dir + sep + e.name);
-    if (e.is_dir) {
-      collect_files_rec(base_dir, rel, depth + 1, out);
-      continue;
-    }
-    out->push_back({rel, e.size});
-  }
-}
-
 // ---------- zip extraction (miniz) ----------
 bool extract_zip(const std::string& zip_path, const std::string& dest,
                  std::string* note) {
@@ -771,69 +747,29 @@ bool recv_exact_all(sock_t s, const char* pre, size_t pre_len, uint64_t len,
   return got == len;
 }
 
-// On-disk size, 64-bit on both platforms (plain stat truncates at 2 GiB
-// under MSVC, and GoW texpacks exceed that).
-uint64_t file_size_disk(const char* path) {
-#ifdef _WIN32
-  WIN32_FILE_ATTRIBUTE_DATA fad{};
-  if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) return 0;
-  return ((uint64_t)fad.nFileSizeHigh << 32) | (uint64_t)fad.nFileSizeLow;
-#else
-  struct stat st{};
-  if (stat(path, &st) != 0 || st.st_size < 0) return 0;
-  return (uint64_t)st.st_size;
-#endif
-}
-
 uint64_t stream_to_file(sock_t s, const char* pre, size_t pre_len,
                         const char* path, uint64_t len) {
   FILE* f = fopen(path, "wb");
   if (!f) return 0;
-  uint64_t got = 0;      // bytes received from the socket
-  uint64_t written = 0;  // bytes fwrite actually accepted
-  bool write_ok = true;
+  uint64_t got = 0;
   if (pre && pre_len) {
     size_t wr = std::min<size_t>(pre_len, (size_t)std::min<uint64_t>(len, pre_len));
     if (wr) {
-      size_t nwr = fwrite(pre, 1, wr, f);
-      written += nwr;
-      if (nwr != wr) write_ok = false;
+      fwrite(pre, 1, wr, f);
       got += wr;
-      g_upload_done += nwr;
+      g_upload_done += wr;
     }
   }
   char buf[65536];
   while (got < len && !g_stop) {
     const int want = (int)std::min<uint64_t>(len - got, sizeof(buf));
     const int n = recv(s, buf, want, 0);
-    if (n < 0) {
-      char line[128];
-      snprintf(line, sizeof(line), "trt: upload recv error got=%llu/%llu",
-               (unsigned long long)got, (unsigned long long)len);
-      log_line(line);
-      break;
-    }
-    if (n == 0) break;  // orderly EOF: client went away; short read fails below
-    size_t nwr = fwrite(buf, 1, (size_t)n, f);
-    written += nwr;
-    if (nwr != (size_t)n) write_ok = false;
+    if (n <= 0) break;
+    fwrite(buf, 1, (size_t)n, f);
     got += (uint64_t)n;
-    g_upload_done += nwr;
-    if (!write_ok) break;  // disk full/quota: stop reading, report honestly
+    g_upload_done += (uint64_t)n;
   }
-  if (fclose(f) != 0) write_ok = false;  // flush failure (e.g. disk full)
-  // Ground truth: the on-disk size. Never trust the byte counters alone --
-  // .102 reported ok:true for truncated files (fwrite/fclose ignored).
-  const uint64_t on_disk = file_size_disk(path);
-  if (!write_ok || got != len || on_disk != len) {
-    char line[220];
-    snprintf(line, sizeof(line),
-             "trt: upload SHORT len=%llu got=%llu wr=%llu disk=%llu %s",
-             (unsigned long long)len, (unsigned long long)got,
-             (unsigned long long)written, (unsigned long long)on_disk, path);
-    log_line(line);
-    return on_disk;  // caller treats != len as failure (500 + removes partial)
-  }
+  fclose(f);
   return got;
 }
 
@@ -854,16 +790,6 @@ void respond(sock_t s, const char* code, const char* ctype,
                     "Connection: close\r\n\r\n", code, ctype, body.size());
   if (hl > 0) send_all(s, hdr, (size_t)hl);
   if (!body.empty()) send_all(s, body.data(), body.size());
-}
-
-// Send one HTTP/1.1 chunked-transfer chunk (hex length, data, CRLF).
-void send_chunk(sock_t s, const std::string& data) {
-  if (data.empty()) return;
-  char hdr[32];
-  int hl = snprintf(hdr, sizeof(hdr), "%zx\r\n", data.size());
-  if (hl > 0) send_all(s, hdr, (size_t)hl);
-  send_all(s, data.data(), data.size());
-  send_all(s, "\r\n", 2);
 }
 
 std::string read_control_body(sock_t s, const char* pre, size_t pre_len,
@@ -1079,56 +1005,6 @@ void handle_client(sock_t s) {
     const std::string logp =
         g_local_state_dir + std::string(1, XFER_SEP) + "tiramisu.log";
     respond(s, "200 OK", "text/plain; charset=utf-8", read_log_tail(logp));
-    return;
-  }
-  if (strcmp(method, "GET") == 0 && url_path == "/api/list-files") {
-    std::string game;
-    if (!sanitize_game_name(query_param(query, "game"), &game)) {
-      respond(s, "400 Bad Request", "text/plain", "invalid game name");
-      return;
-    }
-    const std::string gdir = g_games_dir + std::string(1, XFER_SEP) + game;
-    if (!dir_exists(gdir)) {
-      respond(s, "404 Not Found", "text/plain", "game not found");
-      return;
-    }
-    std::vector<file_item> files;
-    collect_files_rec(gdir, "", 0, &files);
-    std::sort(files.begin(), files.end(),
-              [](const file_item& a, const file_item& b) { return a.rel < b.rel; });
-    // Stream the JSON array with chunked transfer encoding so a 33k-file
-    // tree never needs a multi-MB contiguous body buffer.
-    const char* hdr =
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-        "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
-    send_all(s, hdr, strlen(hdr));
-    std::string chunk;
-    chunk.reserve(65536);
-    auto flush_chunk = [&]() {
-      if (!chunk.empty()) {
-        send_chunk(s, chunk);
-        chunk.clear();
-      }
-    };
-    chunk += "[";
-    bool first = true;
-    char szbuf[32];
-    for (const auto& f : files) {
-      std::string rel = f.rel;
-      for (char& c : rel) if (c == '\\') c = '/';
-      if (!first) chunk += ",";
-      first = false;
-      snprintf(szbuf, sizeof(szbuf), "%llu", (unsigned long long)f.size);
-      chunk += "{\"rel\":\"";
-      chunk += json_escape(rel);
-      chunk += "\",\"size\":";
-      chunk += szbuf;
-      chunk += "}";
-      if (chunk.size() >= 32768) flush_chunk();
-    }
-    chunk += "]";
-    flush_chunk();
-    send_all(s, "0\r\n\r\n", 5);
     return;
   }
   if (strcmp(method, "GET") == 0 && url_path.rfind("/progress/", 0) == 0) {
