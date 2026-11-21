@@ -74,17 +74,6 @@ typedef struct trt_image {
   // STAGE 7: exception directory (.pdata) for RtlLookupFunctionEntry scans
   void* pdata;            // image-relative pointer (base+pdr_va)
   u32   pdata_count;      // number of RUNTIME_FUNCTION entries
-  // M7 Phase 1 (PE32): set for 32-bit images only, zero for PE64.
-  int  is_pe32;            // 1 = PE32 image (32-bit guest; load-only in Phase 1)
-  u32  guest_base;         // guest-VA load base (guest address space, not host)
-  u32  reloc_fixups;       // HIGHLOW/DIR64 fixups applied by the reloc pass
-  u32  pe32_trap_count;    // IAT/delay slots bound to trap addresses (PE32)
-  u32  pe32_guestva_count; // IAT slots bound to sibling guest-VA exports (PE32)
-  u32  tls_data_rva;       // PE32 TLS raw-data RVA (0 = no TLS dir)
-  u32  tls_data_size;      // PE32 TLS raw-data size
-  u32  tls_zero_fill;      // PE32 TLS zero-fill size
-  u32  tls_index_rva;      // PE32 TLS index-slot RVA (slot left unwritten: the
-                           // Phase 2 emulator assigns the FS-based TLS index)
  } trt_image;
 
 // STAGE 7: the shared process guest TEB (gs:[0x08] StackLimit, gs:[0x10]
@@ -103,52 +92,19 @@ void  trt_guest_tls_bind_host_slots(void** host_tls, void** guest_tls);
 // Map a PE64 from a file image. Read-only view of [file, file+file_size).
 // Stages: validate -> alloc -> headers+sections -> relocs -> imports -> TLS.
 // Pages stay RW until trt_seal_image().
-// M7 Phase 1: a PE32 file (machine 0x014c, magic 0x10b) routes to
-// trt_map_pe32 automatically; anything else that is neither PE64 nor PE32
-// fails TRT_ERR_NOT_PE64.
 int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
                 const u8* file, size_t file_size, trt_image** out);
-
-// Map a PE32 (32-bit) image: same stages as trt_map_pe, with 4-byte thunks,
-// HIGHLOW relocations against a GUEST-VA base (independent of the host
-// mapping), a 32-bit TLS directory, and trap-address import binding (a
-// 32-bit IAT slot cannot hold a 64-bit pointer: bound imports get a
-// reserved guest-VA trap address, see TRT_PE32_TRAP_BASE in pe.h; imports
-// from a sibling 32-bit DLL bind to the export's guest VA instead).
-// LOAD-ONLY: nothing in the image executes (no x86 engine until Phase 2);
-// the entry point and TLS callbacks are collected, never called.
-int trt_map_pe32(const trt_backend* be, const trt_resolver* rs,
-                 const u8* file, size_t file_size, trt_image** out);
-
-// ---- M7 Phase 1: 32-bit trap bindings ----
-// One registry entry per unique bound module!symbol (deduped across the
-// process); trap N lives at TRT_PE32_TRAP_BASE + 4*N. The registry is the
-// audit trail for the 32-bit import binds and the Phase 2 dispatcher's
-// input (it maps a trap address back to the module!symbol + 64-bit bridge
-// address). Process-global, never reset.
-int trt_pe32_trap_count(void);
-// Describe binding `index` (0..count-1). Any out pointer may be NULL.
-// Returns 0 on success, -1 for an out-of-range index.
-int trt_pe32_trap_info(int index, char* mod_out, size_t mod_cap,
-                       char* sym_out, size_t sym_cap, u16* ordinal_out,
-                       u32* trap_va_out);
-// 1 iff `guest_va` is inside the reserved trap range.
-int trt_pe32_is_trap(u32 guest_va);
-// Release all guest-VA reservations (called by trt_images_reset between
-// corpus PEs; images already mapped keep their recorded guest_base).
-void trt_pe32_guest_reset(void);
 
 // Flip sections to final protections (code -> RX). Call once after
 // relocation/import/TLS writes are complete. Returns TRT_OK or TRT_ERR_SEAL.
 int trt_seal_image(const trt_backend* be, trt_image* img);
 
 // ---- boot audit (offline gate for REAL games) ----------------------------
-// Parses a PE's import + delay-import tables IN FILE SPACE (no mapping,
+// Parses a PE64's import + delay-import tables IN FILE SPACE (no mapping,
 // no execution, the file bytes are never modified) and pushes every
 // module!symbol through the REAL resolver — the same code path trt_map_pe
 // uses to bind imports. On return *missing lists every "module!symbol"
 // that failed to resolve, in table order.
-// Handles PE64 (8-byte thunks) and PE32 (4-byte thunks) alike.
 // Returns TRT_OK when the audit ran (check *missing to decide bootability);
 // TRT_ERR_* for malformed PEs / usage errors.
 int trt_audit_imports(const u8* file, size_t file_size,
