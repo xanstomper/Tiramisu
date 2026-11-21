@@ -1,0 +1,3 @@
+LIBRARY guestdll
+EXPORTS
+    dll_add
