@@ -34,3 +34,7 @@ docs/progress/*.csv
 docs/progress/*.bak*
 docs/progress/*.skipped
 docs/progress/recovered-loader-patches/
+docs/progress/*.sh
+docs/progress/*.patch
+docs/progress/xbox-console.lock
+docs/progress/xbox-traces/
