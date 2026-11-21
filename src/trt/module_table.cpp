@@ -124,6 +124,9 @@ bool is_overridable_module(const char* name) {
       "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
       "combase.dll", "dwrite.dll", "d2d1.dll", "d3d10.dll", "d3d12.dll",
       "dxgi.dll", "version.dll",
+      // Match the built-in Steamworks route used by LoadLibrary and the
+      // sibling resolver. Native Steamworks expects a running desktop client.
+      "steam_api64.dll", "steam_api.dll",
   };
   for (const char* no : kNoOverride)
     if (name_eq(name, no)) return false;
@@ -255,6 +258,13 @@ void* resolve_through_table(void* user, const char* module,
         if (const char* alias = dll_alias_lookup(target))
           if (void* fn3 = g_system_load(alias, symbol)) return fn3;
       }
+      // SYSTEM module with an attached fallback table: the console binds its
+      // real DLL above and never reaches this; a host offline run has no
+      // system DLL, so registered fallback exports serve — each must fail
+      // NAMED when called (never ok-stubs).
+      for (int i = 0; i < m.fn_count; ++i)
+        if (symbol && strcmp(m.fns[i].name, symbol) == 0)
+          return (void*)m.fns[i].fn;
       return nullptr;
     default:
       return nullptr;
@@ -452,6 +462,9 @@ const mod_default k_defaults[] = {
     // UIAutomationCore: UnityPlayer imports the Uia* accessibility surface;
     // console has no UIA — STUB binds fail-visible, calls name themselves
     {"uiautomationcore.dll", TRT_ROUTE_STUB},
+    // GoW (DECIMA PC) imports WLDAP32 by ordinals; no console wldap32 exists
+    // — STUB binds fail-visible so a real call names itself
+    {"wldap32.dll", TRT_ROUTE_STUB},
     {"uxtheme.dll", TRT_ROUTE_BUILTIN},
     {"msimg32.dll", TRT_ROUTE_BUILTIN},
     {"vulkan-1.dll", TRT_ROUTE_BUILTIN},

@@ -32,6 +32,76 @@ extern "C" void trt_mem_budget_discharge_commit(u64 bytes);
 extern "C" int trt_mem_budget_charge_va(u64 bytes);
 extern "C" void trt_mem_budget_discharge_va(u64 bytes);
 
+#if defined(_WIN32)
+namespace {
+struct RecentImport {
+  volatile u32 site;
+  volatile u32 tid;
+  volatile uintptr_t caller;
+};
+static_assert(sizeof(RecentImport) == 16);
+struct ImportLocation { char module[72]; char function[96]; };
+std::atomic<u32> g_recent_import_tick{0};
+std::atomic<u32> g_import_sites_count{0};
+RecentImport g_recent_imports[64]{};
+ImportLocation g_import_sites[4096]{};
+
+void* trace_guest_import(const trt_backend* be, const char* module,
+                         const char* function, u16 ordinal, void* fn) {
+  const u32 site_index = g_import_sites_count.fetch_add(1, std::memory_order_relaxed);
+  if (site_index >= sizeof(g_import_sites) / sizeof(g_import_sites[0])) return fn;
+  ImportLocation& where = g_import_sites[site_index];
+  snprintf(where.module, sizeof(where.module), "%s", module);
+  if (function) snprintf(where.function, sizeof(where.function), "%s", function);
+  else snprintf(where.function, sizeof(where.function), "#%u", (unsigned)ordinal);
+  // Transparent tail trampoline. Records the native TEB thread id and the
+  // guest return address, preserves incoming registers and calls the target.
+  constexpr u8 kTrace[] = {
+      0x9c, 0x50, 0x41, 0x52, 0x41, 0x53, 0x48, 0xb8, 0x81, 0x70, 0x60, 0x50,
+      0x40, 0x30, 0x20, 0x10, 0x41, 0xba, 0x01, 0x00, 0x00, 0x00, 0xf0, 0x44,
+      0x0f, 0xc1, 0x10, 0x41, 0x83, 0xe2, 0x3f, 0x41, 0xc1, 0xe2, 0x04, 0x48,
+      0xb8, 0x82, 0x70, 0x60, 0x50, 0x40, 0x30, 0x20, 0x10, 0x4c, 0x01, 0xd0,
+      0xc7, 0x00, 0x83, 0x30, 0x20, 0x10, 0x65, 0x44, 0x8b, 0x14, 0x25, 0x48,
+      0x00, 0x00, 0x00, 0x44, 0x89, 0x50, 0x04, 0x4c, 0x8b, 0x54, 0x24, 0x20,
+      0x4c, 0x89, 0x50, 0x08, 0x41, 0x5b, 0x41, 0x5a, 0x58, 0x9d, 0xff, 0x25,
+      0x00, 0x00, 0x00, 0x00, 0x84, 0x70, 0x60, 0x50, 0x40, 0x30, 0x20, 0x10,
+  };
+  auto* executable = static_cast<u8*>(be->alloc(sizeof(kTrace), 0));
+  if (!executable) return fn;
+  memcpy(executable, kTrace, sizeof(kTrace));
+  const u64 patch_8 = reinterpret_cast<uintptr_t>(&g_recent_import_tick);
+  memcpy(executable + 8, &patch_8, sizeof(patch_8));
+  const u64 patch_37 = reinterpret_cast<uintptr_t>(g_recent_imports);
+  memcpy(executable + 37, &patch_37, sizeof(patch_37));
+  const u32 patch_50 = site_index;
+  memcpy(executable + 50, &patch_50, sizeof(patch_50));
+  const u64 patch_88 = reinterpret_cast<uintptr_t>(fn);
+  memcpy(executable + 88, &patch_88, sizeof(patch_88));
+  if (be->protect(executable, sizeof(kTrace), TRT_PROT_R | TRT_PROT_X) != 0) {
+    be->release(executable, sizeof(kTrace));
+    return fn;
+  }
+  return executable;
+}
+}
+
+extern "C" void trt_log_recent_imports(u32 tid) {
+  const u32 end = g_recent_import_tick.load(std::memory_order_relaxed);
+  const u32 begin = end > 64 ? end - 64 : 0;
+  for (u32 i = begin; i < end; ++i) {
+    const RecentImport& event = g_recent_imports[i & 63u];
+    if (event.tid != tid) continue;
+    const u32 site = event.site;
+    if (site >= sizeof(g_import_sites) / sizeof(g_import_sites[0])) continue;
+    const ImportLocation& where = g_import_sites[site];
+    char line[230];
+    snprintf(line, sizeof(line), "recent guest import: %s!%s caller=%p",
+             where.module, where.function, reinterpret_cast<void*>(event.caller));
+    trt_core_log(line);
+  }
+}
+#endif
+
 #if defined(__has_feature)
 #  if __has_feature(address_sanitizer)
 extern "C" void __asan_unpoison_memory_region(const volatile void*, size_t)
@@ -558,9 +628,6 @@ extern "C" const char* trt_errstr(int code) {
     case TRT_ERR_TLS_BOUNDS: return "TLS_BOUNDS";
     case TRT_ERR_SEAL: return "SEAL (final protect failed)";
     case TRT_ERR_DELAY_IMPORT: return "DELAY_IMPORT (delay-load directory not processed in v0)";
-    case TRT_ERR_MANAGED: return "MANAGED (.NET assembly: CLR header present, no .NET Framework CLR on console)";
-    case TRT_ERR_MONO: return "MONO (Mono embedding failure; see trt_mono_last_error)";
-    case TRT_ERR_FNA3D: return "FNA3D (FNA3D host-device handoff failure; see trt_fna3d_last_error)";
     default: return "UNKNOWN";
   }
 }
@@ -610,20 +677,6 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
   const u64 entry_rva = rd32((const u8*)&nt->optional_header.address_of_entry_point);
   const u64 size_headers = rd32((const u8*)&nt->optional_header.size_of_headers);
   const trt_data_directory* dirs = nt->optional_header.directories;
-
-  // ---- 2b. managed (.NET) assemblies ----
-  // A PE with a COM descriptor (data directory 14) is a .NET assembly: its
-  // entry point is a stub that jumps to mscoree.dll!_CorExeMain, and there
-  // is no .NET Framework CLR on the console (no mscoree/clr.dll, no GAC,
-  // no fusion, no XNA redist). Fail fast with a dedicated code instead of
-  // dying later at import bind with an unexplained mscoree.dll error.
-  // Deliberately NOT a STUB: binding _CorExeMain to a thunk that returns 0
-  // would make the game "exit 0" silently, which is worse than failing.
-  if (rd32((const u8*)&nt->optional_header.number_of_rva_and_sizes) >
-          TRT_PE_DIR_COM_DESCRIPTOR &&
-      dirs[TRT_PE_DIR_COM_DESCRIPTOR].virtual_address != 0)
-    return fail(&img, be, TRT_ERR_MANAGED,
-                "managed .NET assembly (COM descriptor present); no CLR on console");
 
   // section headers live right after optional header, in the file
   const u8* sec_base = (const u8*)&nt->optional_header +
@@ -774,20 +827,35 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
     logf_be(be, "trt: loaded at preferred base, no reloc pass");
   }
 
+  // Publish the allocated, section-mapped, relocated image to *out BEFORE
+  // walking imports so circular DLL dependencies (e.g. libSceGnm.dll <->
+  // libSceGpuAddress.dll) can resolve exports against this in-progress image
+  // without re-entering trt_map_pe recursively.
+  *out = (trt_image*)malloc(sizeof(trt_image));
+  if (!*out) return fail(&img, be, TRT_ERR_ALLOC, "image struct alloc");
+  memcpy(*out, &img, sizeof(img));
+  auto fail_out = [&](int code, const char* detail) -> int {
+    if (*out) {
+      free(*out);
+      *out = nullptr;
+    }
+    return fail(&img, be, code, detail);
+  };
+
   // ---- 6. imports ----
   const u64 imp_va = dirs[TRT_PE_DIR_IMPORT].virtual_address;
   const u64 imp_sz = dirs[TRT_PE_DIR_IMPORT].size;
   u32 n_modules = 0, n_symbols = 0;
   if (imp_va && imp_sz) {
     if (imp_va + imp_sz > size_of_image)
-      return fail(&img, be, TRT_ERR_IMPORT, "import dir out of image");
+      return fail_out(TRT_ERR_IMPORT, "import dir out of image");
     for (u64 d = 0; d + sizeof(trt_import_descriptor) <= imp_sz;
          d += sizeof(trt_import_descriptor)) {
       const trt_import_descriptor* desc =
           (const trt_import_descriptor*)(img.base + imp_va + d);
       if (!desc->first_thunk && !desc->name) break;  // terminator
       if (desc->name >= size_of_image || desc->first_thunk >= size_of_image)
-        return fail(&img, be, TRT_ERR_IMPORT, "import descriptor out of image");
+        return fail_out(TRT_ERR_IMPORT, "import descriptor out of image");
       const char* mod_name = (const char*)(img.base + desc->name);
       const u64 int_rva = desc->original_first_thunk ? desc->original_first_thunk
                                                      : desc->first_thunk;
@@ -796,7 +864,7 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
       for (u64 t = iat_rva;; t += 8) {
         const u64 lt = int_rva + (t - iat_rva);
         if (t + 8 > size_of_image || lt + 8 > size_of_image)
-          return fail(&img, be, TRT_ERR_IMPORT, "IAT runs off image");
+          return fail_out(TRT_ERR_IMPORT, "IAT runs off image");
         const u64 thunk = rd64(img.base + lt);
         if (thunk == 0) break;  // terminator
         const char* sym_name = nullptr;
@@ -805,20 +873,23 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
           ordinal = (u16)(thunk & 0xFFFF);
         } else {
           if (thunk + 2 >= size_of_image)
-            return fail(&img, be, TRT_ERR_IMPORT, "hint/name out of image");
+            return fail_out(TRT_ERR_IMPORT, "hint/name out of image");
           sym_name = (const char*)(img.base + thunk + 2);
           if (strnlen(sym_name, 256) == 256)
-            return fail(&img, be, TRT_ERR_IMPORT, "symbol name not terminated");
+            return fail_out(TRT_ERR_IMPORT, "symbol name not terminated");
         }
         void* fn = rs->resolve(rs->user, mod_name, sym_name, ordinal);
         if (!fn) {
           char det[224];
           snprintf(det, sizeof(det), "%s!%s", mod_name,
                    sym_name ? sym_name : "#ordinal");
-          return fail(&img, be, TRT_ERR_IMPORT, det);
+          return fail_out(TRT_ERR_IMPORT, det);
         }
+#if defined(_WIN32)
+        fn = trace_guest_import(be, mod_name, sym_name, ordinal, fn);
+#endif
         memcpy(img.base + t, &fn, 8);  // bind IAT
-        if (n_symbols == 0) {
+        if (n_symbols == 0 || strncmp(mod_name, "steam_api", 9) == 0) {
           char line[256];
           snprintf(line, sizeof(line), "trt: bind %s!%s -> %p", mod_name,
                    sym_name ? sym_name : "#ordinal", fn);
@@ -840,7 +911,7 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
   const u64 tls_va = dirs[TRT_PE_DIR_TLS].virtual_address;
   if (tls_va) {
     if (tls_va + sizeof(trt_tls_directory64) > size_of_image)
-      return fail(&img, be, TRT_ERR_TLS_BOUNDS, "tls dir out of image");
+      return fail_out(TRT_ERR_TLS_BOUNDS, "tls dir out of image");
     const trt_tls_directory64* tls = (const trt_tls_directory64*)(img.base + tls_va);
     // A TLS directory with AddressOfCallbacks == 0 is legal (TLS data, no
     // callbacks): zero callbacks, NOT a load failure. Without this guard
@@ -858,7 +929,7 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
       const u64 arr_rva =
           (u64)tls->address_of_callbacks - (u64)(uintptr_t)img.base;
       if (arr_rva + 8 > size_of_image)
-        return fail(&img, be, TRT_ERR_TLS_BOUNDS, "tls callback array out of image");
+        return fail_out(TRT_ERR_TLS_BOUNDS, "tls callback array out of image");
       u64 c = arr_rva;
       for (; c + 8 <= size_of_image &&
              img.tls_callback_count < TRT_MAX_TLS_CALLBACKS; c += 8) {
@@ -866,7 +937,7 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
         if (cb == 0) break;
         const u64 cb_rva = cb - (u64)(uintptr_t)img.base;
         if (cb_rva >= size_of_image)
-          return fail(&img, be, TRT_ERR_TLS_BOUNDS, "tls callback out of image");
+          return fail_out(TRT_ERR_TLS_BOUNDS, "tls callback out of image");
         img.tls_callback_rvas[img.tls_callback_count++] = cb_rva;
       }
       // the cap is a real limit, not a silent drop: say so when entries remain
@@ -958,10 +1029,10 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
                                     : (u64)dd->module_handle_rva - preferred;
       if (name_rva >= size_of_image || iat_rva >= size_of_image ||
           int_rva >= size_of_image)
-        return fail(&img, be, TRT_ERR_DELAY_IMPORT, "delay descriptor out of image");
+        return fail_out(TRT_ERR_DELAY_IMPORT, "delay descriptor out of image");
       const char* mod_name = (const char*)(img.base + name_rva);
       if (strnlen(mod_name, 256) == 256)
-        return fail(&img, be, TRT_ERR_DELAY_IMPORT, "delay dll name unterminated");
+        return fail_out(TRT_ERR_DELAY_IMPORT, "delay dll name unterminated");
       for (u64 t = 0;; t += 8) {
         if (int_rva + t + 8 > size_of_image || iat_rva + t + 8 > size_of_image)
           break;
@@ -1007,8 +1078,6 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
     logf_be(be, line);
   }
 
-  *out = (trt_image*)malloc(sizeof(trt_image));
-  if (!*out) return fail(&img, be, TRT_ERR_ALLOC, "image struct alloc");
   memcpy(*out, &img, sizeof(img));
   char line[160];
   snprintf(line, sizeof(line),
@@ -1617,12 +1686,6 @@ static int audit_imports_impl(const u8* file, size_t file_size,
   const u64 size_of_image = rd32(opt + 56);
   const u64 preferred = is_pe32 ? rd32(opt + 28) : rd64(opt + 24);
   const trt_data_directory* dirs = trt_pe_directories(opt, magic);
-  // Managed (.NET) assemblies never reach import bind: the CLR header is
-  // the verdict.
-  const u32 num_dirs = is_pe32 ? rd32(opt + 92) : rd32(opt + 108);
-  if (num_dirs > TRT_PE_DIR_COM_DESCRIPTOR &&
-      dirs[TRT_PE_DIR_COM_DESCRIPTOR].virtual_address != 0)
-    return TRT_ERR_MANAGED;
   const u64 sec_off =
       nt_off + 24 + rd16(file + nt_off + 20);  // size_of_optional_header
   file_view fv{file, file_size, sec_off, nsec};

@@ -209,19 +209,7 @@ int trt_mem_budget_charge_commit(u64 bytes) {
 
 void trt_mem_budget_discharge_commit(u64 bytes) {
   if (!bytes) return;
-  const u64 before = g_committed.load();
-  g_committed.store(before > bytes ? before - bytes : 0);
-  if (before < bytes) {
-    // accounting tripwire: a discharge larger than the ledger means a
-    // caller freed bytes it never charged (or freed twice)
-    char line[256];
-    snprintf(line, sizeof(line),
-             "[trt] mem: BUDGET ACCOUNTING: %s discharge of %llu bytes "
-             "exceeds committed %llu — clamped to 0 (over-discharge, "
-             "caller bug)",
-             "commit", (unsigned long long)bytes, (unsigned long long)before);
-    trt_core_log(line);
-  }
+  discharge(g_committed, bytes, "commit");
   // dropping back below a soft level re-arms its warning: a game that
   // streams (alloc/free cycles near the ceiling) must warn again on the
   // next climb, not once per process
@@ -251,19 +239,7 @@ int trt_mem_budget_charge_map(u64 bytes) {
 
 void trt_mem_budget_discharge_map(u64 bytes) {
   if (!bytes) return;
-  const u64 m = g_mapped.load();
-  g_mapped.store(m > bytes ? m - bytes : 0);
-  if (m < bytes) {
-    // accounting tripwire: a discharge larger than the ledger means a
-    // caller freed bytes it never charged (or freed twice)
-    char line[256];
-    snprintf(line, sizeof(line),
-             "[trt] mem: BUDGET ACCOUNTING: %s discharge of %llu bytes "
-             "exceeds committed %llu — clamped to 0 (over-discharge, "
-             "caller bug)",
-             "mapped view", (unsigned long long)bytes, (unsigned long long)m);
-    trt_core_log(line);
-  }
+  discharge(g_mapped, bytes, "mapped view");
   trt_mem_budget_discharge_commit(bytes);
   discharge(g_va_reserved, bytes, "VA reservation");
 }

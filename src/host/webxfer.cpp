@@ -25,7 +25,7 @@
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #include <windows.h>
-  #include <bcrypt.h>    // brown-line paired-LAN control pairing RNG
+  #include <bcrypt.h>
   #include <sys/stat.h>  // _stat64 for upload verification
   #pragma comment(lib, "bcrypt.lib")
   #pragma comment(lib, "ws2_32.lib")
@@ -70,6 +70,7 @@
 #include <cstring>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -895,6 +896,19 @@ void send_chunk(sock_t s, const std::string& data) {
   send_all(s, "\r\n", 2);
 }
 
+std::string read_control_body(sock_t s, const char* pre, size_t pre_len,
+                              size_t size) {
+  std::string body(pre, std::min(size, pre_len));
+  while (body.size() < size) {
+    char buf[512];
+    const int count = recv(s, buf, static_cast<int>(
+        std::min(sizeof(buf), size - body.size())), 0);
+    if (count <= 0) break;
+    body.append(buf, count);
+  }
+  return body;
+}
+
 bool parse_control_events(const std::string& body, std::vector<web_control_event>* events) {
   std::istringstream input(body);
   std::string line;
@@ -978,19 +992,6 @@ void handle_controls(sock_t s, const std::string& path, const std::string& auth,
     }
   }
   respond(s, status, "text/plain; charset=utf-8", output);
-}
-
-std::string read_control_body(sock_t s, const char* pre, size_t pre_len,
-                              size_t size) {
-  std::string body(pre, std::min(size, pre_len));
-  while (body.size() < size) {
-    char buf[512];
-    const int count = recv(s, buf, static_cast<int>(
-        std::min(sizeof(buf), size - body.size())), 0);
-    if (count <= 0) break;
-    body.append(buf, count);
-  }
-  return body;
 }
 
 void handle_client(sock_t s) {
@@ -1789,6 +1790,23 @@ void webxfer_set_launch_result(const std::string& name, const std::string& resul
   g.last_launch_result = result;
 }
 
+std::vector<web_control_event> webxfer_control_events() {
+  std::lock_guard<std::mutex> lock(g_control_mu);
+  if (g_control_last != control_clock::time_point{} &&
+      control_clock::now() - g_control_last > std::chrono::seconds(2)) {
+    g_control_last = {};
+    g_control_events = {{'r', 0, 0}};
+  }
+  std::vector<web_control_event> events;
+  events.swap(g_control_events);
+  return events;
+}
+
+std::string webxfer_control_code() {
+  std::lock_guard<std::mutex> lock(g_control_mu);
+  return g_control_code;
+}
+
 void webxfer_shutdown() {
   g_stop = true;
   if (g_listener != kBadSock) {
@@ -1820,22 +1838,6 @@ std::string webxfer_url() {
 unsigned short webxfer_port() {
   std::lock_guard<std::mutex> lk(g_mu);
   return g.port;
-}
-
-std::vector<web_control_event> webxfer_control_events() {
-  std::lock_guard<std::mutex> lock(g_control_mu);
-  if (g_control_last != control_clock::time_point{} &&
-      control_clock::now() - g_control_last > std::chrono::seconds(2)) {
-    g_control_last = {};
-    g_control_events = {{'r', 0, 0}};
-  }
-  std::vector<web_control_event> events;
-  events.swap(g_control_events);
-  return events;
-}
-std::string webxfer_control_code() {
-  std::lock_guard<std::mutex> lock(g_control_mu);
-  return g_control_code;
 }
 
 } // namespace longan
