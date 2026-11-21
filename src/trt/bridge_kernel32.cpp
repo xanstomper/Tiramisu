@@ -1509,49 +1509,11 @@ void trt_bridge_set_cwd(const char* guest_dir) {
   }
 }
 
-// .102 diagnostic: log CreateFileW's RESULT next to the .101 open trace, so a
-// boot-path question ("did the save opens succeed?") is answerable from the
-// log. Same 128-call cap as the open trace; n is the 0-based call number
-// hoisted from the open-trace block below.
-static void cf_ret_log(unsigned n, void* h) {
-  if (n >= 128) return;
-  char l[192];
-  if (h == (void*)(uintptr_t)-1)
-    snprintf(l, sizeof(l), "boottrace: CreateFileW #%u -> FAIL err=%u",
-             n + 1, err_ref_for_current_thread());
-  else
-    snprintf(l, sizeof(l), "boottrace: CreateFileW #%u -> OK handle=%p",
-             n + 1, h);
-  trt_core_log(l);
-}
-
 void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
                                   void* sa, u32 disposition, u32 flags,
                                   void* tmpl) {
   (void)share; (void)sa; (void)flags; (void)tmpl;
   if (!name) return (void*)(uintptr_t)-1;
-  // Boot-trace: log the first file opens so a boot-path question ("did the
-  // game open any files before the fault, and which?") is answerable from
-  // the log. Capped at 128: after the boot window, opens are gameplay
-  // streaming, not signal, and unbounded logging would flood tiramisu.log.
-  // CreateFileA delegates to CreateFileW, so this covers both.
-  unsigned cf_n = 0;
-  {
-    static std::atomic<unsigned> cf_calls{0};
-    cf_n = cf_calls.fetch_add(1, std::memory_order_relaxed);
-    if (cf_n < 128) {
-      char cf_vpath[512];
-      build_guest_vpath(name, cf_vpath, sizeof(cf_vpath));
-      char cf_line[640];
-      snprintf(cf_line, sizeof(cf_line),
-               "boottrace: CreateFileW #%u \"%s\" disp=%u write=%d",
-               cf_n + 1, cf_vpath, disposition,
-               (access & 0x40000000u) != 0);
-      trt_core_log(cf_line);
-    } else if (cf_n == 128) {
-      trt_core_log("boottrace: CreateFileW log cap reached (128), suppressing");
-    }
-  }
   // All write access masks need a writable VFS target, including
   // FILE_APPEND_DATA, FILE_WRITE_EA, FILE_WRITE_ATTRIBUTES and GENERIC_ALL.
   const u32 write_access = 0x40000000u | 0x10000000u | 0x00000002u |
@@ -1569,7 +1531,6 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
       err_ref_for_current_thread() = 19;  // ERROR_WRITE_PROTECT
       trt_core_log("kernel32: CreateFileW(write) on a mounted disc image -> "
                    "ERROR_WRITE_PROTECT");
-      cf_ret_log(cf_n, (void*)(uintptr_t)-1);
       return (void*)(uintptr_t)-1;
     }
     int img_dir = 0;
@@ -1581,24 +1542,19 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
                img_dir ? "ERROR_ACCESS_DENIED (directory)"
                        : "ERROR_FILE_NOT_FOUND");
       trt_core_log(plog);
-      cf_ret_log(cf_n, (void*)(uintptr_t)-1);
       return (void*)(uintptr_t)-1;
     }
     FILE* ios = fopen(host, "rb");
     if (!ios) {
       err_ref_for_current_thread() = 2;
-      cf_ret_log(cf_n, (void*)(uintptr_t)-1);
       return (void*)(uintptr_t)-1;
     }
     char vpath[512];
     build_guest_vpath(name, vpath, sizeof(vpath));
-    void* cf_h = file_alloc(ios, 'r', vpath);
-    cf_ret_log(cf_n, cf_h);
-    return cf_h;
+    return file_alloc(ios, 'r', vpath);
   }
   if (trt_vfs_resolve_utf16_rw(name, for_write, host, sizeof(host)) != 0) {
     err_ref_for_current_thread() = 3; // PATH_NOT_FOUND
-    cf_ret_log(cf_n, (void*)(uintptr_t)-1);
     return (void*)(uintptr_t)-1;
   }
   if (disp == 1 /*CREATE_NEW*/) {
@@ -1606,7 +1562,6 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
     if (trt_vfs_resolve_utf16_rw(name, 0, check, sizeof(check)) == 0 &&
         trt_vfs_stat(check, nullptr, nullptr) == 0) {
       err_ref_for_current_thread() = 80; // ERROR_FILE_EXISTS
-      cf_ret_log(cf_n, (void*)(uintptr_t)-1);
       return (void*)(uintptr_t)-1;
     }
   }
@@ -1665,15 +1620,12 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
              "  path was: %s (access=0x%08x disposition=%u write=%d)",
              host, access, disp, write);
     trt_core_log(plog);
-    cf_ret_log(cf_n, (void*)(uintptr_t)-1);
     return (void*)(uintptr_t)-1;
   }
   if (for_write) trt_vfs_mark_z_deleted_utf16(name, 0, 0);
   char vpath[512];
   build_guest_vpath(name, vpath, sizeof(vpath));
-  void* cf_h = file_alloc(os, write ? 'w' : 'r', vpath);
-  cf_ret_log(cf_n, cf_h);
-  return cf_h;
+  return file_alloc(os, write ? 'w' : 'r', vpath);
 }
 
 static int file_xfer_impl(void* h, void* buf, u32 bytes, int is_write,
@@ -1730,29 +1682,6 @@ static int file_xfer_impl(void* h, void* buf, u32 bytes, int is_write,
   return 1;
 }
 
-// .102 diagnostic: log ReadFile/ReadFileEx results with the file's vpath, so
-// "did GoW read the save, and how many bytes?" is answerable from the log.
-// Capped at 128 calls; the vpath lookup takes g_files_mu briefly.
-static void rf_log(const char* tag, void* h, u32 bytes, size_t n, int ok) {
-  static std::atomic<unsigned> rf_calls{0};
-  const unsigned n_call = rf_calls.fetch_add(1, std::memory_order_relaxed);
-  if (n_call >= 128) {
-    if (n_call == 128)
-      trt_core_log("boottrace: ReadFile log cap reached (128), suppressing");
-    return;
-  }
-  char vp[512] = {};
-  {
-    std::lock_guard<std::mutex> lk(g_files_mu);
-    file_rec* rec = file_at_locked(h);
-    if (rec) snprintf(vp, sizeof(vp), "%s", rec->vpath);
-  }
-  char l[720];
-  snprintf(l, sizeof(l), "boottrace: %s #%u h=%p \"%s\" req=%u -> %s got=%zu",
-           tag, n_call + 1, h, vp, bytes, ok ? "OK" : "FAIL", n);
-  trt_core_log(l);
-}
-
 int TRT_STDCALL trt_ReadFile(void* h, void* buf, u32 bytes, u32* read,
                              void* overlapped) {
   extern int TRT_STDCALL trt_SetEvent(u64 handle);
@@ -1760,11 +1689,9 @@ int TRT_STDCALL trt_ReadFile(void* h, void* buf, u32 bytes, u32* read,
   size_t n = 0;
   if (!buf || !file_xfer_impl(h, buf, bytes, 0, overlapped, &n, nullptr)) {
     if (read) *read = 0;
-    rf_log("ReadFile", h, bytes, 0, 0);
     return 0;
   }
   if (read) *read = (u32)n;
-  rf_log("ReadFile", h, bytes, n, 1);
   if (overlapped) {
     u64* ov = (u64*)overlapped;
     ov[0] = 0;
@@ -1820,11 +1747,7 @@ int TRT_STDCALL trt_ReadFileEx(void* h, void* buf, u32 bytes, void* overlapped,
   }
   size_t n = 0;
   u32 io_err = 0;
-  if (!file_xfer_impl(h, buf, bytes, 0, overlapped, &n, &io_err)) {
-    rf_log("ReadFileEx", h, bytes, 0, 0);
-    return 0;
-  }
-  rf_log("ReadFileEx", h, bytes, n, 1);
+  if (!file_xfer_impl(h, buf, bytes, 0, overlapped, &n, &io_err)) return 0;
   u64* ov = (u64*)overlapped;
   ov[0] = (io_err == 38u) ? 0xC0000011ull /*STATUS_END_OF_FILE*/ : 0ull;
   ov[1] = (u64)n;
@@ -2098,8 +2021,6 @@ int TRT_STDCALL trt_SetCurrentDirectoryA(const char* name) {
 int TRT_STDCALL trt_GetCurrentDirectoryW(u32 len, u16* buf) {
   trt_vfs_get_cwd(g_cwd, sizeof(g_cwd));
   const u32 clen = (u32)strlen(g_cwd);
-  if (clen == 0)
-    trt_core_log("strtrace: GetCurrentDirectoryW -> FAIL (empty cwd)");
   if (!buf || len <= clen) return (int)(clen + 1);
   for (u32 i = 0; i <= clen; ++i) buf[i] = (u16)(u8)g_cwd[i];
   return (int)clen;
@@ -2110,11 +2031,6 @@ extern const u16* trt_gap_env_build_wblock(const char* const* defaults,
 extern int trt_gap_env_free_wblock(const u16* block);
 
 const u16* TRT_STDCALL trt_GetEnvironmentStringsW() {
-  {  // .102: note when the guest reads the whole environment block
-    static std::atomic<unsigned> es_calls{0};
-    if (es_calls.fetch_add(1, std::memory_order_relaxed) < 8)
-      trt_core_log("envtrace: GetEnvironmentStringsW called");
-  }
   const char* pairs[] = {
     "PATH=C:\\Windows\\System32;Z:\\",
     "TEMP=C:\\Temp", "TMP=C:\\Temp",
@@ -2132,24 +2048,10 @@ int TRT_STDCALL trt_FreeEnvironmentStringsW(const u16* b) {
 
 u32 TRT_STDCALL trt_GetModuleFileNameW(void* mod, u16* buf, u32 len) {
   (void)mod;
-  if (!buf || !len) {
-    trt_core_log("strtrace: GetModuleFileNameW -> FAIL (NULL buf/len 0)");
-    return 0;
-  }
+  if (!buf || !len) return 0;
   u32 i = 0;
   for (; g_exepath[i] && i < len - 1; ++i) buf[i] = (u16)(u8)g_exepath[i];
   buf[i] = 0;
-  if (i == 0) {
-    trt_core_log("strtrace: GetModuleFileNameW -> FAIL (empty exepath)");
-  } else {
-    static std::atomic<unsigned> mfn_calls{0};
-    if (mfn_calls.fetch_add(1, std::memory_order_relaxed) < 8) {
-      char l[600];
-      snprintf(l, sizeof(l), "strtrace: GetModuleFileNameW -> \"%s\"",
-               g_exepath);
-      trt_core_log(l);
-    }
-  }
   return i;
 }
 
@@ -2820,7 +2722,23 @@ void fill_startup_info_w(void* si) {
   if (!si) return;
   memset(si, 0, 104);
   ((u32*)si)[0] = 104;  // cb
+  // Real Windows fills lpDesktop ("WinSta0\Default") and lpTitle (full exe path
+  // GoW faults passing a NULL string to a CRT string function right
+  // after Steam init; a NULL lpTitle/lpDesktop is the live candidate.
+  // Static storage: the struct holds pointers, so stack buffers would dangle.
+  // u16 arrays (not L"..." literals): wchar_t is 32-bit on the Linux gate.
+  static u16 desktop_buf[] = {'W', 'i', 'n', 'S', 't', 'a', '0', '\\',
+                              'D', 'e', 'f', 'a', 'u', 'l', 't', 0};
+  static u16 title_buf[260];
+  // Full path, not basename: GoW strrchrs lpTitle for a backslash;
+  // a bare basename returns NULL and its pointer math faults at -1.
+  size_t ti = 0;
+  for (; g_exepath[ti] && ti < 258; ++ti) title_buf[ti] = (u16)(u8)g_exepath[ti];
+  title_buf[ti] = 0;
+  ((u16**)si)[2] = desktop_buf;  // lpDesktop @16
+  ((u16**)si)[3] = title_buf;    // lpTitle @24
   boot_log("kernel32: GetStartupInfoW -> zeroed STARTUPINFOW (no console)");
+  boot_log("kernel32: GetStartupInfoW lpDesktop/lpTitle filled");
 }
 
 void fill_startup_info_a(void* si) {
