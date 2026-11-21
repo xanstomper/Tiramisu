@@ -1,0 +1,9 @@
+LIBRARY steam_api64
+EXPORTS
+    SteamAPI_RestartAppIfNecessary
+    SteamAPI_Init
+    SteamAPI_Shutdown
+    SteamAPI_IsSteamRunning
+    SteamAPI_GetSteamID
+    SteamAPI_SetRichPresence
+    SteamAPI_RunCallbacks
