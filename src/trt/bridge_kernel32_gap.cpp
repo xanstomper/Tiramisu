@@ -102,69 +102,6 @@ int env_find_locked(const char* name) {
   return -1;
 }
 
-// ---- the canonical guest environment (0.2.2.95) ---------------------------
-// One source of truth for the guest env block: GetEnvironmentStringsW/A
-// advertise exactly this set, and the store is seeded with it on first use
-// so GetEnvironmentVariableW/A and the bridged _wgetenv/getenv see the same
-// values (bridges audit #7: the advertised defaults used to be invisible to
-// GetEnvironmentVariableW). Values match the VFS layout the bridge presents
-// (C:\ paths, TIRAMISU host, Player user).
-static const char* kTrtDefaultEnv[] = {
-  "PATH=C:\\Windows\\System32;Z:\\",
-  "TEMP=C:\\Temp", "TMP=C:\\Temp",
-  "USERPROFILE=C:\\Users\\Player",
-  "APPDATA=C:\\Users\\Player\\AppData\\Roaming",
-  "LOCALAPPDATA=C:\\Users\\Player\\AppData\\Local",
-  "COMPUTERNAME=TIRAMISU", "USERNAME=Player",
-  "SystemRoot=C:\\Windows",
-  "SystemDrive=C:",
-  "windir=C:\\Windows",
-  "ComSpec=C:\\Windows\\System32\\cmd.exe",
-  "ProgramFiles=C:\\Program Files",
-  "ProgramFiles(x86)=C:\\Program Files (x86)",
-  "ProgramData=C:\\ProgramData",
-  "PUBLIC=C:\\Users\\Public",
-  "ALLUSERSPROFILE=C:\\ProgramData",
-  "HOMEDRIVE=C:",
-  "HOMEPATH=\\Users\\Player",
-  "OS=Windows_NT",
-  "PATHEXT=.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC",
-  "NUMBER_OF_PROCESSORS=8",
-  "PROCESSOR_ARCHITECTURE=AMD64",
-  "PROCESSOR_IDENTIFIER=AMD64 Family 25 Model 33 Stepping 0, AuthenticAMD",
-  "PROCESSOR_LEVEL=25",
-  "PROCESSOR_REVISION=2100",
-  "SESSIONNAME=Console",
-  "LOGONSERVER=\\\\TIRAMISU",
-  "USERDOMAIN=TIRAMISU",
-};
-
-extern "C" const char* const* trt_gap_env_defaults(size_t* count) {
-  if (count) *count = sizeof(kTrtDefaultEnv) / sizeof(kTrtDefaultEnv[0]);
-  return kTrtDefaultEnv;
-}
-
-// Seed-once: insert any missing defaults into the store (caller holds
-// g_env_mu). Runs on the first env access of any kind, so a game that queries
-// GetEnvironmentVariableW before ever calling GetEnvironmentStringsW still
-// sees the full set. A variable the game later deletes stays deleted.
-bool g_env_seeded = false;
-
-void seed_defaults_locked() {
-  if (g_env_seeded) return;
-  g_env_seeded = true;
-  for (size_t i = 0; i < sizeof(kTrtDefaultEnv) / sizeof(kTrtDefaultEnv[0]);
-       ++i) {
-    const char* kv = kTrtDefaultEnv[i];
-    const char* eq = strchr(kv, '=');
-    if (!eq) continue;
-    std::string key(kv, (size_t)(eq - kv));
-    if (env_find_locked(key.c_str()) < 0) {
-      g_env_store.emplace_back(key, std::string(eq + 1));
-    }
-  }
-}
-
 std::string utf16_to_utf8_dyn(const u16* s) {
   std::string out;
   if (!s) return out;
@@ -184,7 +121,6 @@ extern "C" const char* trt_gap_env_get(const char* name) {
   if (!name) return nullptr;
   static thread_local std::string t_env_val;
   std::lock_guard<std::mutex> lk(g_env_mu);
-  seed_defaults_locked();
   const int idx = env_find_locked(name);
   if (idx < 0 || g_env_store[(size_t)idx].second.empty()) return nullptr;
   t_env_val = g_env_store[(size_t)idx].second;
@@ -211,7 +147,6 @@ extern "C" const u16* trt_gap_env_build_wblock(const char* const* defaults,
   std::vector<std::pair<std::string, std::string>> merged;
   {
     std::lock_guard<std::mutex> lk(g_env_mu);
-    seed_defaults_locked();
     for (size_t i = 0; i < default_count; ++i) {
       const char* kv = defaults[i];
       if (!kv) continue;
