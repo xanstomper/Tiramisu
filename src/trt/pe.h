@@ -1,5 +1,5 @@
 // tiramisu/src/trt/pe.h
-// Self-contained PE32/PE64 structures and loader error codes.
+// Self-contained PE64 structures and loader error codes.
 // Deliberately windows.h-free so the loader compiles and tests on any host.
 #ifndef TIRAMISU_PE_H
 #define TIRAMISU_PE_H
@@ -61,41 +61,14 @@ enum {
   TRT_ERR_SEAL = 13,          // final protect() failed
   TRT_ERR_DELAY_IMPORT = 14,  // delay-load dir present (unprocessed in v0)
   TRT_ERR_BAD_ARGS = 15,
-  TRT_ERR_MANAGED = 16,  // .NET assembly (COM descriptor present); no CLR here
-  TRT_ERR_MONO = 17,          // Mono embedding failure (see trt_mono_last_error)
-  TRT_ERR_FNA3D = 18          // FNA3D host-device handoff failure (see trt_fna3d_last_error)
+  TRT_ERR_MONO = 16,          // Mono embedding failure (see trt_mono_last_error)
+  TRT_ERR_FNA3D = 17          // FNA3D host-device handoff failure (see trt_fna3d_last_error)
 };
 
-// min/max PE32/PE64 header offsets/sizes we rely on (SDK-free constants)
+// min/max PE64 header offsets/sizes we rely on (SDK-free constants)
 #define TRT_PE_MACHINE_X64 0x8664u
-#define TRT_PE_MACHINE_I386 0x014cu
 #define TRT_PE_OPT64_MAGIC 0x020bu
-#define TRT_PE_OPT32_MAGIC 0x010bu
 #define TRT_PE_MAX_IMAGE_BYTES (2ull * 1024ull * 1024ull * 1024ull) // 2 GB cap
-
-// ---- M7 Phase 1: 32-bit trap addresses ----
-// A 32-bit IAT slot cannot hold a 64-bit pointer, so a bound 32-bit import
-// gets a reserved guest-VA trap address instead of a host address. The
-// range 0xF0000000..0xF003FFFF (256 KiB = 65536 slots x 4 bytes) sits in
-// the guest kernel-reserved top of the 32-bit VA space: no image ever maps
-// there (guest images live below 0x70000000), so a jump/call to a trap
-// address faults visibly until the Phase 2 emulator installs its trap
-// dispatcher. Trap N = BASE + 4*N; N indexes the binding registry in
-// pe_loader.cpp (module!symbol recorded at bind time). Phase 1 is
-// LOAD-ONLY: the traps are not callable, by design.
-#define TRT_PE32_TRAP_BASE 0xF0000000u
-#define TRT_PE32_TRAP_MAX  65536u
-#define TRT_PE32_TRAP_END  (TRT_PE32_TRAP_BASE + 4u * TRT_PE32_TRAP_MAX)
-
-// Data-directory array offset within the optional header differs by width:
-// the PE32 optional header is 96 bytes before the directories, PE32+ is
-// 112 (PE32 has BaseOfData + a 32-bit ImageBase where PE32+ has a 64-bit
-// ImageBase; the layouts converge again at SizeOfImage). Any code that
-// reads directories[] from a file whose width is not known statically MUST
-// use trt_pe_directories() (defined below, after trt_data_directory),
-// never the 64-bit struct layout.
-#define TRT_PE32_OPT_DIRS_OFF 96
-#define TRT_PE64_OPT_DIRS_OFF 112
 
 #pragma pack(push, 1)
 
@@ -129,20 +102,7 @@ typedef struct trt_data_directory {
 #define TRT_PE_DIR_RELOC  5
 #define TRT_PE_DIR_TLS    9
 #define TRT_PE_DIR_DELAY_IMPORT 13
-#define TRT_PE_DIR_COM_DESCRIPTOR 14  // .NET CLR header (managed assemblies)
 #define TRT_PE_NUM_DIRECTORIES 16
-
-// Width-aware data-directory accessor: `optional_header` points at the
-// optional header (NT headers + 24); `magic` selects the layout (0x10b =
-// PE32, dirs at +96; 0x20b = PE32+, dirs at +112). Anything else is
-// treated as PE32+ (callers validate the magic first).
-static inline const trt_data_directory* trt_pe_directories(
-    const void* optional_header, u16 magic) {
-  const u8* base = (const u8*)optional_header;
-  if (magic == TRT_PE_OPT32_MAGIC)
-    return (const trt_data_directory*)(base + TRT_PE32_OPT_DIRS_OFF);
-  return (const trt_data_directory*)(base + TRT_PE64_OPT_DIRS_OFF);
-}
 
 typedef struct trt_optional_header64 {
   u16 magic;                 // 0x020b
@@ -167,34 +127,6 @@ typedef struct trt_nt_headers64 {
   trt_file_header file_header;
   trt_optional_header64 optional_header;
 } trt_nt_headers64;
-
-// ---- PE32 (32-bit) optional header: ImageBase and the stack/heap sizes
-// are u32, and BaseOfData exists (PE32+ drops it). Total 224 bytes with
-// the 16 data directories; the directories start at offset 96.
-typedef struct trt_optional_header32 {
-  u16 magic;                 // 0x010b
-  u8  major_linker; u8 minor_linker;
-  u32 size_of_code; u32 size_of_initialized_data; u32 size_of_uninitialized_data;
-  u32 address_of_entry_point;      // RVA
-  u32 base_of_code;
-  u32 base_of_data;                // PE32 only
-  u32 image_base;                  // preferred load address (guest VA)
-  u32 section_alignment; u32 file_alignment;
-  u16 os_major; u16 os_minor; u16 image_major; u16 image_minor;
-  u16 subsys_major; u16 subsys_minor; u32 win32_version;
-  u32 size_of_image; u32 size_of_headers;
-  u32 check_sum; u16 subsystem; u16 dll_characteristics;
-  u32 size_of_stack_reserve; u32 size_of_stack_commit;
-  u32 size_of_heap_reserve; u32 size_of_heap_commit;
-  u32 loader_flags; u32 number_of_rva_and_sizes;
-  trt_data_directory directories[TRT_PE_NUM_DIRECTORIES];
-} trt_optional_header32;
-
-typedef struct trt_nt_headers32 {
-  u32 signature;              // 'PE\0\0'
-  trt_file_header file_header;
-  trt_optional_header32 optional_header;
-} trt_nt_headers32;
 
 typedef struct trt_section_header {
   u8  name[8];
@@ -260,16 +192,6 @@ typedef struct trt_tls_directory64 {
   u64 address_of_callbacks;        // VA of NULL-terminated callback ptr array
   u32 size_of_zero_fill; u32 characteristics;
 } trt_tls_directory64;
-
-// PE32 TLS directory: same fields, 32-bit VAs; the callback array holds
-// 4-byte VAs. The VAs are GUEST VAs (relocated by the 32-bit delta).
-typedef struct trt_tls_directory32 {
-  u32 start_address_of_raw_data;
-  u32 end_address_of_raw_data;
-  u32 address_of_index;
-  u32 address_of_callbacks;        // VA of NULL-terminated u32 callback array
-  u32 size_of_zero_fill; u32 characteristics;
-} trt_tls_directory32;
 
 #pragma pack(pop)
 

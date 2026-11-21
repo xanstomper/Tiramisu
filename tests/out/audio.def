@@ -1,0 +1,5 @@
+LIBRARY xaudio2_9
+EXPORTS
+    XAudio2Create
+    trt_audio_note_submit
+    trt_audio_note_start
