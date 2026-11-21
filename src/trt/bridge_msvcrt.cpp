@@ -837,61 +837,13 @@ u64 TRT_GUEST_ABI crt_wcsftime(u16* buf, u64 maxsz, const u16* fmt,
 struct env_cache_entry { char key[128]; char val[1024]; bool used; };
 env_cache_entry g_env_cache[64];
 
-// .102 diagnostic: log every getenv/_wgetenv call (name + NULL/found + why).
-// res: 1 = found, 0 = missing var, -1 = bridge fn missing, -2 = value too long.
-static void crt_env_log(const char* tag, const char* name, int res) {
-  static unsigned env_calls = 0;
-  if (env_calls >= 128) {
-    if (env_calls == 128)
-      trt_core_log("envtrace: env log cap reached (128), suppressing");
-    ++env_calls;
-    return;
-  }
-  ++env_calls;
-  char l[384];
-  if (res == 1)
-    snprintf(l, sizeof(l), "envtrace: %s(\"%s\") -> found", tag, name);
-  else if (res == -1)
-    snprintf(l, sizeof(l), "envtrace: %s(\"%s\") -> NULL (no bridge fn)", tag,
-             name);
-  else if (res == -2)
-    snprintf(l, sizeof(l), "envtrace: %s(\"%s\") -> NULL (value too long)",
-             tag, name);
-  else
-    snprintf(l, sizeof(l), "envtrace: %s(\"%s\") -> NULL (missing)", tag,
-             name);
-  trt_core_log(l);
-}
-
-static void crt_env_log_w(const char* tag, const u16* name, int res) {
-  char n[256] = {};
-  if (name) {
-    for (int i = 0; i < 255 && name[i]; ++i)
-      n[i] = (name[i] < 0x80) ? (char)name[i] : '?';
-  }
-  crt_env_log(tag, name ? n : "<NULL>", res);
-}
-
 char* TRT_GUEST_ABI crt_getenv(const char* name) {
-  if (!name) {
-    crt_env_log("getenv", "<NULL>", 0);
-    return nullptr;
-  }
+  if (!name) return nullptr;
   auto fn = (pfn_GetEnvA)k32_sym("GetEnvironmentVariableA");
-  if (!fn) {
-    crt_env_log("getenv", name, -1);
-    return nullptr;
-  }
+  if (!fn) return nullptr;
   char tmp[1024];
   u32 n = fn(name, tmp, sizeof(tmp));
-  if (n == 0) {
-    crt_env_log("getenv", name, 0);
-    return nullptr;
-  }
-  if (n >= sizeof(tmp)) {
-    crt_env_log("getenv", name, -2);
-    return nullptr;
-  }
+  if (n == 0 || n >= sizeof(tmp)) return nullptr;
   file_lock();
   int slot = -1;
   for (int i = 0; i < 64; ++i) {
@@ -907,7 +859,6 @@ char* TRT_GUEST_ABI crt_getenv(const char* name) {
   snprintf(g_env_cache[slot].val, sizeof(g_env_cache[slot].val), "%s", tmp);
   char* res = g_env_cache[slot].val;
   file_unlock();
-  crt_env_log("getenv", name, 1);
   return res;
 }
 
@@ -1428,31 +1379,16 @@ u16 g_wgetenv_ring[16][1024] = {};
 u32 g_wgetenv_idx = 0;
 
 u16* TRT_GUEST_ABI crt__wgetenv(const u16* name) {
-  if (!name || !name[0]) {
-    crt_env_log_w("_wgetenv", name, 0);
-    set_errno_from_host(EINVAL);
-    return nullptr;
-  }
+  if (!name || !name[0]) { set_errno_from_host(EINVAL); return nullptr; }
   auto fn = (pfn_GetEnvW)k32_sym("GetEnvironmentVariableW");
-  if (!fn) {
-    crt_env_log_w("_wgetenv", name, -1);
-    return nullptr;
-  }
+  if (!fn) return nullptr;
   u16 tmp[1024];
   u32 n = fn(name, tmp, 1024);
-  if (n == 0) {
-    crt_env_log_w("_wgetenv", name, 0);
-    return nullptr;
-  }
-  if (n >= 1024) {
-    crt_env_log_w("_wgetenv", name, -2);
-    return nullptr;
-  }
+  if (n == 0 || n >= 1024) return nullptr;
   crt_lock(7);
   u16* slot = g_wgetenv_ring[g_wgetenv_idx++ & 15u];
   memcpy(slot, tmp, ((size_t)n + 1) * 2);
   crt_unlock(7);
-  crt_env_log_w("_wgetenv", name, 1);
   return slot;
 }
 i32 TRT_GUEST_ABI crt__wputenv_s(const u16* name, const u16* value) {

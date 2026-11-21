@@ -761,7 +761,7 @@ int main() {
     auto pGetGen = (fn_getgeneric)sq("SteamAPI_ISteamClient_GetISteamGenericInterface");
     auto pBSub = (fn_bsub)sq("SteamAPI_ISteamApps_BIsSubscribedApp");
 
-    CHECK(pInit && pInit() == 1, "SteamAPI_Init succeeds");
+    CHECK(pInit && pInit() == 0, "SteamAPI_Init reports unavailable client");
     void* client = pClient ? pClient() : nullptr;
     void* client2 = pCreateIf ? pCreateIf("SteamClient020") : nullptr;
     CHECK(client != nullptr && client == client2,

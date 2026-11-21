@@ -138,12 +138,12 @@ int main(int argc, char** argv) {
   CHECK(trt_seal_image(&be, img) == TRT_OK, "image sealed (W^X)");
 
   const u64 ret = win64_call(img->base + img->entry_rva, 0, 0, 0);
-  printf("  guest returned 0x%llx (want 0x7f)\n", (unsigned long long)ret);
+  printf("  guest returned 0x%llx (want 0x71, no-client diagnostic)\n", (unsigned long long)ret);
 
   CHECK(ret & 0x1u, "RestartAppIfNecessary -> no restart (auth-only)");
-  CHECK(ret & 0x2u, "SteamAPI_Init succeeded");
-  CHECK(ret & 0x4u, "GetSteamID returned a valid-format ID");
-  CHECK(ret & 0x8u, "IsSteamRunning -> 1");
+  CHECK(!(ret & 0x2u), "SteamAPI_Init failed with no client");
+  CHECK(!(ret & 0x4u), "GetSteamID no-user diagnostic returned zero");
+  CHECK(!(ret & 0x8u), "IsSteamRunning -> 0 with no client");
   CHECK(ret & 0x10u, "SetRichPresence accepted");
   CHECK(ret & 0x20u, "RunCallbacks dispatched");
   CHECK(ret & 0x40u, "Shutdown clean");

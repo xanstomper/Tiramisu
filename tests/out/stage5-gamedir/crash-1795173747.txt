@@ -1,0 +1,8 @@
+TIRAMISU CRASH REPORT (text minidump)
+  time: 1795173747
+  exception code: 0xc0000005
+  exception address: 0x180001234
+  thread id: 132409
+  modules:
+    guest_dbghelp.exe                                base=0x2900000 size=0x4000
+  (text minidump replaces the ETW the console does not have)

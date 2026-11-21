@@ -1,0 +1,6 @@
+LIBRARY dinput8
+EXPORTS
+    DirectInput8Create
+    trt_di_feed_move
+    trt_di_feed_button
+    trt_di_feed_key
