@@ -1,0 +1,104 @@
+--- a/third_party/fna-src/lib/FNA3D/src/FNA3D_Driver_D3D11.c
++++ b/third_party/fna-src/lib/FNA3D/src/FNA3D_Driver_D3D11.c
+@@ -31,6 +31,19 @@
+ #include "FNA3D_Driver_D3D11.h"
+ #include "FNA3D_Driver_D3D11_shaders.h"
+ 
++#if defined(_WIN32)
++/* Memory instrumentation (patch 08, oom-analysis.md section 6.3): the
++ * host provides the UWP app memory usage (this driver is C and cannot
++ * call WinRT), and the Mono SGen heap size comes from the runtime
++ * (mono/metadata/mono-gc.h:118-119; declared directly — the driver
++ * does not include Mono headers). Both are exported from the host
++ * binary / the statically linked Mono lib. */
++#include <stdint.h>
++extern uint64_t trt_fna3d_app_memory_usage(void);
++extern int64_t mono_gc_get_heap_size(void);
++extern int64_t mono_gc_get_used_size(void);
++#endif
++
+ #ifdef USE_SDL3
+ #include <SDL3/SDL.h>
+ 
+@@ -3676,6 +3689,24 @@
+ 		0
+ 	);
+ 	SDL_UnlockMutex(renderer->ctxLock);
++#if defined(_WIN32)
++	/* Memory instrumentation (oom-analysis.md section 6.3): log app
++	 * memory + SGen heap after each large texture upload. The atlas
++	 * phase is where the .141 process died, so this pins whether
++	 * memory climbs during it. Threshold: 1 MiB — atlas pages are
++	 * >= 1 MiB, loose PNGs are < 64 KiB, so small textures stay quiet.
++	 */
++	if (dataLength >= 1024 * 1024)
++	{
++		FNA3D_LogInfo(
++			"mem after SetData %dx%d (%d B): app %llu MiB, "
++			"sgen heap %lld used %lld MiB",
++			(int) w, (int) h, (int) dataLength,
++			(unsigned long long) (trt_fna3d_app_memory_usage() / (1024 * 1024)),
++			(long long) (mono_gc_get_heap_size() / (1024 * 1024)),
++			(long long) (mono_gc_get_used_size() / (1024 * 1024)));
++	}
++#endif
+ }
+ 
+ static void D3D11_SetTextureData3D(
+--- a/src/trt/fna3d_host.h
++++ b/src/trt/fna3d_host.h
+@@ -86,6 +86,14 @@
+ // Human-readable detail of the last handoff failure ("" when none).
+ const char* trt_fna3d_last_error(void);
+ 
++// Current app memory usage in bytes (MemoryManager::AppMemoryUsage on
++// UWP; 0 on Linux). Memory instrumentation for the Celeste OOM
++// investigation (oom-analysis.md): the FNA3D D3D11 driver logs this
++// after each large texture upload (patch 08). The driver is C and
++// cannot call WinRT directly, so the host provides it. Returns 0 if
++// the query fails.
++u64 trt_fna3d_app_memory_usage(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/src/trt/fna3d_host.cpp
++++ b/src/trt/fna3d_host.cpp
+@@ -42,6 +42,8 @@
+ #if defined(_WIN32)
+ // ---- Windows/UWP: real handoff into the FNA3D D3D11 driver ----
+ #include "FNA3D.h"
++#include <winrt/base.h>  // winrt::hresult_error
++#include <winrt/Windows.System.h>  // MemoryManager::AppMemoryUsage (patch 08)
+ 
+ namespace {
+ 
+@@ -114,6 +116,18 @@
+   return trt_fna3d_attach(&cfg);
+ }
+ 
++extern "C" u64 trt_fna3d_app_memory_usage(void) {
++  // Memory instrumentation for the Celeste OOM investigation
++  // (oom-analysis.md): the FNA3D D3D11 driver logs this after each
++  // large texture upload (patch 08). Returns 0 if the query fails.
++  try {
++    using winrt::Windows::System::MemoryManager;
++    return (u64)MemoryManager::AppMemoryUsage();
++  } catch (const winrt::hresult_error&) {
++    return 0;
++  }
++}
++
+ #else
+ // ---- Linux: no D3D11. Honest failure, not a fake. ----
+ extern "C" int trt_fna3d_attach(const trt_fna3d_attach_config* cfg) {
+@@ -132,4 +146,9 @@
+               "the offline harness renders via FNA3D/OpenGL)");
+ }
+ 
++extern "C" u64 trt_fna3d_app_memory_usage(void) {
++  // No WinRT on Linux; the D3D11 driver is not built for Linux either.
++  return 0;
++}
++
+ #endif  // _WIN32

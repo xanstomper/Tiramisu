@@ -1,0 +1,54 @@
+--- a/src/trt/bridge_fmod_studio.cpp
++++ b/src/trt/bridge_fmod_studio.cpp
+@@ -43,6 +43,14 @@
+ #include "bridge_fmod_studio.h"
+ #include "trt_trace.h"
+ 
++#if defined(_WIN32)
++// WinRT MemoryManager for the bank-load memory log (patch 07). UWP
++// only: the Linux harness has no WinRT (its branch logs PCM bytes
++// only, below).
++#include <winrt/base.h>  // winrt::hresult_error
++#include <winrt/Windows.System.h>  // MemoryManager::AppMemoryUsage
++#endif
++
+ #include "bridge_audio.h"
+ #include "bridge_fmod.h"
+ #include "fsb_vorbis_setups.h"
+@@ -1097,6 +1105,36 @@
+        path, (int)b->events.size(), (int)b->timelines.size(),
+        (int)b->instruments.size(), (int)b->wavs.size(), (int)b->fsbs.size(),
+        (int)b->string_guids.size());
++  // Memory instrumentation (oom-analysis.md section 6.2): log app memory
++  // + PCM cache bytes after each bank load. Requires patch 06 (the
++  // trt_fmod_studio_pcm_cache_bytes accessor). On Linux (no WinRT) only
++  // the PCM cache bytes are logged.
++#if defined(_WIN32)
++  {
++    char mem[256];
++    try {
++      using winrt::Windows::System::MemoryManager;
++      const u64 usage = MemoryManager::AppMemoryUsage();
++      const u64 limit = MemoryManager::AppMemoryUsageLimit();
++      const u64 pcm = trt_fmod_studio_pcm_cache_bytes();
++      std::snprintf(mem, sizeof(mem),
++                    "fmod-studio: mem after bank %s: app %llu/%llu MiB, "
++                    "pcm cache %llu MiB",
++                    path, (unsigned long long)(usage / (1024 * 1024)),
++                    (unsigned long long)(limit / (1024 * 1024)),
++                    (unsigned long long)(pcm / (1024 * 1024)));
++    } catch (const winrt::hresult_error&) {
++      std::snprintf(mem, sizeof(mem),
++                    "fmod-studio: mem after bank %s: app usage query failed",
++                    path);
++    }
++    logf("%s", mem);
++  }
++#else
++  logf("fmod-studio: mem after bank %s: pcm cache %llu MiB", path,
++       (unsigned long long)(trt_fmod_studio_pcm_cache_bytes() /
++                            (1024 * 1024)));
++#endif
+   return b;
+ }
+ 

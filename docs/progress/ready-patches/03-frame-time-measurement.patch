@@ -1,0 +1,149 @@
+--- a/third_party/fna3d-src/src/FNA3D_Driver_D3D11.c
++++ b/third_party/fna3d-src/src/FNA3D_Driver_D3D11.c
+@@ -75,6 +75,15 @@
+ 
+ #include <dxgi.h>
+ 
++#if defined(_WIN32)
++/* TIRAMISU EXTENSION: QueryPerformanceCounter for frame-time
++ * measurement (D3D11_INTERNAL_FrameTimeSample, below). Included
++ * explicitly: the host build defines WIN32_LEAN_AND_MEAN, which
++ * excludes profileapi.h from windows.h.
++ */
++#include <profileapi.h>
++#endif
++
+ #ifndef DXGI_PRESENT_ALLOW_TEARING
+ #define DXGI_PRESENT_ALLOW_TEARING 0x00000200UL
+ #endif /* DXGI_PRESENT_ALLOW_TEARING */
+@@ -1590,6 +1599,119 @@
+ 	SDL_UnlockMutex(renderer->ctxLock);
+ }
+ 
++#if defined(_WIN32)
++/* TIRAMISU EXTENSION: frame-time measurement.
++ * Timestamps each Present and logs the rolling average + p95 frame
++ * time to tiramisu.log every 60 frames (via FNA3D_LogInfo, which the
++ * host hooks to its logger in trt_fna3d_attach). p95 < 16.7ms proves
++ * 60fps; 20-30ms means the Mono interpreter is the bottleneck and AOT
++ * compilation is the next step (see aot-compilation-plan.md).
++ * Zero allocation in the Present path: fixed-size ring buffer, and
++ * the sort + log run only once per 60 frames. Runs under the ctxLock
++ * held by D3D11_SwapBuffers, so no extra synchronisation is needed.
++ */
++#define TRT_FRAME_SAMPLES 120
++#define TRT_FRAME_LOG_EVERY 60
++
++static double trt_frame_times[TRT_FRAME_SAMPLES];
++static int trt_frame_count = 0;
++static int trt_frame_index = 0;
++static uint64_t trt_frame_total = 0;
++static int64_t trt_frame_prev_qpc = 0;
++static int64_t trt_frame_qpc_freq = 0;
++
++static void D3D11_INTERNAL_FrameTimeSample(void)
++{
++	LARGE_INTEGER now;
++	double dt_ms, sum, avg, p95;
++	double sorted[TRT_FRAME_SAMPLES];
++	int i, j, n, p95i;
++	double key;
++
++	if (trt_frame_qpc_freq == 0)
++	{
++		LARGE_INTEGER freq;
++		if (!QueryPerformanceFrequency(&freq) || freq.QuadPart == 0)
++		{
++			/* No high-resolution timer; give up quietly. */
++			trt_frame_qpc_freq = -1;
++			return;
++		}
++		trt_frame_qpc_freq = freq.QuadPart;
++	}
++	if (trt_frame_qpc_freq < 0)
++	{
++		return;
++	}
++	QueryPerformanceCounter(&now);
++	if (trt_frame_prev_qpc == 0)
++	{
++		trt_frame_prev_qpc = now.QuadPart;
++		return;
++	}
++	dt_ms = (double) (now.QuadPart - trt_frame_prev_qpc) *
++		1000.0 / (double) trt_frame_qpc_freq;
++	trt_frame_prev_qpc = now.QuadPart;
++
++	/* Ring buffer: fixed size, no allocation. */
++	trt_frame_times[trt_frame_index] = dt_ms;
++	trt_frame_index = (trt_frame_index + 1) % TRT_FRAME_SAMPLES;
++	if (trt_frame_count < TRT_FRAME_SAMPLES)
++	{
++		trt_frame_count += 1;
++	}
++	trt_frame_total += 1;
++
++	/* Log every 60 frames once the window has 60 samples. */
++	if (trt_frame_count < TRT_FRAME_LOG_EVERY ||
++		(trt_frame_total % TRT_FRAME_LOG_EVERY) != 0)
++	{
++		return;
++	}
++
++	/* Average over the window. */
++	sum = 0.0;
++	n = trt_frame_count;
++	for (i = 0; i < n; i += 1)
++	{
++		sum += trt_frame_times[i];
++	}
++	avg = sum / (double) n;
++
++	/* p95: copy + insertion sort (120 elements, once per 60 frames). */
++	for (i = 0; i < n; i += 1)
++	{
++		sorted[i] = trt_frame_times[i];
++	}
++	for (i = 1; i < n; i += 1)
++	{
++		key = sorted[i];
++		j = i - 1;
++		while (j >= 0 && sorted[j] > key)
++		{
++			sorted[j + 1] = sorted[j];
++			j -= 1;
++		}
++		sorted[j + 1] = key;
++	}
++	p95i = (int) (0.95 * (double) (n - 1) + 0.5);
++	if (p95i < 0)
++	{
++		p95i = 0;
++	}
++	if (p95i >= n)
++	{
++		p95i = n - 1;
++	}
++	p95 = sorted[p95i];
++
++	FNA3D_LogInfo(
++		"trt: frame avg=%.1fms p95=%.1fms n=%d",
++		avg, p95, n
++	);
++}
++#endif /* defined(_WIN32) */
++
+ static void D3D11_SwapBuffers(
+ 	FNA3D_Renderer *driverData,
+ 	FNA3D_Rect *sourceRectangle,
+@@ -1791,6 +1913,10 @@
+ 	{
+ 		presentFlags = 0;
+ 	}
++#if defined(_WIN32)
++	/* TIRAMISU EXTENSION: frame-time measurement. */
++	D3D11_INTERNAL_FrameTimeSample();
++#endif
+ 	IDXGISwapChain_Present(
+ 		swapchainData->swapchain,
+ 		renderer->syncInterval,

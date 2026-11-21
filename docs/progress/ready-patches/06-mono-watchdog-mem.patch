@@ -1,0 +1,104 @@
+--- a/src/trt/mono_host.cpp
++++ b/src/trt/mono_host.cpp
+@@ -20,6 +20,7 @@
+ 
+ #include "fna_platform.h"
+ #include "trt_trace.h"
++#include "bridge_fmod_studio.h"  // trt_fmod_studio_pcm_cache_bytes (watchdog memory line)
+ 
+ #include <cstdint>
+ #include <cstdlib>  // malloc/free for the heap probe
+@@ -128,6 +129,11 @@
+ #include <mono/metadata/object.h>
+ #include <mono/metadata/exception.h>
+ 
++// WinRT MemoryManager for the watchdog memory line (patch 06): the UWP
++// app memory usage + limit. Inside the enclosing _WIN32 block.
++#include <winrt/base.h>  // winrt::hresult_error
++#include <winrt/Windows.System.h>  // MemoryManager::AppMemoryUsage
++
+ // domain.h is not shipped in the Ubuntu libmono-2.0-dev header set, so
+ // mono_domain_set_config is declared directly (same as the Linux path).
+ extern "C" void mono_domain_set_config(MonoDomain* domain, const char* base_dir,
+@@ -137,6 +143,14 @@
+ // header set), so it is declared directly here (same as mono_domain_set_config).
+ extern "C" void mono_jit_set_aot_only(int aot_only);
+ 
++// mono_gc_get_heap_size / mono_gc_get_used_size are declared in
++// mono/metadata/mono-gc.h (mono-gc.h:118-119), which is not in the
++// shipped header set, so they are declared directly here (same as
++// mono_domain_set_config). Verified exported from libmonosgen-uwp.lib
++// (T symbols in mono-symbols.txt). Used by the watchdog memory line.
++extern "C" int64_t mono_gc_get_heap_size(void);
++extern "C" int64_t mono_gc_get_used_size(void);
++
+ namespace {
+ 
+ // dllmaps for the assembly-load hook (same contract as Linux: set for
+@@ -663,6 +677,34 @@
+         } else {
+           trt_trace("TRACE PROBE malloc NULL (out of memory)");
+         }
++        // Memory instrumentation (oom-analysis.md section 6.1): the
++        // DECISIVE measurement for the .141 ceiling — if app usage
++        // climbs toward the 5 GB limit before the death, it is OOM; if
++        // it stays flat (~500 MB), it is a silent crash. Allocation-free
++        // (stack buffer + trt_trace), like the rest of this watchdog.
++        {
++          char m[192];
++          try {
++            using winrt::Windows::System::MemoryManager;
++            const uint64_t usage = MemoryManager::AppMemoryUsage();
++            const uint64_t limit = MemoryManager::AppMemoryUsageLimit();
++            const uint64_t pcm = trt_fmod_studio_pcm_cache_bytes();
++            const int64_t heap = mono_gc_get_heap_size();
++            const int64_t used = mono_gc_get_used_size();
++            std::snprintf(m, sizeof(m),
++                          "TRACE mem: app %llu/%llu MiB, pcm %llu MiB, "
++                          "sgen heap %lld used %lld MiB",
++                          (unsigned long long)(usage / (1024 * 1024)),
++                          (unsigned long long)(limit / (1024 * 1024)),
++                          (unsigned long long)(pcm / (1024 * 1024)),
++                          (long long)(heap / (1024 * 1024)),
++                          (long long)(used / (1024 * 1024)));
++          } catch (const winrt::hresult_error&) {
++            std::snprintf(m, sizeof(m),
++                          "TRACE mem: app usage query failed");
++          }
++          trt_trace(m);
++        }
+       }
+     }
+   });
+--- a/src/trt/bridge_fmod_studio.h
++++ b/src/trt/bridge_fmod_studio.h
+@@ -341,6 +341,11 @@
+ // harness test uses this — the game's system handle lives inside
+ // managed code and the test cannot know it.
+ int trt_fmod_studio_global_event_count();
++// Current PCM decode cache size in bytes (g_cache_bytes). Memory
++// instrumentation for the Celeste OOM investigation (oom-analysis.md):
++// the Mono watchdog (patch 06) logs this on every tick, and bank_load
++// (patch 07) logs it after each bank load.
++u64 trt_fmod_studio_pcm_cache_bytes();
+ 
+ #ifdef __cplusplus
+ }
+--- a/src/trt/bridge_fmod_studio.cpp
++++ b/src/trt/bridge_fmod_studio.cpp
+@@ -1475,6 +1475,15 @@
+ 
+ }  // namespace
+ 
++// Memory instrumentation for the Celeste OOM investigation
++// (oom-analysis.md): current PCM decode cache size in bytes. The Mono
++// watchdog (patch 06) and bank_load (patch 07) log this. g_cache_bytes
++// lives in the anonymous namespace above; this file-scope accessor is
++// how the rest of the host reads it.
++extern "C" u64 trt_fmod_studio_pcm_cache_bytes() {
++  return (u64)g_cache_bytes;
++}
++
+ namespace {
+ 
+ // ---- cross-bank lookups ----

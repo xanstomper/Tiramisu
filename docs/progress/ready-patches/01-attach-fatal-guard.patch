@@ -1,0 +1,19 @@
+--- a/src/host/main.cpp
++++ b/src/host/main.cpp
+@@ -1438,6 +1438,16 @@
+       snprintf(ab, sizeof(ab), "TRACE fna3d attach rc=%d attached=%d",
+                arc, trt_fna3d_is_attached());
+       trt_trace(ab);
++      if (!trt_fna3d_is_attached()) {
++        // FATAL guard: a failed attach must stop the launch here. Without
++        // it, PrepareWindowAttributes takes the stock D3D11 probe path
++        // (which succeeds on UWP) and CreateDevice builds a swapchain
++        // against a garbage window handle -> NULL deref AV.
++        longan::log_line("trt: FATAL fna3d attach failed - refusing stock D3D11 path");
++        r.map_rc = TRT_ERR_FNA3D;
++        strncpy(r.detail, trt_fna3d_last_error(), sizeof(r.detail) - 1);
++        return r;
++      }
+     }
+     trt_trace("TRACE PrepareWindowAttributes enter");
+     FNA3D_PrepareWindowAttributes();

@@ -1,0 +1,26 @@
+--- a/src/trt/bridge_steam.cpp
++++ b/src/trt/bridge_steam.cpp
+@@ -103,9 +103,21 @@
+ }
+ void TRT_GUEST_ABI trt_SteamAPI_RunCallbacks(void) {
+   // the registered callbacks run through the real callback dispatch; a game
+-  // that waits for an achievement callback gets it when it earns one
++  // that waits for an achievement callback gets it when it earns one.
++  // RegisterCallback stores .run = nullptr (the game fills the vtable), so
++  // dispatch reads the CCallbackBase vtable directly: the first field of
++  // the callback object is the vtable pointer, slot 0 is Run.
+   for (int i = 0; i < g_callback_count; ++i) {
+-    if (g_callbacks[i].run) g_callbacks[i].run(g_callbacks[i].callback, nullptr);
++    void* cb = g_callbacks[i].callback;
++    if (!cb) continue;
++    if (g_callbacks[i].run) {
++      g_callbacks[i].run(cb, nullptr);
++      continue;
++    }
++    void** vtable = *reinterpret_cast<void***>(cb);
++    if (!vtable || !vtable[0]) continue;
++    auto run = reinterpret_cast<int (*)(void*, void*)>(vtable[0]);
++    run(cb, nullptr);
+   }
+ }
+ 
