@@ -18,3 +18,4 @@ third_party/gl4es/.git/
 third_party/d3d8to9/.git/
 third_party/mojoshader/.git/
 .mochi/
+out-*/

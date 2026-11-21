@@ -133,9 +133,34 @@ int TRT_STDCALL trt_GetSystemTimes(u64* idle, u64* kernel, u64* user) {
   return 1;
 }
 
+// .102 diagnostic: log every environment lookup (name + found/missing), so a
+// missing var handed to a string function shows up in the log. Capped at 128
+// calls; the counter is a plain static (boot is effectively single-threaded
+// and the cap is a flood guard, not a correctness mechanism).
+static void env_log_w(const char* tag, const char* name, int found, u32 len) {
+  static unsigned env_calls = 0;
+  if (env_calls >= 128) {
+    if (env_calls == 128)
+      trt_core_log("envtrace: env log cap reached (128), suppressing");
+    ++env_calls;
+    return;
+  }
+  ++env_calls;
+  char l[384];
+  if (found)
+    snprintf(l, sizeof(l), "envtrace: %s(\"%s\") -> found len=%u", tag, name,
+             len);
+  else
+    snprintf(l, sizeof(l), "envtrace: %s(\"%s\") -> MISSING", tag, name);
+  trt_core_log(l);
+}
+
 u32 TRT_STDCALL trt_GetEnvironmentVariableW(const u16* name, u16* buf,
                                                u32 size) {
-  if (!name) return 0;
+  if (!name) {
+    env_log_w("GetEnvironmentVariableW", "<NULL>", 0, 0);
+    return 0;
+  }
   char n[256];
   utf16_to_utf8(name, n, sizeof(n));
   // the SetEnvironmentVariableW store first (cross-call consistency: a
@@ -147,8 +172,12 @@ u32 TRT_STDCALL trt_GetEnvironmentVariableW(const u16* name, u16* buf,
     v = trt_gap_env_get(n);
   }
   if (!v) v = getenv(n);
-  if (!v) return 0;
+  if (!v) {
+    env_log_w("GetEnvironmentVariableW", n, 0, 0);
+    return 0;
+  }
   const u32 need = (u32)strlen(v) + 1;
+  env_log_w("GetEnvironmentVariableW", n, 1, need - 1);
   if (buf && size >= need) {
     for (u32 i = 0; i < need; ++i) buf[i] = (u16)(u8)v[i];
     return need;
@@ -158,7 +187,10 @@ u32 TRT_STDCALL trt_GetEnvironmentVariableW(const u16* name, u16* buf,
 
 u32 TRT_STDCALL trt_ExpandEnvironmentStringsW(const u16* in, u16* out,
                                                 u32 size) {
-  if (!in) return 0;
+  if (!in) {
+    trt_core_log("strtrace: ExpandEnvironmentStringsW(NULL) -> 0");
+    return 0;
+  }
   char src[1024], dst[2048];
   utf16_to_utf8(in, src, sizeof(src));
   const char* base = nullptr;

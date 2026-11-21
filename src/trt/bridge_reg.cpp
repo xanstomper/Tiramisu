@@ -1084,9 +1084,14 @@ int TRT_GUEST_ABI trt_RegQueryInfoKeyW(u64 hkey, u16* cls, u32* cb_cls,
 int TRT_GUEST_ABI trt_GetUserNameW(u16* buf, u32* cch) {
   static const char k_user[] = "tiramisu";
   const u32 need = (u32)sizeof(k_user);
-  if (!cch) { token_set_last_error(87); return 0; }
+  if (!cch) {
+    trt_core_log("strtrace: GetUserNameW -> FAIL (NULL cch)");
+    token_set_last_error(87);
+    return 0;
+  }
   if (!buf || *cch < need) {
     *cch = need;
+    trt_core_log("strtrace: GetUserNameW -> FAIL (buffer too small)");
     token_set_last_error(122);  // ERROR_INSUFFICIENT_BUFFER
     return 0;
   }
@@ -1098,9 +1103,14 @@ int TRT_GUEST_ABI trt_GetUserNameW(u16* buf, u32* cch) {
 int TRT_GUEST_ABI trt_GetUserNameA(char* buf, u32* cch) {
   static const char k_user[] = "tiramisu";
   const u32 need = (u32)sizeof(k_user);
-  if (!cch) { token_set_last_error(87); return 0; }
+  if (!cch) {
+    trt_core_log("strtrace: GetUserNameA -> FAIL (NULL cch)");
+    token_set_last_error(87);
+    return 0;
+  }
   if (!buf || *cch < need) {
     *cch = need;
+    trt_core_log("strtrace: GetUserNameA -> FAIL (buffer too small)");
     token_set_last_error(122);
     return 0;
   }

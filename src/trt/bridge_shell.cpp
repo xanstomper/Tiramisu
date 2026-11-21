@@ -12,7 +12,8 @@
 //
 // SHGetKnownFolderPath maps the FOLDERID_* GUIDs games actually pass
 // (Documents {FDD39AD0..}, LocalAppData {F1B32785..}, Profile {5E6C858F..},
-// Roaming AppData {3EB685DB..}, ProgramData {62AB5D82..}).
+// Roaming AppData {3EB685DB..}, ProgramData {62AB5D82..},
+// Saved Games {4C5C32FF-BB9D-43B0-B5B4-2D72E54EAAA4}).
 //
 // Both wide and ANSI entry points fill a MAX_PATH (260) buffer; the VFS
 // mkdirs the folder when the SHF_FLAG_CREATE bit (0x8000) is set.
@@ -175,8 +176,8 @@ int knownfolder_path(const u8* g, char* out, u32 cap) {
       {0x3EB685DBu, 0x65F9, 0x4CF6, "C:\\users\\player\\AppData\\Roaming"},
       // FOLDERID_ProgramData {62AB5D82-FDC1-4DC3-9A70-5B0E9E5C6EB4}
       {0x62AB5D82u, 0xFDC1, 0x4DC3, "C:\\ProgramData"},
-      // FOLDERID_SavedGames {4C5C32FA-BB47-4C5C-B1A7-17439CE19972}
-      {0x4C5C32FAu, 0xBB47, 0x4C5C, "C:\\users\\player\\Saved Games"},
+      // FOLDERID_SavedGames {4C5C32FF-BB9D-43B0-B5B4-2D72E54EAAA4}
+      {0x4C5C32FFu, 0xBB9D, 0x43B0, "C:\\users\\player\\Saved Games"},
       // FOLDERID_LocalAppDataLow {A520A1A4-1780-4FF6-BD18-167343C5AF16}
       // (Unity Application.persistentDataPath)
       {0xA520A1A4u, 0x1780, 0x4FF6, "C:\\users\\player\\AppData\\LocalLow"},
@@ -204,7 +205,7 @@ int knownfolder_path(const u8* g, char* out, u32 cap) {
 
 int TRT_GUEST_ABI shell_SHGetKnownFolderPath(const u8* rfid, u32 flags,
                                              void* token, u16** path_out) {
-  (void)flags; (void)token;
+  (void)token;
   if (!path_out) return E_INVALIDARG_;
   *path_out = nullptr;
   if (!rfid) return E_INVALIDARG_;
@@ -229,7 +230,9 @@ int TRT_GUEST_ABI shell_SHGetKnownFolderPath(const u8* rfid, u32 flags,
   utf8_to_utf16(p8, buf, len + 1);
   *path_out = buf;
   char line[160];
-  snprintf(line, sizeof(line), "shell: SHGetKnownFolderPath -> %s", p8);
+  snprintf(line, sizeof(line),
+           "shell: SHGetKnownFolderPath -> %s flags=0x%x out=%p buf=%p",
+           p8, flags, (void*)path_out, (void*)buf);
   log_line(line);
   return S_OK_;
 }

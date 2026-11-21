@@ -20,6 +20,76 @@
 #include <vector>
 #include <string>
 
+#if defined(_WIN32)
+namespace {
+struct RecentImport {
+  volatile u32 site;
+  volatile u32 tid;
+  volatile uintptr_t caller;
+};
+static_assert(sizeof(RecentImport) == 16);
+struct ImportLocation { char module[72]; char function[96]; };
+std::atomic<u32> g_recent_import_tick{0};
+std::atomic<u32> g_import_sites_count{0};
+RecentImport g_recent_imports[64]{};
+ImportLocation g_import_sites[4096]{};
+
+void* trace_guest_import(const trt_backend* be, const char* module,
+                         const char* function, u16 ordinal, void* fn) {
+  const u32 site_index = g_import_sites_count.fetch_add(1, std::memory_order_relaxed);
+  if (site_index >= sizeof(g_import_sites) / sizeof(g_import_sites[0])) return fn;
+  ImportLocation& where = g_import_sites[site_index];
+  snprintf(where.module, sizeof(where.module), "%s", module);
+  if (function) snprintf(where.function, sizeof(where.function), "%s", function);
+  else snprintf(where.function, sizeof(where.function), "#%u", (unsigned)ordinal);
+  // Transparent tail trampoline. Records the native TEB thread id and the
+  // guest return address, preserves incoming registers and calls the target.
+  constexpr u8 kTrace[] = {
+      0x9c, 0x50, 0x41, 0x52, 0x41, 0x53, 0x48, 0xb8, 0x81, 0x70, 0x60, 0x50,
+      0x40, 0x30, 0x20, 0x10, 0x41, 0xba, 0x01, 0x00, 0x00, 0x00, 0xf0, 0x44,
+      0x0f, 0xc1, 0x10, 0x41, 0x83, 0xe2, 0x3f, 0x41, 0xc1, 0xe2, 0x04, 0x48,
+      0xb8, 0x82, 0x70, 0x60, 0x50, 0x40, 0x30, 0x20, 0x10, 0x4c, 0x01, 0xd0,
+      0xc7, 0x00, 0x83, 0x30, 0x20, 0x10, 0x65, 0x44, 0x8b, 0x14, 0x25, 0x48,
+      0x00, 0x00, 0x00, 0x44, 0x89, 0x50, 0x04, 0x4c, 0x8b, 0x54, 0x24, 0x20,
+      0x4c, 0x89, 0x50, 0x08, 0x41, 0x5b, 0x41, 0x5a, 0x58, 0x9d, 0xff, 0x25,
+      0x00, 0x00, 0x00, 0x00, 0x84, 0x70, 0x60, 0x50, 0x40, 0x30, 0x20, 0x10,
+  };
+  auto* executable = static_cast<u8*>(be->alloc(sizeof(kTrace), 0));
+  if (!executable) return fn;
+  memcpy(executable, kTrace, sizeof(kTrace));
+  const u64 patch_8 = reinterpret_cast<uintptr_t>(&g_recent_import_tick);
+  memcpy(executable + 8, &patch_8, sizeof(patch_8));
+  const u64 patch_37 = reinterpret_cast<uintptr_t>(g_recent_imports);
+  memcpy(executable + 37, &patch_37, sizeof(patch_37));
+  const u32 patch_50 = site_index;
+  memcpy(executable + 50, &patch_50, sizeof(patch_50));
+  const u64 patch_88 = reinterpret_cast<uintptr_t>(fn);
+  memcpy(executable + 88, &patch_88, sizeof(patch_88));
+  if (be->protect(executable, sizeof(kTrace), TRT_PROT_R | TRT_PROT_X) != 0) {
+    be->release(executable, sizeof(kTrace));
+    return fn;
+  }
+  return executable;
+}
+}
+
+extern "C" void trt_log_recent_imports(u32 tid) {
+  const u32 end = g_recent_import_tick.load(std::memory_order_relaxed);
+  const u32 begin = end > 64 ? end - 64 : 0;
+  for (u32 i = begin; i < end; ++i) {
+    const RecentImport& event = g_recent_imports[i & 63u];
+    if (event.tid != tid) continue;
+    const u32 site = event.site;
+    if (site >= sizeof(g_import_sites) / sizeof(g_import_sites[0])) continue;
+    const ImportLocation& where = g_import_sites[site];
+    char line[230];
+    snprintf(line, sizeof(line), "recent guest import: %s!%s caller=%p",
+             where.module, where.function, reinterpret_cast<void*>(event.caller));
+    trt_core_log(line);
+  }
+}
+#endif
+
 #if defined(__has_feature)
 #  if __has_feature(address_sanitizer)
 extern "C" void __asan_unpoison_memory_region(const volatile void*, size_t)
@@ -208,6 +278,16 @@ int trt_guest_tls_register(const u8* raw, size_t raw_size, size_t total_size,
     *out_index = idx;
   }
   sync_thread_tls_state();
+#if defined(_WIN32)
+  if (total_size > 0) {
+    char line[192];
+    void* block = (*out_index < t_tls_state.cap) ? t_tls_state.slots[*out_index] : nullptr;
+    snprintf(line, sizeof(line),
+             "trt: guest TLS register index=%u raw=%zu total=%zu array=%p block=%p",
+             *out_index, raw_size, total_size, t_tls_state.slots, block);
+    trt_core_log(line);
+  }
+#endif
   return 0;
 }
 
@@ -221,10 +301,18 @@ void** trt_guest_tls_array(void) {
 }
 
 #if defined(_WIN32)
-static void bind_native_module_tls(HMODULE module, void** native, void** guest) {
-  if (!module) return;
-  // The platform supplies mapped module handles. A module can still unload
-  // between enumeration and this read, so guard the borrowed pointers.
+static void bind_native_module_tls(HMODULE module, void** native, void** guest,
+                                  const char* label = nullptr,
+                                  bool report = false) {
+  if (!module) {
+    if (report) {
+      char line[128];
+      snprintf(line, sizeof(line), "trt: native TLS probe %s: module absent",
+               label ? label : "(unnamed)");
+      trt_core_log(line);
+    }
+    return;
+  }
   __try {
     const auto* base = reinterpret_cast<const u8*>(module);
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
@@ -233,12 +321,36 @@ static void bind_native_module_tls(HMODULE module, void** native, void** guest) 
     if (nt->Signature != IMAGE_NT_SIGNATURE ||
         nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_TLS) return;
     const auto& entry = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
-    if (!entry.VirtualAddress || entry.Size < sizeof(IMAGE_TLS_DIRECTORY64)) return;
+    if (!entry.VirtualAddress || entry.Size < sizeof(IMAGE_TLS_DIRECTORY64)) {
+      if (report) {
+        char line[144];
+        snprintf(line, sizeof(line), "trt: native TLS probe %s: no TLS directory",
+                 label ? label : "(unnamed)");
+        trt_core_log(line);
+      }
+      return;
+    }
     const auto* tls = reinterpret_cast<const IMAGE_TLS_DIRECTORY64*>(base + entry.VirtualAddress);
     if (!tls->AddressOfIndex) return;
     const DWORD index = *reinterpret_cast<const DWORD*>(tls->AddressOfIndex);
-    if (index < k_guest_tls_first_index) guest[index] = native[index];
-  } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (index < k_guest_tls_first_index && !report) guest[index] = native[index];
+    if (report) {
+      char line[192];
+      snprintf(line, sizeof(line),
+               "trt: native TLS probe %s index=%u native=%p guest=%p",
+               label ? label : "(unnamed)", (unsigned)index,
+               index < k_guest_tls_first_index ? native[index] : nullptr,
+               index < k_guest_tls_first_index ? guest[index] : nullptr);
+      trt_core_log(line);
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    if (report) {
+      char line[128];
+      snprintf(line, sizeof(line), "trt: native TLS probe %s: SEH while reading image",
+               label ? label : "(unnamed)");
+      trt_core_log(line);
+    }
+  }
 }
 #endif
 
@@ -248,23 +360,47 @@ void trt_guest_tls_bind_host_slots(void** native, void** guest) {
   const u32 index = (u32)_tls_index;
   if (index < k_guest_tls_first_index) guest[index] = native[index];
 
+  static std::atomic<bool> reported{false};
+  const bool report = !reported.exchange(true, std::memory_order_relaxed);
   using enum_modules = BOOL (WINAPI*)(HANDLE, HMODULE*, DWORD, LPDWORD);
   static const auto modules = reinterpret_cast<enum_modules>(
       GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32EnumProcessModules"));
   HMODULE loaded[256];
   DWORD bytes = 0;
-  if (modules && modules(GetCurrentProcess(), loaded, sizeof(loaded), &bytes)) {
+  const bool enumerated =
+      modules && modules(GetCurrentProcess(), loaded, sizeof(loaded), &bytes);
+  if (enumerated) {
     const size_t count = bytes < sizeof(loaded) ? bytes / sizeof(HMODULE)
                                                : sizeof(loaded) / sizeof(HMODULE);
     for (size_t i = 0; i < count; ++i) bind_native_module_tls(loaded[i], native, guest);
+    if (report) {
+      char line[128];
+      snprintf(line, sizeof(line),
+               "trt: native TLS module enumeration succeeded count=%zu", count);
+      trt_core_log(line);
+    }
   } else {
     // The Xbox AppContainer can restrict process enumeration. Preserve the
     // loaded system components that the direct graphics path calls into.
+    if (report)
+      trt_core_log("trt: native TLS module enumeration failed; using fallback list");
     const wchar_t* graphics_modules[] = {
         L"d3d11.dll", L"d3d11on12.dll", L"d3d12.dll", L"D3D12Core.dll",
         L"dxgi.dll", L"d3dcompiler_47.dll", L"winrtbase.dll", L"combase.dll"};
     for (const auto* name : graphics_modules)
       bind_native_module_tls(GetModuleHandleW(name), native, guest);
+  }
+  if (report) {
+    bind_native_module_tls(GetModuleHandleW(L"ucrtbase.dll"), native, guest,
+                           "ucrtbase.dll", true);
+    bind_native_module_tls(GetModuleHandleW(L"vcruntime140.dll"), native, guest,
+                           "vcruntime140.dll", true);
+    bind_native_module_tls(GetModuleHandleW(L"msvcp140.dll"), native, guest,
+                           "msvcp140.dll", true);
+    bind_native_module_tls(GetModuleHandleW(L"kernelbase.dll"), native, guest,
+                           "kernelbase.dll", true);
+    bind_native_module_tls(GetModuleHandleW(L"ntdll.dll"), native, guest,
+                           "ntdll.dll", true);
   }
 #else
   (void)native;
@@ -499,20 +635,35 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
     logf_be(be, "trt: loaded at preferred base, no reloc pass");
   }
 
+  // Publish the allocated, section-mapped, relocated image to *out BEFORE
+  // walking imports so circular DLL dependencies (e.g. libSceGnm.dll <->
+  // libSceGpuAddress.dll) can resolve exports against this in-progress image
+  // without re-entering trt_map_pe recursively.
+  *out = (trt_image*)malloc(sizeof(trt_image));
+  if (!*out) return fail(&img, be, TRT_ERR_ALLOC, "image struct alloc");
+  memcpy(*out, &img, sizeof(img));
+  auto fail_out = [&](int code, const char* detail) -> int {
+    if (*out) {
+      free(*out);
+      *out = nullptr;
+    }
+    return fail(&img, be, code, detail);
+  };
+
   // ---- 6. imports ----
   const u64 imp_va = dirs[TRT_PE_DIR_IMPORT].virtual_address;
   const u64 imp_sz = dirs[TRT_PE_DIR_IMPORT].size;
   u32 n_modules = 0, n_symbols = 0;
   if (imp_va && imp_sz) {
     if (imp_va + imp_sz > size_of_image)
-      return fail(&img, be, TRT_ERR_IMPORT, "import dir out of image");
+      return fail_out(TRT_ERR_IMPORT, "import dir out of image");
     for (u64 d = 0; d + sizeof(trt_import_descriptor) <= imp_sz;
          d += sizeof(trt_import_descriptor)) {
       const trt_import_descriptor* desc =
           (const trt_import_descriptor*)(img.base + imp_va + d);
       if (!desc->first_thunk && !desc->name) break;  // terminator
       if (desc->name >= size_of_image || desc->first_thunk >= size_of_image)
-        return fail(&img, be, TRT_ERR_IMPORT, "import descriptor out of image");
+        return fail_out(TRT_ERR_IMPORT, "import descriptor out of image");
       const char* mod_name = (const char*)(img.base + desc->name);
       const u64 int_rva = desc->original_first_thunk ? desc->original_first_thunk
                                                      : desc->first_thunk;
@@ -521,7 +672,7 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
       for (u64 t = iat_rva;; t += 8) {
         const u64 lt = int_rva + (t - iat_rva);
         if (t + 8 > size_of_image || lt + 8 > size_of_image)
-          return fail(&img, be, TRT_ERR_IMPORT, "IAT runs off image");
+          return fail_out(TRT_ERR_IMPORT, "IAT runs off image");
         const u64 thunk = rd64(img.base + lt);
         if (thunk == 0) break;  // terminator
         const char* sym_name = nullptr;
@@ -530,20 +681,23 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
           ordinal = (u16)(thunk & 0xFFFF);
         } else {
           if (thunk + 2 >= size_of_image)
-            return fail(&img, be, TRT_ERR_IMPORT, "hint/name out of image");
+            return fail_out(TRT_ERR_IMPORT, "hint/name out of image");
           sym_name = (const char*)(img.base + thunk + 2);
           if (strnlen(sym_name, 256) == 256)
-            return fail(&img, be, TRT_ERR_IMPORT, "symbol name not terminated");
+            return fail_out(TRT_ERR_IMPORT, "symbol name not terminated");
         }
         void* fn = rs->resolve(rs->user, mod_name, sym_name, ordinal);
         if (!fn) {
           char det[224];
           snprintf(det, sizeof(det), "%s!%s", mod_name,
                    sym_name ? sym_name : "#ordinal");
-          return fail(&img, be, TRT_ERR_IMPORT, det);
+          return fail_out(TRT_ERR_IMPORT, det);
         }
+#if defined(_WIN32)
+        fn = trace_guest_import(be, mod_name, sym_name, ordinal, fn);
+#endif
         memcpy(img.base + t, &fn, 8);  // bind IAT
-        if (n_symbols == 0) {
+        if (n_symbols == 0 || strncmp(mod_name, "steam_api", 9) == 0) {
           char line[256];
           snprintf(line, sizeof(line), "trt: bind %s!%s -> %p", mod_name,
                    sym_name ? sym_name : "#ordinal", fn);
@@ -565,7 +719,7 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
   const u64 tls_va = dirs[TRT_PE_DIR_TLS].virtual_address;
   if (tls_va) {
     if (tls_va + sizeof(trt_tls_directory64) > size_of_image)
-      return fail(&img, be, TRT_ERR_TLS_BOUNDS, "tls dir out of image");
+      return fail_out(TRT_ERR_TLS_BOUNDS, "tls dir out of image");
     const trt_tls_directory64* tls = (const trt_tls_directory64*)(img.base + tls_va);
     // callbacks array is addressed by VA; after relocation it points at the
     // RUNTIME image (new base + rva), so translate through the actual base —
@@ -576,14 +730,14 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
     const u64 arr_rva =
         (u64)tls->address_of_callbacks - (u64)(uintptr_t)img.base;
     if (arr_rva + 8 > size_of_image)
-      return fail(&img, be, TRT_ERR_TLS_BOUNDS, "tls callback array out of image");
+      return fail_out(TRT_ERR_TLS_BOUNDS, "tls callback array out of image");
     for (u64 c = arr_rva; c + 8 <= size_of_image &&
                           img.tls_callback_count < TRT_MAX_TLS_CALLBACKS; c += 8) {
       const u64 cb = rd64(img.base + c);
       if (cb == 0) break;
       const u64 cb_rva = cb - (u64)(uintptr_t)img.base;
       if (cb_rva >= size_of_image)
-        return fail(&img, be, TRT_ERR_TLS_BOUNDS, "tls callback out of image");
+        return fail_out(TRT_ERR_TLS_BOUNDS, "tls callback out of image");
       img.tls_callback_rvas[img.tls_callback_count++] = cb_rva;
     }
     char line[96];
@@ -665,10 +819,10 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
                                     : (u64)dd->module_handle_rva - preferred;
       if (name_rva >= size_of_image || iat_rva >= size_of_image ||
           int_rva >= size_of_image)
-        return fail(&img, be, TRT_ERR_DELAY_IMPORT, "delay descriptor out of image");
+        return fail_out(TRT_ERR_DELAY_IMPORT, "delay descriptor out of image");
       const char* mod_name = (const char*)(img.base + name_rva);
       if (strnlen(mod_name, 256) == 256)
-        return fail(&img, be, TRT_ERR_DELAY_IMPORT, "delay dll name unterminated");
+        return fail_out(TRT_ERR_DELAY_IMPORT, "delay dll name unterminated");
       for (u64 t = 0;; t += 8) {
         if (int_rva + t + 8 > size_of_image || iat_rva + t + 8 > size_of_image)
           break;
@@ -714,8 +868,6 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
     logf_be(be, line);
   }
 
-  *out = (trt_image*)malloc(sizeof(trt_image));
-  if (!*out) return fail(&img, be, TRT_ERR_ALLOC, "image struct alloc");
   memcpy(*out, &img, sizeof(img));
   char line[160];
   snprintf(line, sizeof(line),

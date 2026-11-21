@@ -1057,6 +1057,25 @@ static int guest_seh_filter(EXCEPTION_POINTERS* ep) {
              (unsigned long)record.ExceptionCode, where);
   }
   longan::log_line(line);
+  if (ep->ContextRecord) {
+    const CONTEXT& c = *ep->ContextRecord;
+    snprintf(line, sizeof(line),
+             "guest fault regs: rip=%016llx rsp=%016llx rbp=%016llx rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx",
+             (unsigned long long)c.Rip, (unsigned long long)c.Rsp,
+             (unsigned long long)c.Rbp, (unsigned long long)c.Rax,
+             (unsigned long long)c.Rbx, (unsigned long long)c.Rcx,
+             (unsigned long long)c.Rdx);
+    longan::log_line(line);
+    snprintf(line, sizeof(line),
+             "guest fault regs: rsi=%016llx rdi=%016llx r8=%016llx r9=%016llx r10=%016llx r11=%016llx r12=%016llx r13=%016llx r14=%016llx r15=%016llx eflags=%08lx",
+             (unsigned long long)c.Rsi, (unsigned long long)c.Rdi,
+             (unsigned long long)c.R8, (unsigned long long)c.R9,
+             (unsigned long long)c.R10, (unsigned long long)c.R11,
+             (unsigned long long)c.R12, (unsigned long long)c.R13,
+             (unsigned long long)c.R14, (unsigned long long)c.R15,
+             (unsigned long)c.EFlags);
+    longan::log_line(line);
+  }
   DWORD64 frames[32];
   const int count = capture_fault_stack(ep->ContextRecord, frames, 32);
   for (int i = 1; i < count; ++i) {
@@ -1917,6 +1936,14 @@ struct tiramisu_host
     snprintf(line, sizeof(line), "tiramisu boot: pkg=%s state=%s",
              install.c_str(), g_local_state.c_str());
     longan::log_line(line);
+    // The side-by-side GoWNetPlay diagnostic is registered directly from the
+    // PC SMB share. Read its game library from that same package root, keeping
+    // ordinary Tiramisu installs on their LocalState games folder.
+    if (install.find("GoWNetPlay") != std::string::npos) {
+      g_games_dir = install + "\\network-games";
+      snprintf(line, sizeof(line), "network game library: %s", g_games_dir.c_str());
+      longan::log_line(line);
+    }
 
     // ---- persisted settings (dashboard-editable; consumed by bridges) ----
     const int applied = longan::settings_load(g_local_state);
@@ -1970,7 +1997,7 @@ struct tiramisu_host
     setup_steps({L"Storage ready", L"Direct3D 11 ready", L"Gamepads probed",
                  std::wstring(L"Audio: ") + u82ws(line)},
                 L"Starting the transfer server…", false);
-    const std::string url = longan::webxfer_start(g_local_state, 1920);
+    const std::string url = longan::webxfer_start_port(g_local_state, 9128);
     snprintf(line, sizeof(line), "transfer: %s (QR on TV)", url.c_str());
     longan::log_line(line);
     longan::ui_set_qr(url);
@@ -2046,6 +2073,19 @@ struct tiramisu_host
                  L"Self-test: " + u82ws(trt_errstr(gr.map_rc))},
                 nullptr, true);
     g_setup_done = true;  // A press on the finished screen opens the shelf
+    if (install.find("GoWNetPlay") != std::string::npos) {
+      bool gow_found = false;
+      for (const auto& ge : g_games) {
+        if (ge.name == "God of War") {
+          g_pending_launch = ge.name;
+          gow_found = true;
+          break;
+        }
+      }
+      longan::log_line(gow_found
+                           ? "network auto-launch: God of War queued"
+                           : "network auto-launch: God of War missing from shelf");
+    }
   }
 
   void enable_keyboard_interceptor() {

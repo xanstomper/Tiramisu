@@ -93,12 +93,14 @@ u32 GSTD guest_shell_main(u64 a, u64 b, u64 c) {
 
   // ---- 3. FOLDERID GUID form ----
   {
-    // FOLDERID_SavedGames {4C5C32FA-BB47-4C5C-B1A7-17439CE19972}
+    // FOLDERID_SavedGames {4C5C32FF-BB9D-43B0-B5B4-2D72E54EAAA4}
     u8 rfid[16];
     for (u32 i = 0; i < 16; ++i) rfid[i] = 0;
-    rfid[3] = 0x4C; rfid[2] = 0x5C; rfid[1] = 0x32; rfid[0] = 0xFA;
-    rfid[5] = 0xBB; rfid[4] = 0x47;
-    rfid[7] = 0x4C; rfid[6] = 0x5C;
+    rfid[3] = 0x4C; rfid[2] = 0x5C; rfid[1] = 0x32; rfid[0] = 0xFF;
+    rfid[5] = 0xBB; rfid[4] = 0x9D;
+    rfid[7] = 0x43; rfid[6] = 0xB0;
+    rfid[8] = 0xB5; rfid[9] = 0xB4; rfid[10] = 0x2D; rfid[11] = 0x72;
+    rfid[12] = 0xE5; rfid[13] = 0x4E; rfid[14] = 0xAA; rfid[15] = 0xA4;
     u16* sp = 0;
     if (SHGetKnownFolderPath(rfid, 0, 0, &sp) == 0 && sp) {
       u32 ok = 0;

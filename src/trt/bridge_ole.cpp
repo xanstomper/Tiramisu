@@ -195,7 +195,12 @@ void* TRT_GUEST_ABI ole_CoTaskMemAlloc(u32 bytes) {
 void* TRT_GUEST_ABI ole_CoTaskMemRealloc(void* p, u32 bytes) {
   return realloc(p, bytes);
 }
-void TRT_GUEST_ABI ole_CoTaskMemFree(void* p) { free(p); }
+void TRT_GUEST_ABI ole_CoTaskMemFree(void* p) {
+  char line[112];
+  snprintf(line, sizeof(line), "ole32: CoTaskMemFree(%p)", p);
+  trt_core_log(line);
+  free(p);
+}
 u32 TRT_GUEST_ABI ole_CoTaskMemSize(void* p) {
   (void)p;
   return 0;  // Windows answers the alloc size; nothing depends on it here

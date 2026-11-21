@@ -1060,13 +1060,40 @@ u16 TRT_STDCALL trt_RtlCaptureStackBackTrace(u32 skip, u32 capture, void** bt,
 // Environment / File / Disk / SysInfo / Power / ProcThread / Toolhelp
 // ============================================================================
 
+// .102 diagnostic: log every environment lookup (name + found/missing).
+static void env_log_a(const char* tag, const char* name, int found, u32 len) {
+  static std::atomic<unsigned> env_calls{0};
+  const unsigned n_call = env_calls.fetch_add(1, std::memory_order_relaxed);
+  if (n_call >= 128) {
+    if (n_call == 128)
+      trt_core_log("envtrace: env log cap reached (128), suppressing");
+    return;
+  }
+  char l[384];
+  if (found)
+    snprintf(l, sizeof(l), "envtrace: %s(\"%s\") -> found len=%u", tag, name,
+             len);
+  else
+    snprintf(l, sizeof(l), "envtrace: %s(\"%s\") -> MISSING", tag, name);
+  trt_core_log(l);
+}
+
 u32 TRT_STDCALL trt_GetEnvironmentVariableA(const char* name, char* buf,
                                             u32 size) {
-  if (!name) { trt_SetLastError(87); return 0; }
+  if (!name) {
+    env_log_a("GetEnvironmentVariableA", "<NULL>", 0, 0);
+    trt_SetLastError(87);
+    return 0;
+  }
   const char* val = trt_gap_env_get(name);
   if (!val) val = getenv(name);
-  if (!val) { trt_SetLastError(203); return 0; }
+  if (!val) {
+    env_log_a("GetEnvironmentVariableA", name, 0, 0);
+    trt_SetLastError(203);
+    return 0;
+  }
   const size_t n = strlen(val);
+  env_log_a("GetEnvironmentVariableA", name, 1, (u32)n);
   if (!buf || size <= n) return (u32)(n + 1);
   memcpy(buf, val, n + 1);
   return (u32)n;
