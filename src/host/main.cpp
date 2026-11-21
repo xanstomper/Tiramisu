@@ -1936,14 +1936,6 @@ struct tiramisu_host
     snprintf(line, sizeof(line), "tiramisu boot: pkg=%s state=%s",
              install.c_str(), g_local_state.c_str());
     longan::log_line(line);
-    // The side-by-side GoWNetPlay diagnostic is registered directly from the
-    // PC SMB share. Read its game library from that same package root, keeping
-    // ordinary Tiramisu installs on their LocalState games folder.
-    if (install.find("GoWNetPlay") != std::string::npos) {
-      g_games_dir = install + "\\network-games";
-      snprintf(line, sizeof(line), "network game library: %s", g_games_dir.c_str());
-      longan::log_line(line);
-    }
 
     // ---- persisted settings (dashboard-editable; consumed by bridges) ----
     const int applied = longan::settings_load(g_local_state);
@@ -1997,7 +1989,7 @@ struct tiramisu_host
     setup_steps({L"Storage ready", L"Direct3D 11 ready", L"Gamepads probed",
                  std::wstring(L"Audio: ") + u82ws(line)},
                 L"Starting the transfer server…", false);
-    const std::string url = longan::webxfer_start_port(g_local_state, 9128);
+    const std::string url = longan::webxfer_start(g_local_state, 1920);
     snprintf(line, sizeof(line), "transfer: %s (QR on TV)", url.c_str());
     longan::log_line(line);
     longan::ui_set_qr(url);
@@ -2073,19 +2065,6 @@ struct tiramisu_host
                  L"Self-test: " + u82ws(trt_errstr(gr.map_rc))},
                 nullptr, true);
     g_setup_done = true;  // A press on the finished screen opens the shelf
-    if (install.find("GoWNetPlay") != std::string::npos) {
-      bool gow_found = false;
-      for (const auto& ge : g_games) {
-        if (ge.name == "God of War") {
-          g_pending_launch = ge.name;
-          gow_found = true;
-          break;
-        }
-      }
-      longan::log_line(gow_found
-                           ? "network auto-launch: God of War queued"
-                           : "network auto-launch: God of War missing from shelf");
-    }
   }
 
   void enable_keyboard_interceptor() {

@@ -771,69 +771,29 @@ bool recv_exact_all(sock_t s, const char* pre, size_t pre_len, uint64_t len,
   return got == len;
 }
 
-// On-disk size, 64-bit on both platforms (plain stat truncates at 2 GiB
-// under MSVC, and GoW texpacks exceed that).
-uint64_t file_size_disk(const char* path) {
-#ifdef _WIN32
-  WIN32_FILE_ATTRIBUTE_DATA fad{};
-  if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) return 0;
-  return ((uint64_t)fad.nFileSizeHigh << 32) | (uint64_t)fad.nFileSizeLow;
-#else
-  struct stat st{};
-  if (stat(path, &st) != 0 || st.st_size < 0) return 0;
-  return (uint64_t)st.st_size;
-#endif
-}
-
 uint64_t stream_to_file(sock_t s, const char* pre, size_t pre_len,
                         const char* path, uint64_t len) {
   FILE* f = fopen(path, "wb");
   if (!f) return 0;
-  uint64_t got = 0;      // bytes received from the socket
-  uint64_t written = 0;  // bytes fwrite actually accepted
-  bool write_ok = true;
+  uint64_t got = 0;
   if (pre && pre_len) {
     size_t wr = std::min<size_t>(pre_len, (size_t)std::min<uint64_t>(len, pre_len));
     if (wr) {
-      size_t nwr = fwrite(pre, 1, wr, f);
-      written += nwr;
-      if (nwr != wr) write_ok = false;
+      fwrite(pre, 1, wr, f);
       got += wr;
-      g_upload_done += nwr;
+      g_upload_done += wr;
     }
   }
   char buf[65536];
   while (got < len && !g_stop) {
     const int want = (int)std::min<uint64_t>(len - got, sizeof(buf));
     const int n = recv(s, buf, want, 0);
-    if (n < 0) {
-      char line[128];
-      snprintf(line, sizeof(line), "trt: upload recv error got=%llu/%llu",
-               (unsigned long long)got, (unsigned long long)len);
-      log_line(line);
-      break;
-    }
-    if (n == 0) break;  // orderly EOF: client went away; short read fails below
-    size_t nwr = fwrite(buf, 1, (size_t)n, f);
-    written += nwr;
-    if (nwr != (size_t)n) write_ok = false;
+    if (n <= 0) break;
+    fwrite(buf, 1, (size_t)n, f);
     got += (uint64_t)n;
-    g_upload_done += nwr;
-    if (!write_ok) break;  // disk full/quota: stop reading, report honestly
+    g_upload_done += (uint64_t)n;
   }
-  if (fclose(f) != 0) write_ok = false;  // flush failure (e.g. disk full)
-  // Ground truth: the on-disk size. Never trust the byte counters alone --
-  // .102 reported ok:true for truncated files (fwrite/fclose ignored).
-  const uint64_t on_disk = file_size_disk(path);
-  if (!write_ok || got != len || on_disk != len) {
-    char line[220];
-    snprintf(line, sizeof(line),
-             "trt: upload SHORT len=%llu got=%llu wr=%llu disk=%llu %s",
-             (unsigned long long)len, (unsigned long long)got,
-             (unsigned long long)written, (unsigned long long)on_disk, path);
-    log_line(line);
-    return on_disk;  // caller treats != len as failure (500 + removes partial)
-  }
+  fclose(f);
   return got;
 }
 
@@ -1629,12 +1589,7 @@ std::string webxfer_start_port(const std::string& local_state, unsigned short po
 
 std::string webxfer_start(const std::string& local_state, int display_w) {
   (void)display_w;
-  std::string url = webxfer_start_port(local_state, 9127);
-  if (!url.empty()) return url;
-  // Keep side-by-side Tiramisu diagnostic apps from stealing the main app's
-  // listener; the next fixed port is a predictable fallback for API clients.
-  url = webxfer_start_port(local_state, 9128);
-  return url;
+  return webxfer_start_port(local_state, 9127);
 }
 
 bool webxfer_find_game(const char* name, char* out_exe, size_t cap) {

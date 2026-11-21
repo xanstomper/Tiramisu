@@ -278,16 +278,6 @@ int trt_guest_tls_register(const u8* raw, size_t raw_size, size_t total_size,
     *out_index = idx;
   }
   sync_thread_tls_state();
-#if defined(_WIN32)
-  if (total_size > 0) {
-    char line[192];
-    void* block = (*out_index < t_tls_state.cap) ? t_tls_state.slots[*out_index] : nullptr;
-    snprintf(line, sizeof(line),
-             "trt: guest TLS register index=%u raw=%zu total=%zu array=%p block=%p",
-             *out_index, raw_size, total_size, t_tls_state.slots, block);
-    trt_core_log(line);
-  }
-#endif
   return 0;
 }
 
@@ -301,18 +291,10 @@ void** trt_guest_tls_array(void) {
 }
 
 #if defined(_WIN32)
-static void bind_native_module_tls(HMODULE module, void** native, void** guest,
-                                  const char* label = nullptr,
-                                  bool report = false) {
-  if (!module) {
-    if (report) {
-      char line[128];
-      snprintf(line, sizeof(line), "trt: native TLS probe %s: module absent",
-               label ? label : "(unnamed)");
-      trt_core_log(line);
-    }
-    return;
-  }
+static void bind_native_module_tls(HMODULE module, void** native, void** guest) {
+  if (!module) return;
+  // The platform supplies mapped module handles. A module can still unload
+  // between enumeration and this read, so guard the borrowed pointers.
   __try {
     const auto* base = reinterpret_cast<const u8*>(module);
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
@@ -321,36 +303,12 @@ static void bind_native_module_tls(HMODULE module, void** native, void** guest,
     if (nt->Signature != IMAGE_NT_SIGNATURE ||
         nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_TLS) return;
     const auto& entry = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
-    if (!entry.VirtualAddress || entry.Size < sizeof(IMAGE_TLS_DIRECTORY64)) {
-      if (report) {
-        char line[144];
-        snprintf(line, sizeof(line), "trt: native TLS probe %s: no TLS directory",
-                 label ? label : "(unnamed)");
-        trt_core_log(line);
-      }
-      return;
-    }
+    if (!entry.VirtualAddress || entry.Size < sizeof(IMAGE_TLS_DIRECTORY64)) return;
     const auto* tls = reinterpret_cast<const IMAGE_TLS_DIRECTORY64*>(base + entry.VirtualAddress);
     if (!tls->AddressOfIndex) return;
     const DWORD index = *reinterpret_cast<const DWORD*>(tls->AddressOfIndex);
-    if (index < k_guest_tls_first_index && !report) guest[index] = native[index];
-    if (report) {
-      char line[192];
-      snprintf(line, sizeof(line),
-               "trt: native TLS probe %s index=%u native=%p guest=%p",
-               label ? label : "(unnamed)", (unsigned)index,
-               index < k_guest_tls_first_index ? native[index] : nullptr,
-               index < k_guest_tls_first_index ? guest[index] : nullptr);
-      trt_core_log(line);
-    }
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    if (report) {
-      char line[128];
-      snprintf(line, sizeof(line), "trt: native TLS probe %s: SEH while reading image",
-               label ? label : "(unnamed)");
-      trt_core_log(line);
-    }
-  }
+    if (index < k_guest_tls_first_index) guest[index] = native[index];
+  } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 #endif
 
@@ -360,47 +318,23 @@ void trt_guest_tls_bind_host_slots(void** native, void** guest) {
   const u32 index = (u32)_tls_index;
   if (index < k_guest_tls_first_index) guest[index] = native[index];
 
-  static std::atomic<bool> reported{false};
-  const bool report = !reported.exchange(true, std::memory_order_relaxed);
   using enum_modules = BOOL (WINAPI*)(HANDLE, HMODULE*, DWORD, LPDWORD);
   static const auto modules = reinterpret_cast<enum_modules>(
       GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32EnumProcessModules"));
   HMODULE loaded[256];
   DWORD bytes = 0;
-  const bool enumerated =
-      modules && modules(GetCurrentProcess(), loaded, sizeof(loaded), &bytes);
-  if (enumerated) {
+  if (modules && modules(GetCurrentProcess(), loaded, sizeof(loaded), &bytes)) {
     const size_t count = bytes < sizeof(loaded) ? bytes / sizeof(HMODULE)
                                                : sizeof(loaded) / sizeof(HMODULE);
     for (size_t i = 0; i < count; ++i) bind_native_module_tls(loaded[i], native, guest);
-    if (report) {
-      char line[128];
-      snprintf(line, sizeof(line),
-               "trt: native TLS module enumeration succeeded count=%zu", count);
-      trt_core_log(line);
-    }
   } else {
     // The Xbox AppContainer can restrict process enumeration. Preserve the
     // loaded system components that the direct graphics path calls into.
-    if (report)
-      trt_core_log("trt: native TLS module enumeration failed; using fallback list");
     const wchar_t* graphics_modules[] = {
         L"d3d11.dll", L"d3d11on12.dll", L"d3d12.dll", L"D3D12Core.dll",
         L"dxgi.dll", L"d3dcompiler_47.dll", L"winrtbase.dll", L"combase.dll"};
     for (const auto* name : graphics_modules)
       bind_native_module_tls(GetModuleHandleW(name), native, guest);
-  }
-  if (report) {
-    bind_native_module_tls(GetModuleHandleW(L"ucrtbase.dll"), native, guest,
-                           "ucrtbase.dll", true);
-    bind_native_module_tls(GetModuleHandleW(L"vcruntime140.dll"), native, guest,
-                           "vcruntime140.dll", true);
-    bind_native_module_tls(GetModuleHandleW(L"msvcp140.dll"), native, guest,
-                           "msvcp140.dll", true);
-    bind_native_module_tls(GetModuleHandleW(L"kernelbase.dll"), native, guest,
-                           "kernelbase.dll", true);
-    bind_native_module_tls(GetModuleHandleW(L"ntdll.dll"), native, guest,
-                           "ntdll.dll", true);
   }
 #else
   (void)native;
