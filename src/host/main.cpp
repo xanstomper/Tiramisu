@@ -12,11 +12,6 @@
 #include "webxfer.h"
 #include "settings.h"
 #include "../trt/trt.h"
-#include "../trt/mono_host.h"
-#include "../trt/fna_platform.h"
-#include "../trt/fna3d_host.h"
-#include "../trt/trt_trace.h"
-#include "FNA3D.h"
 #include "../trt/bridge_res.h"
 #include "../trt/bridge_nvapi.h"
 #include "../trt/iso.h"
@@ -54,16 +49,6 @@
 #include <winrt/Windows.UI.Input.h>
 #include "native_gameinput.h"
 
-// timeBeginPeriod is desktop-partition in the SDK headers (not declared
-// under WINAPI_FAMILY_APP), but callable from the AppContainer at runtime —
-// declared directly. winmm.lib is pulled in by the #pragma comment(lib) in
-// src/trt/bridge_winmm.cpp.
-extern "C" unsigned int __stdcall timeBeginPeriod(unsigned int uPeriod);
-// TerminateThread is desktop-partition like timeBeginPeriod — declared
-// directly (item 5: the force-kill watchdog's last resort).
-extern "C" int __stdcall TerminateThread(void* hThread,
-                                         unsigned long dwExitCode);
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -99,9 +84,6 @@ std::atomic<bool> g_shutdown{false};
 std::atomic<bool> g_guest_running{false};
 DWORD g_ui_tid = 0;
 std::thread g_guest_thread;
-std::string g_running_game_name;  // guest currently running ("" when idle) — heartbeat + logs
-ULONGLONG g_boot_ms = 0;          // GetTickCount64 at Run() start — heartbeat uptime
-ULONGLONG g_last_rescan_ms = 0;   // GetTickCount64 of the last shelf rescan — debounce clock
 std::string g_pending_launch;
 bool g_mouse_mode = false;
 bool g_kbd_mouse_mode = false;
@@ -767,161 +749,6 @@ void scan_compat_iso(trt_iso* iso, const std::string& rel, char* out,
   scan_compat_stream(is, out, cap);
 }
 
-// Scan ONE entry (a game folder, or a disc image dropped straight into
-// the games folder) into g_games. Extracted from scan_games_root so a
-// scoped rescan can rebuild just the changed game instead of re-walking
-// every root + drive (item 4). `is_dir` comes from the FindFirstFile
-// attributes on the sweep path; a scoped rescan passes the attributes
-// it probed itself.
-void scan_game_entry(
-    const std::string& root, const std::string& n, bool is_dir,
-    char drive_tag,
-    const std::vector<std::pair<std::string, std::string>>& prev_choice) {
-  if (n == "." || n == "..") return;
-  if (!is_dir) {
-    // A disc image dropped straight into the games folder: the exe list is
-    // read out of the image and it mounts as D: on launch.
-    const size_t dot = n.rfind('.');
-    if (dot == std::string::npos) return;
-    const std::string ext = lower_ascii(n.substr(dot));
-    if (ext != ".iso" && ext != ".bin" && ext != ".img") return;
-    const std::string img_path = root + "\\" + n;
-    bool dup_img = false;
-    for (const auto& existing : g_games)
-      if (!_stricmp(existing.image.c_str(), img_path.c_str())) dup_img = true;
-    if (dup_img) return;
-    trt_iso* iso = trt_iso_open(img_path.c_str());
-    if (!iso) {
-      char line[600];
-      snprintf(line, sizeof(line),
-               "shelf: %s is not an ISO9660/UDF image (skipped, named)",
-               img_path.c_str());
-      longan::log_line(line);
-      return;
-    }
-    std::vector<exe_cand> icands;
-    const std::string stem = n.substr(0, dot);
-    collect_iso_exes_rec(iso, "", stem, 0, &icands);
-    if (icands.empty()) {
-      char line[600];
-      snprintf(line, sizeof(line),
-               "shelf: %s mounted but holds no runnable exe", img_path.c_str());
-      longan::log_line(line);
-      trt_iso_close(iso);
-      return;
-    }
-    std::sort(icands.begin(), icands.end(),
-              [](const exe_cand& a, const exe_cand& b) {
-      if (a.score != b.score) return a.score > b.score;
-      if (a.size != b.size) return a.size > b.size;
-      return a.rel < b.rel;
-    });
-    game_entry ge;
-    ge.name = stem;
-    ge.dir = root;
-    ge.image = img_path;
-    for (const auto& c : icands) ge.exes.push_back(c.rel);
-    ge.exe = ge.exes[0];
-    char compat[280];
-    scan_compat_iso(iso, ge.exe, compat, (unsigned)sizeof(compat));
-    ge.compat = compat;
-    trt_iso_close(iso);
-    g_games.push_back(std::move(ge));
-    return;
-  }
-  const std::string gdir = root + "\\" + n;
-  std::string disp = n;
-  bool dup = false;
-  for (const auto& existing : g_games) {
-    if (!_stricmp(existing.dir.c_str(), gdir.c_str())) {
-      dup = true;
-      break;
-    }
-    if (existing.name == disp && drive_tag) {
-      disp = n + " [" + std::string(1, drive_tag) + ":]";
-    }
-  }
-  if (dup) return;
-  std::vector<exe_cand> cands;
-  collect_exes_rec(gdir, "", n, 0, &cands);
-  // A folder that holds a disc image is a game too: the exe list comes from
-  // inside the image and the image is mounted as D: at launch.
-  std::string image_path;
-  if (cands.empty()) {
-    char img[1024] = {};
-    if (trt_iso_find_image_in_dir(gdir.c_str(), img, sizeof(img))) {
-      trt_iso* iso = trt_iso_open(img);
-      if (iso) {
-        collect_iso_exes_rec(iso, "", n, 0, &cands);
-        if (!cands.empty()) image_path = img;
-        trt_iso_close(iso);
-      }
-      if (cands.empty()) {
-        char line[600];
-        snprintf(line, sizeof(line),
-                 "shelf: %s holds a disc image but no runnable exe inside it",
-                 img);
-        longan::log_line(line);
-      }
-    }
-  }
-  if (cands.empty()) return;
-  std::sort(cands.begin(), cands.end(), [](const exe_cand& a, const exe_cand& b) {
-    if (a.score != b.score) return a.score > b.score;
-    if (a.size != b.size) return a.size > b.size;
-    if (a.depth != b.depth) return a.depth < b.depth;
-    return a.rel < b.rel;
-  });
-  game_entry ge;
-  ge.name = disp;
-  ge.dir = gdir;
-  for (const auto& c : cands) ge.exes.push_back(c.rel);
-  ge.exe_idx = 0;
-  {
-    std::ifstream ef(gdir + "\\tiramisu_exe.txt");
-    std::string cfg_exe;
-    if (ef && std::getline(ef, cfg_exe)) {
-      while (!cfg_exe.empty() && ((unsigned char)cfg_exe.back() <= ' '))
-        cfg_exe.pop_back();
-      for (size_t k = 0; k < ge.exes.size(); ++k) {
-        if (!_stricmp(ge.exes[k].c_str(), cfg_exe.c_str())) {
-          ge.exe_idx = (int)k;
-          break;
-        }
-      }
-    }
-    std::ifstream inf(gdir + "\\tiramisu_input.txt");
-    std::string im;
-    if (inf && std::getline(inf, im)) {
-      while (!im.empty() && ((unsigned char)im.back() <= ' ')) im.pop_back();
-      ge.input_mode = lower_ascii(im);
-    }
-  }
-  for (const auto& p : prev_choice) {
-    if (p.first == (ge.image.empty() ? gdir : ge.image)) {
-      for (size_t k = 0; k < ge.exes.size(); ++k) {
-        if (ge.exes[k] == p.second) {
-          ge.exe_idx = (int)k;
-          break;
-        }
-      }
-      break;
-    }
-  }
-  ge.exe = ge.exes[ge.exe_idx];
-  ge.image = image_path;
-  char compat[280];
-  if (!ge.image.empty()) {
-    trt_iso* iso = trt_iso_open(ge.image.c_str());
-    scan_compat_iso(iso, ge.exe, compat, (unsigned)sizeof(compat));
-    trt_iso_close(iso);
-  } else {
-    scan_compat(gdir + "\\" + ge.exe, compat, (unsigned)sizeof(compat));
-  }
-  ge.compat = compat;
-  g_games.push_back(std::move(ge));
-}
-
 void scan_games_root(
     const std::string& root, char drive_tag,
     const std::vector<std::pair<std::string, std::string>>& prev_choice) {
@@ -929,28 +756,161 @@ void scan_games_root(
   HANDLE h = FindFirstFileA((root + "\\*").c_str(), &fd);
   if (h == INVALID_HANDLE_VALUE) return;
   do {
-    scan_game_entry(root, fd.cFileName,
-                    (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0,
-                    drive_tag, prev_choice);
+    const std::string n = fd.cFileName;
+    if (n == "." || n == "..") continue;
+    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+      // A disc image dropped straight into the games folder: the exe list is
+      // read out of the image and it mounts as D: on launch.
+      const size_t dot = n.rfind('.');
+      if (dot == std::string::npos) continue;
+      const std::string ext = lower_ascii(n.substr(dot));
+      if (ext != ".iso" && ext != ".bin" && ext != ".img") continue;
+      const std::string img_path = root + "\\" + n;
+      bool dup_img = false;
+      for (const auto& existing : g_games)
+        if (!_stricmp(existing.image.c_str(), img_path.c_str())) dup_img = true;
+      if (dup_img) continue;
+      trt_iso* iso = trt_iso_open(img_path.c_str());
+      if (!iso) {
+        char line[600];
+        snprintf(line, sizeof(line),
+                 "shelf: %s is not an ISO9660/UDF image (skipped, named)",
+                 img_path.c_str());
+        longan::log_line(line);
+        continue;
+      }
+      std::vector<exe_cand> icands;
+      const std::string stem = n.substr(0, dot);
+      collect_iso_exes_rec(iso, "", stem, 0, &icands);
+      if (icands.empty()) {
+        char line[600];
+        snprintf(line, sizeof(line),
+                 "shelf: %s mounted but holds no runnable exe", img_path.c_str());
+        longan::log_line(line);
+        trt_iso_close(iso);
+        continue;
+      }
+      std::sort(icands.begin(), icands.end(),
+                [](const exe_cand& a, const exe_cand& b) {
+        if (a.score != b.score) return a.score > b.score;
+        if (a.size != b.size) return a.size > b.size;
+        return a.rel < b.rel;
+      });
+      game_entry ge;
+      ge.name = stem;
+      ge.dir = root;
+      ge.image = img_path;
+      for (const auto& c : icands) ge.exes.push_back(c.rel);
+      ge.exe = ge.exes[0];
+      char compat[280];
+      scan_compat_iso(iso, ge.exe, compat, (unsigned)sizeof(compat));
+      ge.compat = compat;
+      trt_iso_close(iso);
+      g_games.push_back(std::move(ge));
+      continue;
+    }
+    const std::string gdir = root + "\\" + n;
+    std::string disp = n;
+    bool dup = false;
+    for (const auto& existing : g_games) {
+      if (!_stricmp(existing.dir.c_str(), gdir.c_str())) {
+        dup = true;
+        break;
+      }
+      if (existing.name == disp && drive_tag) {
+        disp = n + " [" + std::string(1, drive_tag) + ":]";
+      }
+    }
+    if (dup) continue;
+    std::vector<exe_cand> cands;
+    collect_exes_rec(gdir, "", n, 0, &cands);
+    // A folder that holds a disc image is a game too: the exe list comes from
+    // inside the image and the image is mounted as D: at launch.
+    std::string image_path;
+    if (cands.empty()) {
+      char img[1024] = {};
+      if (trt_iso_find_image_in_dir(gdir.c_str(), img, sizeof(img))) {
+        trt_iso* iso = trt_iso_open(img);
+        if (iso) {
+          collect_iso_exes_rec(iso, "", n, 0, &cands);
+          if (!cands.empty()) image_path = img;
+          trt_iso_close(iso);
+        }
+        if (cands.empty()) {
+          char line[600];
+          snprintf(line, sizeof(line),
+                   "shelf: %s holds a disc image but no runnable exe inside it",
+                   img);
+          longan::log_line(line);
+        }
+      }
+    }
+    if (cands.empty()) continue;
+    std::sort(cands.begin(), cands.end(), [](const exe_cand& a, const exe_cand& b) {
+      if (a.score != b.score) return a.score > b.score;
+      if (a.size != b.size) return a.size > b.size;
+      if (a.depth != b.depth) return a.depth < b.depth;
+      return a.rel < b.rel;
+    });
+    game_entry ge;
+    ge.name = disp;
+    ge.dir = gdir;
+    for (const auto& c : cands) ge.exes.push_back(c.rel);
+    ge.exe_idx = 0;
+    {
+      std::ifstream ef(gdir + "\\tiramisu_exe.txt");
+      std::string cfg_exe;
+      if (ef && std::getline(ef, cfg_exe)) {
+        while (!cfg_exe.empty() && ((unsigned char)cfg_exe.back() <= ' '))
+          cfg_exe.pop_back();
+        for (size_t k = 0; k < ge.exes.size(); ++k) {
+          if (!_stricmp(ge.exes[k].c_str(), cfg_exe.c_str())) {
+            ge.exe_idx = (int)k;
+            break;
+          }
+        }
+      }
+      std::ifstream inf(gdir + "\\tiramisu_input.txt");
+      std::string im;
+      if (inf && std::getline(inf, im)) {
+        while (!im.empty() && ((unsigned char)im.back() <= ' ')) im.pop_back();
+        ge.input_mode = lower_ascii(im);
+      }
+    }
+    for (const auto& p : prev_choice) {
+      if (p.first == (ge.image.empty() ? gdir : ge.image)) {
+        for (size_t k = 0; k < ge.exes.size(); ++k) {
+          if (ge.exes[k] == p.second) {
+            ge.exe_idx = (int)k;
+            break;
+          }
+        }
+        break;
+      }
+    }
+    ge.exe = ge.exes[ge.exe_idx];
+    ge.image = image_path;
+    char compat[280];
+    if (!ge.image.empty()) {
+      trt_iso* iso = trt_iso_open(ge.image.c_str());
+      scan_compat_iso(iso, ge.exe, compat, (unsigned)sizeof(compat));
+      trt_iso_close(iso);
+    } else {
+      scan_compat(gdir + "\\" + ge.exe, compat, (unsigned)sizeof(compat));
+    }
+    ge.compat = compat;
+    g_games.push_back(std::move(ge));
   } while (FindNextFileA(h, &fd));
   FindClose(h);
 }
 
-// The exe the user had picked per game (keyed by dir or image path),
-// so a rescan restores the selection instead of resetting to exe 0.
-std::vector<std::pair<std::string, std::string>> snapshot_prev_choice() {
+void rescan_games() {
   std::vector<std::pair<std::string, std::string>> prev_choice;
   for (const auto& ge : g_games) {
     prev_choice.push_back({!ge.image.empty() ? ge.image
                             : (ge.dir.empty() ? ge.name : ge.dir),
                            ge.exe});
   }
-  return prev_choice;
-}
-
-void rescan_games() {
-  std::vector<std::pair<std::string, std::string>> prev_choice =
-      snapshot_prev_choice();
   g_games.clear();
   scan_games_root(g_games_dir, 0, prev_choice);
   for (char drv = 'D'; drv <= 'Y'; ++drv) {
@@ -962,71 +922,10 @@ void rescan_games() {
     }
   }
   if (g_selected >= (int)g_games.size()) g_selected = 0;
-  g_last_rescan_ms = (ULONGLONG)GetTickCount64();
 }
-
-// Full rescan of the games root only (no D:-Y: drive sweep): the
-// periodic refresh and the debounce fallback. Drive sweeps are
-// expensive (22 GetDriveType probes + walks) and removable drives
-// rarely change mid-session; the full sweep still runs at boot and
-// on a launch miss.
-void rescan_games_root_only() {
-  std::vector<std::pair<std::string, std::string>> prev_choice =
-      snapshot_prev_choice();
-  g_games.clear();
-  scan_games_root(g_games_dir, 0, prev_choice);
-  if (g_selected >= (int)g_games.size()) g_selected = 0;
-  g_last_rescan_ms = (ULONGLONG)GetTickCount64();
-}
-
-// Scoped rescan (item 4): rebuild only the entries for one game dir.
-// Drops that game's current entries first, then re-scans just its dir
-// (plus a same-stem disc image in the games root, if one exists). A
-// missing dir (deleted game) means the removal stands — the entries
-// were already dropped and nothing is re-added.
-void rescan_one_game(const std::string& name) {
-  const std::string gdir = g_games_dir + "\\" + name;
-  std::vector<std::pair<std::string, std::string>> prev_choice =
-      snapshot_prev_choice();
-  g_games.erase(std::remove_if(g_games.begin(), g_games.end(),
-                               [&](const game_entry& ge) {
-                                 if (!_stricmp(ge.dir.c_str(), gdir.c_str()))
-                                   return true;
-                                 // a same-stem disc image in the games root
-                                 if (!ge.image.empty() &&
-                                     _strnicmp(ge.image.c_str(), gdir.c_str(),
-                                               gdir.size()) == 0) {
-                                   const std::string tail =
-                                       lower_ascii(ge.image.substr(gdir.size()));
-                                   return tail == ".iso" || tail == ".bin" ||
-                                          tail == ".img";
-                                 }
-                                 return false;
-                               }),
-                g_games.end());
-  DWORD attrs = GetFileAttributesA(gdir.c_str());
-  if (attrs != INVALID_FILE_ATTRIBUTES)
-    scan_game_entry(g_games_dir, name,
-                    (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0, 0, prev_choice);
-  for (const char* ext : {".iso", ".bin", ".img"}) {
-    const std::string img = gdir + ext;
-    DWORD ia = GetFileAttributesA(img.c_str());
-    if (ia != INVALID_FILE_ATTRIBUTES &&
-        !(ia & FILE_ATTRIBUTE_DIRECTORY))
-      scan_game_entry(g_games_dir, name + ext, false, 0, prev_choice);
-  }
-  if (g_selected >= (int)g_games.size()) g_selected = 0;
-  g_last_rescan_ms = (ULONGLONG)GetTickCount64();
-}
-
-extern "C" int trt_mem_budget_charge_va(u64 bytes);
-extern "C" void trt_mem_budget_discharge_va(u64 bytes);
-extern "C" void trt_mem_budget_reset(void);
-
 
 extern "C" void trt_mem_budget_report(char* line, unsigned cap);
 
-// Brown-line diagnostics: report guest/app memory at boot stages.
 void log_guest_memory(const char* stage) {
   constexpr u64 mib = 1024ULL * 1024ULL;
   char budget[192];
@@ -1082,38 +981,6 @@ void check_guest_stop_trap() {
       if (trt_boot_exit_trap) trt_boot_exit_trap(0);
     }
   }
-}
-
-// Force-kill watchdog (item 5): last resort for a guest thread that ignores
-// a stop request (wedged in a syscall the WM_CLOSE/WM_QUIT trap never
-// reaches — the trap only fires when the guest pumps via host_pump) or that
-// never returns from run_game. TerminateThread is a blunt instrument: the
-// killed thread may have held a trt mutex (leaving it locked — the next
-// launch may hit it) and its guest allocations leak. What it must NOT do is
-// corrupt HOST state, so the teardown is explicit and ordered:
-//   1. terminate the thread, then join it (the handle is ours until join;
-//      the lambda's tail never runs for a killed thread, so the steps
-//      below do the cleanup the tail would have done)
-//   2. clear the running flag + running-game name (the UI must not think a
-//      guest is still running)
-//   3. clear the stop request (it was for the dead run)
-//   4. reset the memory budget (the dead guest's charges are unrecoverable
-//      any other way — the ledger would otherwise refuse the next launch)
-void force_kill_guest(const char* reason) {
-  if (!g_guest_thread.joinable()) return;
-  char line[192];
-  snprintf(line, sizeof(line),
-           "host: FORCE-KILL guest thread (%s) — TerminateThread, budget reset",
-           reason ? reason : "?");
-  longan::log_line(line);
-  ::TerminateThread(g_guest_thread.native_handle(), 1);
-  g_guest_thread.join();
-  g_guest_running.store(false);
-  longan::webxfer_set_running_game("");
-  g_running_game_name.clear();
-  g_guest_stop_req.store(false);
-  trt_mem_budget_reset();
-  longan::log_line("host: guest force-killed; budget reset, shelf live");
 }
 
 void host_exit_trap(int code) {
@@ -1190,6 +1057,25 @@ static int guest_seh_filter(EXCEPTION_POINTERS* ep) {
              (unsigned long)record.ExceptionCode, where);
   }
   longan::log_line(line);
+  if (ep->ContextRecord) {
+    const CONTEXT& c = *ep->ContextRecord;
+    snprintf(line, sizeof(line),
+             "guest fault regs: rip=%016llx rsp=%016llx rbp=%016llx rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx",
+             (unsigned long long)c.Rip, (unsigned long long)c.Rsp,
+             (unsigned long long)c.Rbp, (unsigned long long)c.Rax,
+             (unsigned long long)c.Rbx, (unsigned long long)c.Rcx,
+             (unsigned long long)c.Rdx);
+    longan::log_line(line);
+    snprintf(line, sizeof(line),
+             "guest fault regs: rsi=%016llx rdi=%016llx r8=%016llx r9=%016llx r10=%016llx r11=%016llx r12=%016llx r13=%016llx r14=%016llx r15=%016llx eflags=%08lx",
+             (unsigned long long)c.Rsi, (unsigned long long)c.Rdi,
+             (unsigned long long)c.R8, (unsigned long long)c.R9,
+             (unsigned long long)c.R10, (unsigned long long)c.R11,
+             (unsigned long long)c.R12, (unsigned long long)c.R13,
+             (unsigned long long)c.R14, (unsigned long long)c.R15,
+             (unsigned long)c.EFlags);
+    longan::log_line(line);
+  }
   DWORD64 frames[32];
   const int count = capture_fault_stack(ep->ContextRecord, frames, 32);
   for (int i = 1; i < count; ++i) {
@@ -1398,67 +1284,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   trt_runtime_init(&be, exe_dir.c_str());
   trt_resolver* runtime_rs = trt_runtime_resolver();
 
-  std::ifstream f(exe_path, std::ios::binary);
-  if (!f) {
-    snprintf(r.detail, sizeof(r.detail), "cannot open %s", exe_path.c_str());
-    return r;
-  }
-  std::vector<u8> buf((std::istreambuf_iterator<char>(f)),
-                      std::istreambuf_iterator<char>());
-
-  snprintf(line, sizeof(line), "trt: launching %s (%zu bytes)", exe_path.c_str(),
-           buf.size());
-  longan::log_line(line);
-
-  // Managed (.NET) games don't go through the native PE loader: their
-  // entry point is mscoree!_CorExeMain and their code is IL. Route them
-  // to the embedded Mono runtime instead (Path B). On UWP this fails
-  // NAMED until the Mono-for-UWP step lands (no runtime in-tree yet);
-  // offline it runs the game under Mono + the FNA stack.
-  if (trt_pe_is_managed(buf.data(), buf.size())) {
-    longan::log_line("trt: managed exe detected, routing to Mono");
-    trt_mono_config mcfg = {};
-    mcfg.exe_path = exe_path.c_str();
-    mcfg.log = [](const char* l) { longan::log_line(l); };
-    // Console managed games use the Tiramisu FNA backend (host
-    // CoreWindow + host input), never SDL.
-    mcfg.fna_platform = "tiramisu";
-    // FNA3D device handoff (Celeste hang fix): the Tiramisu backend
-    // never calls FNA3D_PrepareWindowAttributes, so selectedDriver
-    // stays -1 and FNA3D_CreateDevice returns NULL (silent no-render
-    // spin). Attach the host D3D device + install FNA3D log hooks,
-    // THEN select the driver. Both TOGETHER: PrepareWindowAttributes
-    // without the attach takes the stock D3D11 path (garbage-HWND
-    // swapchain -> AV).
-    trt_trace("TRACE fna3d attach enter");
-    {
-      int arc = trt_fna3d_attach_from_hooks(
-          [](const char* l) { longan::log_line(l); });
-      char ab[128];
-      snprintf(ab, sizeof(ab), "TRACE fna3d attach rc=%d attached=%d",
-               arc, trt_fna3d_is_attached());
-      trt_trace(ab);
-      if (!trt_fna3d_is_attached()) {
-        // FATAL guard: a failed attach must stop the launch here. Without
-        // it, PrepareWindowAttributes takes the stock D3D11 probe path
-        // (which succeeds on UWP) and CreateDevice builds a swapchain
-        // against a garbage window handle -> NULL deref AV.
-        longan::log_line("trt: FATAL fna3d attach failed - refusing stock D3D11 path");
-        r.map_rc = TRT_ERR_FNA3D;
-        strncpy(r.detail, trt_fna3d_last_error(), sizeof(r.detail) - 1);
-        return r;
-      }
-    }
-    trt_trace("TRACE PrepareWindowAttributes enter");
-    FNA3D_PrepareWindowAttributes();
-    trt_trace("TRACE PrepareWindowAttributes ok");
-    r.map_rc = trt_mono_run(&mcfg, nullptr, 0, nullptr);
-    if (r.map_rc != TRT_OK) {
-      strncpy(r.detail, trt_mono_last_error(), sizeof(r.detail) - 1);
-    }
-    return r;
-  }
-
+  log_guest_memory("before image load");
   trt_image* img = nullptr;
   {
     std::ifstream f(exe_path, std::ios::binary | std::ios::ate);
@@ -1801,20 +1627,14 @@ static void TRT_GUEST_ABI host_builtin_log_u32(unsigned tag, unsigned value) {
   longan::log_line(line);
 }
 static unsigned TRT_GUEST_ABI host_builtin_query_build(void) {
-  return 0x00020000u;  // runtime build 0.2.0
+  return 0x00020100u;  // runtime build 0.2.1
 }
 
 struct tiramisu_host
     : implements<tiramisu_host, IFrameworkViewSource, IFrameworkView> {
   CoreWindow m_window{nullptr};
   unsigned m_frames = 0;
-  // Rescan debounce (item 4): upload-driven rescans arrive in bursts (one
-  // per file); the pending rescan fires at most once per 2 s, scoped to
-  // the changed game when every pending change is for the same game.
-  bool m_rescan_pending = false;
-  bool m_rescan_pending_full = false;
-  std::string m_rescan_pending_game;
-  ULONGLONG m_next_full_rescan_ms = 0;  // periodic root rescan (30 s)
+  unsigned m_rescan_at = 0;
 
   IFrameworkView CreateView() { return *this; }
   void Initialize(CoreApplicationView const&) {}
@@ -1830,10 +1650,7 @@ struct tiramisu_host
 
   void SetWindow(CoreWindow const& window) {
     m_window = window;
-    // The FNA backend renders into this CoreWindow: hand its ABI
-    // pointer to the native FNA layer (FNA's CreateWindow returns it;
-    // the FNA3D D3D11 driver consumes it later).
-    trt_fna_set_window_handle((void*)winrt::get_abi(window));
+    window.PointerCursor(CoreCursor(CoreCursorType::Arrow, 0));
     const auto sc = longan::swapchain_create(window);
     char line[256];
     snprintf(line, sizeof(line),
@@ -2113,19 +1930,12 @@ struct tiramisu_host
         ws2u8(winrt::Windows::Storage::ApplicationData::Current()
                   .LocalFolder()
                   .Path());
-    // Managed (FNA) games save under LocalState.
-    trt_fna_set_storage_root(g_local_state.c_str());
     g_games_dir = g_local_state + "\\games";
     longan::log_open(install);
     char line[256];
     snprintf(line, sizeof(line), "tiramisu boot: pkg=%s state=%s",
              install.c_str(), g_local_state.c_str());
     longan::log_line(line);
-
-    // 1ms host timer resolution for the session: guest Sleep(1) and frame
-    // pacing need it (the Windows default is ~15.6ms).
-    ::timeBeginPeriod(1);
-    longan::log_line("tiramisu boot: host timer resolution 1ms (timeBeginPeriod)");
 
     // ---- persisted settings (dashboard-editable; consumed by bridges) ----
     const int applied = longan::settings_load(g_local_state);
@@ -2382,27 +2192,16 @@ struct tiramisu_host
     enable_keyboard_interceptor();
 
     int mouse_vx = 960, mouse_vy = 540;
-    auto next_heartbeat = std::chrono::steady_clock::now();
-    g_boot_ms = (ULONGLONG)GetTickCount64();
+    auto next_guest_memory_sample = std::chrono::steady_clock::now();
     while (!g_shutdown.load()) {
-      // Heartbeat (item 10): a line every 60 s so a wedged app is
-      // distinguishable from a quiet one in tiramisu.log. Wall clock, not
-      // frame count — m_frames freezes while a guest runs (Sleep(4) +
-      // continue skips the increment), which is exactly when the
-      // heartbeat matters most.
-      {
+      if (g_guest_running.load()) {
         const auto now = std::chrono::steady_clock::now();
-        if (now >= next_heartbeat) {
-          next_heartbeat = now + std::chrono::seconds(60);
-          char hb[256];
-          snprintf(hb, sizeof(hb), "heartbeat: up %llus guest=%s shelf=%zu games",
-                   (unsigned long long)((GetTickCount64() - g_boot_ms) / 1000),
-                   g_running_game_name.empty() ? "(none)"
-                                               : g_running_game_name.c_str(),
-                   g_games.size());
-          longan::log_line(hb);
+        if (now >= next_guest_memory_sample) {
+          log_guest_memory("running");
+          next_guest_memory_sample = now + std::chrono::seconds(2);
         }
       }
+      trt_input_frame_begin();
       CoreWindow::GetForCurrentThread()
           .Dispatcher()
           .ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
@@ -2569,14 +2368,6 @@ struct tiramisu_host
         const bool pad_vm = (b & XINPUT_GAMEPAD_BACK) && (b & XINPUT_GAMEPAD_START);
         if (g_guest_running.load()) {
           if (longan::webxfer_poll_stop()) request_guest_stop();
-          // Force-kill watchdog (item 5): a stop request a hung guest
-          // ignores for >10 s escalates to TerminateThread. The stop trap
-          // clears the flag when the guest unwinds, and run_game clears it
-          // per launch, so a stale flag can never trigger this.
-          if (g_guest_stop_req.load() &&
-              (u64)GetTickCount64() - g_guest_stop_since.load() > 10000ull) {
-            force_kill_guest("stop ignored 10s");
-          }
           if (longan::trt_settings_quick_menu_enabled() && pad_vm) {
             // RetroArch-style: Back+Start toggles the quick menu
             static bool qm_was = false;
@@ -2795,47 +2586,9 @@ struct tiramisu_host
 
       // ---- launch handoff (web + pad) ----
       if (!g_guest_running.load()) {
-        // Rescan debounce + scope (item 4): uploads request a rescan per
-        // file, and a full rescan re-walks every root + drive on the UI
-        // thread — the prime wedge suspect. Pending rescans coalesce and
-        // fire at most once per 2 s; when every pending change is for the
-        // same game, only that game's dir is re-scanned. A full (root-only)
-        // rescan still runs every 30 s so other changes surface.
-        {
-          std::string rescan_game;
-          if (longan::webxfer_poll_rescan(&rescan_game)) {
-            m_rescan_pending = true;
-            if (rescan_game.empty()) {
-              m_rescan_pending_full = true;
-            } else if (m_rescan_pending_game.empty()) {
-              m_rescan_pending_game = rescan_game;
-            } else if (m_rescan_pending_game != rescan_game) {
-              // two different games changed: scope is lost, rescan the root
-              m_rescan_pending_full = true;
-              m_rescan_pending_game.clear();
-            }
-          }
-          const ULONGLONG now_ms = (ULONGLONG)GetTickCount64();
-          if (m_next_full_rescan_ms == 0)
-            m_next_full_rescan_ms = now_ms + 30000ull;
-          if (m_rescan_pending && now_ms - g_last_rescan_ms >= 2000ull) {
-            m_rescan_pending = false;
-            if (m_rescan_pending_full) {
-              m_rescan_pending_full = false;
-              m_rescan_pending_game.clear();
-              rescan_games_root_only();
-            } else if (!m_rescan_pending_game.empty()) {
-              const std::string game = m_rescan_pending_game;
-              m_rescan_pending_game.clear();
-              rescan_one_game(game);
-            }
-            // any rescan resets the periodic clock
-            m_next_full_rescan_ms = now_ms + 30000ull;
-          }
-          if (now_ms >= m_next_full_rescan_ms) {
-            m_next_full_rescan_ms = now_ms + 30000ull;
-            rescan_games_root_only();
-          }
+        if (longan::webxfer_poll_rescan() || m_frames - m_rescan_at >= 120) {
+          m_rescan_at = m_frames;
+          rescan_games();
         }
         std::string webname;
         if (longan::webxfer_poll_launch(&webname)) {
@@ -2846,7 +2599,7 @@ struct tiramisu_host
           }
           bool found = false;
           for (const auto& ge : g_games)
-            if (_stricmp(ge.name.c_str(), webname.c_str()) == 0) { found = true; break; }
+            if (ge.name == webname) { found = true; break; }
           if (!found) rescan_games();
         }
         if (!g_pending_launch.empty()) {
@@ -2854,7 +2607,7 @@ struct tiramisu_host
           g_pending_launch.clear();
           bool shelf_hit = false;
           for (const auto& ge : g_games)
-            if (_stricmp(ge.name.c_str(), want.c_str()) == 0) { shelf_hit = true; break; }
+            if (ge.name == want) { shelf_hit = true; break; }
           if (!shelf_hit) {
             // console reality: the shelf's FindFirstFileA scan can come up
             // empty while the web dashboard's enumeration lists the game —
@@ -2880,23 +2633,11 @@ struct tiramisu_host
               snprintf(drop, sizeof(drop),
                        "launch %s: game not found on shelf or web list", want.c_str());
               longan::log_line(drop);
-              longan::webxfer_set_launch_result(want, "not found");
             }
           }
           for (const auto& ge : g_games) {
-            if (_stricmp(ge.name.c_str(), want.c_str()) == 0) {
-              // The previous guest thread may still be unwinding after
-              // run_game returned (the running flag clears in the lambda's
-              // tail, so this join normally returns at once) — but never
-              // block the UI thread forever on it: 5 s, then force-kill.
-              if (g_guest_thread.joinable()) {
-                if (::WaitForSingleObject(g_guest_thread.native_handle(),
-                                          5000) == WAIT_OBJECT_0) {
-                  g_guest_thread.join();
-                } else {
-                  force_kill_guest("join timeout");
-                }
-              }
+            if (ge.name == want) {
+              if (g_guest_thread.joinable()) g_guest_thread.join();
               set_guest_status("running " + ge.name + "…");
               if (ge.input_mode == "pad2kbm" || ge.input_mode == "kbm") {
                 g_mouse_mode = true;
@@ -2908,29 +2649,19 @@ struct tiramisu_host
               // the guest explicitly pins it to a 1x1 mouselook trap.
               trt_input_reset_cursor_mode(true);
               longan::webxfer_set_running_game(want);
-              longan::webxfer_set_launch_result(want, "started");
-              g_running_game_name = want;
               g_guest_running.store(true);
               const std::string exe = ge.exe;
               const std::string gdir = ge.dir;
               const std::string img = ge.image;
               g_guest_thread = std::thread([want, exe, gdir, img]() {
-                // the guest main thread's stack reserve is VA for its
-                // lifetime (1 MB Windows default) — charge it here, where
-                // the thread is created, and discharge it in the tail
-                // (a force-killed thread never runs the tail, but the
-                // force-kill path resets the whole budget instead)
-                const bool stack_charged =
-                    trt_mem_budget_charge_va(1024ull * 1024ull) == 0;
                 const auto gr = run_game(want, exe, gdir, img);
                 char line[192];
                 snprintf(line, sizeof(line), "launch %s: rc=%s (%s)",
                          want.c_str(), trt_errstr(gr.map_rc), gr.detail);
                 longan::log_line(line);
-                set_guest_status(want + ": " + trt_errstr(gr.map_rc));
-                if (stack_charged)
-                  trt_mem_budget_discharge_va(1024ull * 1024ull);
-                g_running_game_name.clear();
+                set_guest_status(want + ": " + (gr.map_rc == TRT_OK ? gr.detail
+                                                                   : trt_errstr(gr.map_rc)));
+                longan::webxfer_set_running_game("");
                 g_guest_running.store(false);
               });
               break;
