@@ -25,7 +25,7 @@
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #include <windows.h>
-  #include <bcrypt.h>    // brown-line paired-LAN control pairing RNG
+  #include <bcrypt.h>
   #include <sys/stat.h>  // _stat64 for upload verification
   #pragma comment(lib, "bcrypt.lib")
   #pragma comment(lib, "ws2_32.lib")
@@ -69,7 +69,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
-#include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -80,26 +80,6 @@ namespace {
 
 std::mutex g_mu;
 webxfer_state g;
-
-// In-flight upload guard (item 8): concurrent upload streams to DIFFERENT
-// files are the whole point of parallelism, but two streams writing the
-// SAME file would interleave bytes and fail verification. The registry
-// keys on game + rel (or "zip:" + filename for the zip path); a duplicate
-// in-flight upload gets 409. Entries are erased on every exit path via
-// the RAII guard in the handlers.
-std::mutex g_upload_mu;
-std::set<std::string> g_uploads_inflight;
-
-struct inflight_guard {
-  std::string key;
-  explicit inflight_guard(std::string k) : key(std::move(k)) {}
-  ~inflight_guard() {
-    std::lock_guard<std::mutex> lk(g_upload_mu);
-    g_uploads_inflight.erase(key);
-  }
-  inflight_guard(const inflight_guard&) = delete;
-  inflight_guard& operator=(const inflight_guard&) = delete;
-};
 std::atomic<bool> g_stop{false};
 std::atomic<int> g_workers{0};
 sock_t g_listener = kBadSock;
@@ -703,7 +683,7 @@ const char* k_upload_page =
   "const r=await fetch(url,{method:'PUT',body:cur.file});"
   "if(!r.ok)throw new Error('HTTP '+r.status+' on '+rel);"
   "done+=cur.file.size;E('fill').style.width=(total?Math.min(100,done/total*100):100)+'%';}}"
-  "try{await Promise.all([worker(),worker(),worker(),worker(),worker(),worker()]);"
+  "try{await Promise.all([worker(),worker(),worker()]);"
   "setLog('Uploaded '+items.length+' files to '+g+' — ready to Launch!');refresh();}catch(e){setLog('Upload error: '+e.message);}}"
   "async function uploadZip(f){if(!f)return;"
   "setLog('Uploading '+f.name+'...');E('fill').style.width='5%';"
@@ -895,6 +875,19 @@ void send_chunk(sock_t s, const std::string& data) {
   send_all(s, "\r\n", 2);
 }
 
+std::string read_control_body(sock_t s, const char* pre, size_t pre_len,
+                              size_t size) {
+  std::string body(pre, std::min(size, pre_len));
+  while (body.size() < size) {
+    char buf[512];
+    const int count = recv(s, buf, static_cast<int>(
+        std::min(sizeof(buf), size - body.size())), 0);
+    if (count <= 0) break;
+    body.append(buf, count);
+  }
+  return body;
+}
+
 bool parse_control_events(const std::string& body, std::vector<web_control_event>* events) {
   std::istringstream input(body);
   std::string line;
@@ -978,19 +971,6 @@ void handle_controls(sock_t s, const std::string& path, const std::string& auth,
     }
   }
   respond(s, status, "text/plain; charset=utf-8", output);
-}
-
-std::string read_control_body(sock_t s, const char* pre, size_t pre_len,
-                              size_t size) {
-  std::string body(pre, std::min(size, pre_len));
-  while (body.size() < size) {
-    char buf[512];
-    const int count = recv(s, buf, static_cast<int>(
-        std::min(sizeof(buf), size - body.size())), 0);
-    if (count <= 0) break;
-    body.append(buf, count);
-  }
-  return body;
 }
 
 void handle_client(sock_t s) {
@@ -1083,20 +1063,16 @@ void handle_client(sock_t s) {
     return;
   }
   if (strcmp(method, "GET") == 0 && url_path == "/games") {
-    // games_json() only touches g_games_dir + the filesystem — it never
-    // reads g, so holding g_mu across the (slow, disk-bound) scan and the
-    // socket write blocked every other handler. Build + respond lock-free.
+    std::lock_guard<std::mutex> lk(g_mu);
     respond(s, "200 OK", "application/json", games_json());
     return;
   }
   if (strcmp(method, "GET") == 0 && url_path == "/api/status") {
     std::lock_guard<std::mutex> lk(g_mu);
-    char buf[1024];
+    char buf[640];
     snprintf(buf, sizeof(buf),
              "{\"running\":%s,\"guest_running\":%s,\"running_game\":\"%s\",\"url\":\"%s\","
              "\"last_upload\":\"%s\",\"last_error\":\"%s\","
-             "\"launch_pending\":%s,\"launch_name\":\"%s\","
-             "\"last_launch_result\":\"%s\",\"last_launch_name\":\"%s\","
              "\"upload_done\":%llu,\"upload_total\":%llu}",
              g.running ? "true" : "false",
              // running = the server is listening; guest_running = a guest is
@@ -1106,10 +1082,6 @@ void handle_client(sock_t s) {
              json_escape(g.url).c_str(),
              json_escape(g.last_upload).c_str(),
              json_escape(g.last_error).c_str(),
-             g.launch_requested ? "true" : "false",
-             json_escape(g.launch_name).c_str(),
-             json_escape(g.last_launch_result).c_str(),
-             json_escape(g.last_launch_name).c_str(),
              (unsigned long long)g_upload_done.load(),
              (unsigned long long)g_upload_total.load());
     respond(s, "200 OK", "application/json", buf);
@@ -1193,35 +1165,12 @@ void handle_client(sock_t s) {
       respond(s, "404 Not Found", "text/plain", "game not found");
       return;
     }
-    // Launch honesty (item 9): the old code returned 200 "launching" the
-    // moment the flag was set, before anything ran — and silently
-    // overwrote a pending launch or a running game. A guest already
-    // running or a launch already queued is a 409; a fresh queue is 202
-    // Accepted (queued, not started — /api/status reports the outcome via
-    // last_launch_result once the host loop acts on it).
-    std::string conflict;
-    std::string conflict_name;
     {
       std::lock_guard<std::mutex> lk(g_mu);
-      if (!g.running_game.empty()) {
-        conflict = "already running";
-        conflict_name = g.running_game;
-      } else if (g.launch_requested) {
-        conflict = "launch already queued";
-        conflict_name = g.launch_name;
-      } else {
-        g.launch_name = name;
-        g.launch_requested = true;
-      }
+      g.launch_name = name;
+      g.launch_requested = true;
     }
-    if (!conflict.empty()) {
-      respond(s, "409 Conflict", "application/json",
-              "{\"error\":\"" + conflict + "\",\"name\":\"" +
-                  json_escape(conflict_name) + "\"}");
-      return;
-    }
-    respond(s, "202 Accepted", "application/json",
-            "{\"queued\":true,\"name\":\"" + json_escape(name) + "\"}");
+    respond(s, "200 OK", "text/plain", "launching " + name);
     return;
   }
   if (strcmp(method, "POST") == 0 && url_path == "/api/stop") {
@@ -1236,7 +1185,6 @@ void handle_client(sock_t s) {
     {
       std::lock_guard<std::mutex> lk(g_mu);
       g.rescan_requested = true;
-      g.rescan_game.clear();  // manual rescan is always a full rescan
     }
     respond(s, "200 OK", "application/json", "{\"ok\":true}");
     return;
@@ -1261,7 +1209,6 @@ void handle_client(sock_t s) {
     {
       std::lock_guard<std::mutex> lk(g_mu);
       g.rescan_requested = true;
-      g.rescan_game = name;  // scoped: only this game's entries vanish
     }
     respond(s, "200 OK", "application/json", "{\"deleted\":true}");
     return;
@@ -1313,7 +1260,6 @@ void handle_client(sock_t s) {
     {
       std::lock_guard<std::mutex> lk(g_mu);
       g.rescan_requested = true;
-      g.rescan_game = name;  // scoped: only this game's config changed
     }
     respond(s, "200 OK", "application/json", "{\"saved\":true}");
     return;
@@ -1328,18 +1274,6 @@ void handle_client(sock_t s) {
       respond(s, "400 Bad Request", "text/plain", "invalid game or rel path");
       return;
     }
-    // Two streams writing the SAME file would interleave bytes and fail
-    // verification — refuse the duplicate (409) instead of corrupting the
-    // file. Different files stream concurrently (the whole point of the
-    // parallel uploader). The guard erases the key on every exit path.
-    {
-      std::lock_guard<std::mutex> lk(g_upload_mu);
-      if (!g_uploads_inflight.insert(game + "\x1f" + rel).second) {
-        respond(s, "409 Conflict", "text/plain", "already uploading");
-        return;
-      }
-    }
-    inflight_guard inflight(game + "\x1f" + rel);
     if (expect_100) send_all(s, "HTTP/1.1 100 Continue\r\n\r\n", 25);
     const std::string sep(1, XFER_SEP);
     const std::string gdir = g_games_dir + sep + game;
@@ -1358,7 +1292,6 @@ void handle_client(sock_t s) {
       g.last_upload = game + " -> " + rel;
       g.last_error.clear();
       g.rescan_requested = true;
-      g.rescan_game = game;  // scoped: only this game's dir changed
     }
     {
       // got == content_len here AND the on-disk size was verified equal
@@ -1376,16 +1309,6 @@ void handle_client(sock_t s) {
       respond(s, "400 Bad Request", "text/plain", "bad name");
       return;
     }
-    // Same in-flight guard as /api/upload-file: two zips of the same name
-    // would share one incoming temp file.
-    {
-      std::lock_guard<std::mutex> lk(g_upload_mu);
-      if (!g_uploads_inflight.insert("zip:" + fname).second) {
-        respond(s, "409 Conflict", "text/plain", "already uploading");
-        return;
-      }
-    }
-    inflight_guard inflight("zip:" + fname);
     if (expect_100) send_all(s, "HTTP/1.1 100 Continue\r\n\r\n", 25);
     const std::string sep(1, XFER_SEP);
     const std::string tmp = g_incoming + sep + fname;
@@ -1426,7 +1349,6 @@ void handle_client(sock_t s) {
           g.last_upload = game_name + " (" + mb + ", " + note + ")";
           g.last_error.clear();
           g.rescan_requested = true;
-          g.rescan_game = game_name;  // scoped: only this game's dir changed
         }
         respond(s, "200 OK", "text/plain",
                 "extracted: " + game_name + " — " + note +
@@ -1688,9 +1610,7 @@ std::string webxfer_start_port(const std::string& local_state, unsigned short po
   addr.sin_addr.s_addr = INADDR_ANY;
   addr.sin_port = htons(port);
   if (bind(g_listener, (sockaddr*)&addr, sizeof(addr)) != 0 ||
-      listen(g_listener, 64) != 0) {  // 64-deep backlog: 6 parallel upload
-                                      // workers + dashboard + launch all
-                                      // connect at once; 16 dropped SYNs
+      listen(g_listener, 16) != 0) {
     sock_close(g_listener);
     g_listener = kBadSock;
     std::lock_guard<std::mutex> lk(g_mu);
@@ -1767,26 +1687,33 @@ bool webxfer_poll_stop() {
   return true;
 }
 
-bool webxfer_poll_rescan(std::string* out_game) {
+bool webxfer_poll_rescan() {
   std::lock_guard<std::mutex> lk(g_mu);
   if (!g.rescan_requested) return false;
   g.rescan_requested = false;
-  if (out_game) *out_game = g.rescan_game;
-  g.rescan_game.clear();
   return true;
 }
-
-bool webxfer_poll_rescan() { return webxfer_poll_rescan(nullptr); }
 
 void webxfer_set_running_game(const std::string& name) {
   std::lock_guard<std::mutex> lk(g_mu);
   g.running_game = name;
 }
 
-void webxfer_set_launch_result(const std::string& name, const std::string& result) {
-  std::lock_guard<std::mutex> lk(g_mu);
-  g.last_launch_name = name;
-  g.last_launch_result = result;
+std::vector<web_control_event> webxfer_control_events() {
+  std::lock_guard<std::mutex> lock(g_control_mu);
+  if (g_control_last != control_clock::time_point{} &&
+      control_clock::now() - g_control_last > std::chrono::seconds(2)) {
+    g_control_last = {};
+    g_control_events = {{'r', 0, 0}};
+  }
+  std::vector<web_control_event> events;
+  events.swap(g_control_events);
+  return events;
+}
+
+std::string webxfer_control_code() {
+  std::lock_guard<std::mutex> lock(g_control_mu);
+  return g_control_code;
 }
 
 void webxfer_shutdown() {
@@ -1820,22 +1747,6 @@ std::string webxfer_url() {
 unsigned short webxfer_port() {
   std::lock_guard<std::mutex> lk(g_mu);
   return g.port;
-}
-
-std::vector<web_control_event> webxfer_control_events() {
-  std::lock_guard<std::mutex> lock(g_control_mu);
-  if (g_control_last != control_clock::time_point{} &&
-      control_clock::now() - g_control_last > std::chrono::seconds(2)) {
-    g_control_last = {};
-    g_control_events = {{'r', 0, 0}};
-  }
-  std::vector<web_control_event> events;
-  events.swap(g_control_events);
-  return events;
-}
-std::string webxfer_control_code() {
-  std::lock_guard<std::mutex> lock(g_control_mu);
-  return g_control_code;
 }
 
 } // namespace longan
