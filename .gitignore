@@ -30,3 +30,7 @@ docs/progress/*.msix
 docs/progress/*.xml
 docs/progress/fna-dlls/
 docs/progress/out-*/
+docs/progress/*.csv
+docs/progress/*.bak*
+docs/progress/*.skipped
+docs/progress/recovered-loader-patches/
