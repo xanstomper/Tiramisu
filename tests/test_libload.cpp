@@ -11,6 +11,7 @@
 #include "../src/trt/trt.h"
 #include "../src/trt/images.h"
 
+#include <string>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,7 +65,10 @@ void* linux_alloc(size_t bytes, u64 preferred_base) {
   return p;
 }
 
+bool g_fail_protection = false;
+
 int linux_protect(void* base, size_t bytes, unsigned prot) {
+  if (g_fail_protection) return -1;
   int p = 0;
   if (prot & TRT_PROT_R) p |= PROT_READ;
   if (prot & TRT_PROT_W) p |= PROT_WRITE;
@@ -208,6 +212,17 @@ int main(int argc, char** argv) {
   }
 
   printf("tiramisu guest DLL loading test\n");
+
+  const std::string dll_path = std::string(argc > 3 ? argv[3] : argv[2]) + "/guestdll.dll";
+  const u64 committed_before = trt_mem_budget_committed();
+  g_fail_protection = true;
+  CHECK(!trt_load_pe(dll_path.c_str(), "guestdll.dll", 1),
+        "a failed code protection rejects the DLL");
+  g_fail_protection = false;
+  CHECK(!trt_images_find("guestdll.dll") &&
+            trt_mem_budget_committed() == committed_before,
+        "a failed seal leaves no loaded DLL or mapped memory charge");
+  if (failures) return 1;
 
   // the exe goes through the same path the console host uses
   trt_image* img = trt_load_pe(argv[1], "guest_libload.exe", 0);

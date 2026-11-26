@@ -574,9 +574,17 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
     return nullptr;
   }
 
-  // register BEFORE the entry runs: the DLL may load another DLL that
-  // imports back into this one
-  const char* base = base_name(guest_name ? guest_name : host_path);
+  const char* base = req_base;
+  if (trt_seal_image(g_be, img) != TRT_OK) {
+    char line[320];
+    snprintf(line, sizeof(line), "trt: seal failed for %s", base);
+    trt_core_log(line);
+    trt_unmap(g_be, img);
+    return nullptr;
+  }
+
+  // Reentrant initialization may resolve exports in this image. Register
+  // it only after the entire image has been protected successfully.
   int slot = -1;
   {
     std::lock_guard<std::mutex> lk(g_img_mu);
@@ -597,10 +605,9 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
     }
   }
 
-  if (trt_seal_image(g_be, img) != TRT_OK) {
-    char line[320];
-    snprintf(line, sizeof(line), "trt: seal failed for %s", base);
-    trt_core_log(line);
+  if (slot < 0) {
+    trt_core_log("trt: guest image registry full");
+    trt_unmap(g_be, img);
     return nullptr;
   }
 

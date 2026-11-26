@@ -689,7 +689,8 @@ void measure_surface_pair(ID3D11Texture2D* guest, ID3D11Texture2D* host) {
   if (view) {
     winrt::com_ptr<ID3D11Resource> resource;
     view->GetResource(resource.put());
-    if (resource.get() == static_cast<ID3D11Resource*>(g_guest_backbuffer.get())) {
+    auto* target = g_guest_backbuffer ? g_guest_backbuffer.get() : guest;
+    if (resource.get() == static_cast<ID3D11Resource*>(target)) {
       g_surface_guest_rtv.fetch_add(1);
     } else {
       g_surface_other_rtv.fetch_add(1);
@@ -701,18 +702,19 @@ void measure_surface_pair(ID3D11Texture2D* guest, ID3D11Texture2D* host) {
 void TRT_GUEST_ABI prepare_d3d11_present() {
   if (!g_swap || !g_ctx || !g_device) return;
   end_guest_draw_sample();
-  if (g_guest_backbuffer) {
-    winrt::com_ptr<ID3D11Texture2D> back;
-    if (SUCCEEDED(g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), back.put_void()))) {
-      auto* present_source = g_guest_backbuffer.get();
+  winrt::com_ptr<ID3D11Texture2D> back;
+  if (SUCCEEDED(g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), back.put_void()))) {
+    auto* present_source = back.get();
+    if (g_guest_backbuffer) {
+      present_source = g_guest_backbuffer.get();
       if (g_guest_resolved) {
         g_ctx->ResolveSubresource(g_guest_resolved.get(), 0, present_source, 0,
                                   g_guest_resolve_format);
         present_source = g_guest_resolved.get();
       }
       g_ctx->CopyResource(back.get(), present_source);
-      measure_surface_pair(present_source, back.get());
     }
+    measure_surface_pair(present_source, back.get());
   }
   draw_guest_pointer();
   begin_guest_draw_sample();

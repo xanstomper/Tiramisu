@@ -48,6 +48,12 @@ typedef struct trt_backend {
   // REQUIRED for C++ exceptions in guest code (x64: RtlAddFunctionTable).
   // Return 0 on success. NULL = unsupported (test backend).
   int   (*register_unwind)(void* image_base, const void* pdata, u32 count);
+  // Paired with register_unwind for backends that retain pointers into images.
+#ifdef __cplusplus
+  int   (*unregister_unwind)(const void* pdata) = nullptr;
+#else
+  int   (*unregister_unwind)(const void* pdata);
+#endif
 } trt_backend;
 
 // ---- import resolver: module+symbol -> callable address ----
@@ -88,6 +94,8 @@ typedef struct trt_image {
   u32  tls_zero_fill;      // PE32 TLS zero-fill size
   u32  tls_index_rva;      // PE32 TLS index-slot RVA (slot left unwritten: the
                            // Phase 2 emulator assigns the FS-based TLS index)
+  u32  tls_template_slot; // PE64 TLS index plus one, zero for no template
+  int  unwind_registered;
  } trt_image;
 
 // STAGE 7: the shared process guest TEB (gs:[0x08] StackLimit, gs:[0x10]

@@ -312,6 +312,12 @@ int uwp_register_unwind(void* image_base, const void* pdata, u32 count) {
              : 1;
 }
 
+int uwp_unregister_unwind(const void* pdata) {
+  return RtlDeleteFunctionTable(
+             reinterpret_cast<PIMAGE_RUNTIME_FUNCTION_ENTRY>(const_cast<void*>(pdata)))
+             ? 0 : 1;
+}
+
 void uwp_log(const char* line) { longan::log_line(line); }
 
 std::atomic<bool> g_uwp_raw_mouse{false};
@@ -1584,6 +1590,7 @@ std::atomic<u64> g_guest_stop_since{0};
 
 extern "C" {
 void trt_bridge_post_quit(int code);
+u32 TRT_STDCALL trt_ExitThread(u32 code);
 void trt_real_exit_hook_install(void);
 void trt_syscall_trap_install(void);
 void trt_video_sample_log(void);
@@ -1647,11 +1654,17 @@ void force_kill_guest(const char* reason) {
 }
 
 void host_exit_trap(int code) {
+  checkpoint_outcome(longan::launch_outcome::guest_exit, static_cast<u32>(code));
   if (GetCurrentThreadId() == g_guest_tid) {
     g_exit_code = code;
     std::longjmp(g_exit_jmp, 1);
   }
-  ExitThread((DWORD)code);
+
+  // A guest worker may terminate its process. Request shutdown of the guest
+  // main thread and retire the worker through the Win32 bridge so its
+  // waiters and synchronization objects are released.
+  request_guest_stop();
+  trt_ExitThread(static_cast<u32>(code));
 }
 
 static void describe_fault_pc(uintptr_t pc, char* out, size_t cap) {
@@ -2069,7 +2082,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   longan::swapchain_reset_guest_draw_probe();
   trt_images_reset();
   trt_backend be{&uwp_alloc,     &uwp_protect,        &uwp_release,
-                 &uwp_log,       &uwp_register_unwind};
+                 &uwp_log,       &uwp_register_unwind, &uwp_unregister_unwind};
   trt_set_vmem_hooks(&uwp_reserve, &uwp_commit, &uwp_decommit);
   trt_va_enable_deferred_data(1);
   trt_bridge_boot(&be);

@@ -87,8 +87,10 @@ static u8* g_guest_teb = nullptr;
 static u32 g_guest_tls_next = k_guest_tls_first_index;
 static std::atomic<u32> g_tls_epoch{1};
 static std::vector<tls_template> g_tls_templates;
+static std::vector<u32> g_revoked_tls_templates;
 
 struct ThreadTlsState {
+  size_t revoked_templates_seen = 0;
   alignas(16) u8 teb[0x2000]{};
   void** slots = nullptr;
   size_t cap = 0;
@@ -191,6 +193,15 @@ static void sync_thread_tls_state() {
     ts.cap = target_cap;
   }
 
+  for (; ts.revoked_templates_seen < g_revoked_tls_templates.size();
+       ++ts.revoked_templates_seen) {
+    const u32 index = g_revoked_tls_templates[ts.revoked_templates_seen];
+    if (index < ts.cap) {
+      free(ts.slots[index]);
+      ts.slots[index] = nullptr;
+    }
+  }
+
   for (const tls_template& tpl : g_tls_templates) {
     if (tpl.index < ts.cap && ts.slots[tpl.index] == nullptr) {
       const size_t alloc_sz = tpl.total_size ? tpl.total_size : 1;
@@ -226,6 +237,22 @@ int trt_guest_tls_register(const u8* raw, size_t raw_size, size_t total_size,
   }
   sync_thread_tls_state();
   return 0;
+}
+
+static void unregister_image_tls(u32 slot) {
+  if (!slot) return;
+  const u32 index = slot - 1;
+  {
+    std::lock_guard<std::mutex> lk(g_teb_mu);
+    for (auto it = g_tls_templates.begin(); it != g_tls_templates.end(); ++it) {
+      if (it->index != index) continue;
+      g_revoked_tls_templates.push_back(index);
+      g_tls_templates.erase(it);
+      g_tls_epoch.fetch_add(1, std::memory_order_release);
+      break;
+    }
+  }
+  sync_thread_tls_state();
 }
 
 void trt_guest_tls_sync_thread(void) {
@@ -547,6 +574,27 @@ extern "C" void* trt_pe32_trap_host_fn(int index) {
   return g_pe32_traps[(size_t)index].host_fn;
 }
 
+bool release_image_mapping(const trt_backend* be, trt_image* img) {
+  if (img->unwind_registered && be->unregister_unwind &&
+      be->unregister_unwind(img->pdata) != 0) {
+    logf_be(be, "trt: retaining image after unwind table removal failed");
+    return false;
+  }
+  img->unwind_registered = 0;
+  unregister_image_tls(img->tls_template_slot);
+  img->tls_template_slot = 0;
+  if (img->base) {
+    if (img->is_pe32) pe32_guest_release_by_host(img->base);
+    be->release(img->base, (size_t)img->size_of_image);
+    trt_mem_budget_discharge_commit(img->size_of_image);
+    trt_mem_budget_discharge_va(img->size_of_image);
+    img->base = nullptr;
+  }
+  img->pdata = nullptr;
+  img->pdata_count = 0;
+  return true;
+}
+
 // fail: record stage detail, release mapping, return error code
 int fail(trt_image* img, const trt_backend* be, int code, const char* detail) {
   if (detail && img) {
@@ -557,13 +605,7 @@ int fail(trt_image* img, const trt_backend* be, int code, const char* detail) {
   snprintf(line, sizeof(line), "trt: FAIL %s: %s", trt_errstr(code),
            detail ? detail : "");
   logf_be(be, line);
-  if (img && img->base && be) {
-    if (img->is_pe32) pe32_guest_release_by_host(img->base);
-    be->release(img->base, (size_t)img->size_of_image);
-    trt_mem_budget_discharge_commit(img->size_of_image);
-    trt_mem_budget_discharge_va(img->size_of_image);
-    img->base = nullptr;
-  }
+  if (img && be) release_image_mapping(be, img);
   return code;
 }
 
@@ -951,12 +993,15 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
                (unsigned long long)index_rva, tf->zero_fill,
                (unsigned long long)block_size);
       logf_be(be, probe);
-      if (index_rva + 4 <= size_of_image && block_size > 0) {
+      const bool raw_in_image = !raw_size ||
+          (raw_start_rva < size_of_image && raw_size <= size_of_image - raw_start_rva);
+      if (index_rva <= size_of_image - 4 && raw_in_image && block_size > 0) {
         u32 tls_index = 0;
         const u8* raw_ptr = raw_size ? (img.base + raw_start_rva) : nullptr;
         if (trt_guest_tls_register(raw_ptr, (size_t)raw_size,
                                    (size_t)block_size, &tls_index) == 0) {
           img.guest_teb = ensure_shared_teb();
+          img.tls_template_slot = tls_index + 1;
           *(u32*)(img.base + index_rva) = tls_index;
           char tline[160];
           snprintf(tline, sizeof(tline),
@@ -1610,18 +1655,15 @@ extern "C" int trt_seal_image(const trt_backend* be, trt_image* img) {
   // ---- unwind registration: the OS unwinder cannot see VirtualAlloc'd code
   // until its .pdata is registered. Without this, the FIRST guest C++
   // exception kills the whole process. This is boot-critical, not optional.
-  const trt_data_directory* ex =
-      trt_pe_directories(&nt->optional_header, magic) + TRT_PE_DIR_EXCEPTION;
-  if (ex->virtual_address && ex->size && be->register_unwind) {
-    const u32 count = ex->size / 12;  // RUNTIME_FUNCTION = 12 bytes (3 x u32)
-    const int rc = be->register_unwind(img->base, img->base + ex->virtual_address,
-                                       count);
+  if (img->pdata && img->pdata_count && be->register_unwind && !img->unwind_registered) {
+    const int rc = be->register_unwind(img->base, img->pdata, img->pdata_count);
+    img->unwind_registered = rc == 0;
     char line[128];
     snprintf(line, sizeof(line),
              "trt: unwind .pdata registered funcs=%u rc=%d (RtlAddFunctionTable)",
-             count, rc);
+             img->pdata_count, rc);
     logf_be(be, line);
-  } else if (ex->virtual_address && ex->size) {
+  } else if (img->pdata && img->pdata_count && !be->register_unwind) {
     logf_be(be, "trt: NOTE .pdata present but backend cannot register unwind "
                "(exceptions in guest code will be fatal)");
   }
@@ -1630,13 +1672,7 @@ extern "C" int trt_seal_image(const trt_backend* be, trt_image* img) {
 
 extern "C" void trt_unmap(const trt_backend* be, trt_image* img) {
   if (!be || !img) return;
-  if (img->base) {
-    if (img->is_pe32) pe32_guest_release_by_host(img->base);
-    be->release(img->base, (size_t)img->size_of_image);
-    trt_mem_budget_discharge_commit(img->size_of_image);
-    trt_mem_budget_discharge_va(img->size_of_image);
-  }
-  free(img);
+  if (release_image_mapping(be, img)) free(img);
 }
 
 // ---------------------------------------------------------------------------
