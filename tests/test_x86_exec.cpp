@@ -905,6 +905,59 @@ int main() {
         x86_mem_free(&c);
     }
 
+    printf("== x86: byte operands respect displacement and high registers ==\n");
+    {
+        const uint8_t bytes[] = {
+            0xB8, 0x00, 0x9A, 0x00, 0x00,     // mov eax,0x9a00
+            0xBB, 0x00, 0x10, 0x01, 0x00,     // mov ebx,0x11000
+            0x88, 0x63, 0x01,                 // mov [ebx+1],ah
+            0x80, 0x7B, 0x01, 0x9A,           // cmp byte [ebx+1],0x9a
+            0x0F, 0x94, 0xC2,                 // setz dl
+            0xF4
+        };
+        x86_context c = {};
+        run_prog(&c, bytes, sizeof(bytes), 0, 64);
+        CHECK(c.execution == X86_EXEC_OK && c.regs.edx == 1 &&
+                  x86_mem_read8(&c, 0x11001) == 0x9A,
+              "byte immediates come after address bytes and MOV can read AH");
+        x86_mem_free(&c);
+    }
+
+    printf("== x86: word MOV preserves adjacent bytes and upper register bits ==\n");
+    {
+        const uint8_t bytes[] = {
+            0xBB, 0x00, 0x10, 0x01, 0x00,           // mov ebx,0x11000
+            0xB8, 0xCD, 0xAB, 0x22, 0x11,           // mov eax,0x1122abcd
+            0xB9, 0x00, 0x00, 0x44, 0x33,           // mov ecx,0x33440000
+            0x66, 0x89, 0x43, 0x01,                 // mov [ebx+1],ax
+            0x66, 0x8B, 0x4B, 0x01,                 // mov cx,[ebx+1]
+            0xF4
+        };
+        x86_context c = {};
+        run_prog(&c, bytes, sizeof(bytes), 0, 64);
+        CHECK(c.execution == X86_EXEC_OK && c.regs.ecx == 0x3344ABCD &&
+                  x86_mem_read32(&c, 0x11000) == 0x00ABCD00,
+              "16-bit register and memory operands are not widened");
+        x86_mem_free(&c);
+    }
+
+    printf("== x86: word CMP and TEST ignore upper register bits ==\n");
+    {
+        const uint8_t bytes[] = {
+            0xB8, 0x00, 0x00, 0x22, 0x11,           // mov eax,0x11220000
+            0x66, 0x3B, 0xC2,                       // cmp ax,dx (dx is zero)
+            0x0F, 0x94, 0xC1,                       // setz cl
+            0x66, 0x85, 0xC0,                       // test ax,ax
+            0x0F, 0x94, 0xC5,                       // setz ch
+            0xF4
+        };
+        x86_context c = {};
+        run_prog(&c, bytes, sizeof(bytes), 0, 64);
+        CHECK(c.execution == X86_EXEC_OK && c.regs.ecx == 0x101,
+              "word comparisons can recognize the null terminator in a wide string");
+        x86_mem_free(&c);
+    }
+
     printf("== x86: PE32 static TLS and process-attach callbacks ==\n");
     {
         uint8_t bytes[64]{};

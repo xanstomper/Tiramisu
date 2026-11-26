@@ -164,18 +164,18 @@ int crash_report_trim(const std::string& local_state, int keep) {
   return removed;
 }
 
-bool launch_checkpoint_write(const std::string& local_state,
-                             const launch_checkpoint& report) noexcept {
+static bool write_checkpoint(const std::string& local_state, const char* filename,
+                             const launch_checkpoint& report,
+                             std::atomic_flag& writer) noexcept {
   // A fatal error may interrupt a normal checkpoint write. Keep the last
   // complete checkpoint readable and avoid blocking the exception handler.
-  static std::atomic_flag writer = ATOMIC_FLAG_INIT;
   if (local_state.empty() || writer.test_and_set()) return false;
   struct release_writer {
     std::atomic_flag& value;
     ~release_writer() { value.clear(); }
   } release{writer};
   try {
-    const std::string path = local_state + k_sep + "launch-checkpoint.bin";
+    const std::string path = local_state + k_sep + filename;
     const std::string temporary = path + ".tmp";
     FILE* file = fopen(temporary.c_str(), "wb");
     if (!file) return false;
@@ -196,11 +196,11 @@ bool launch_checkpoint_write(const std::string& local_state,
   return false;
 }
 
-bool launch_checkpoint_read(const std::string& local_state,
+static bool read_checkpoint(const std::string& local_state, const char* filename,
                             launch_checkpoint* report) noexcept {
   if (local_state.empty() || !report) return false;
   try {
-    const std::string path = local_state + k_sep + "launch-checkpoint.bin";
+    const std::string path = local_state + k_sep + filename;
     FILE* file = fopen(path.c_str(), "rb");
     if (!file) return false;
     uint32_t fields[4]{};
@@ -216,6 +216,28 @@ bool launch_checkpoint_read(const std::string& local_state,
   } catch (...) {
     return false;
   }
+}
+
+bool launch_checkpoint_write(const std::string& local_state,
+                             const launch_checkpoint& report) noexcept {
+  static std::atomic_flag writer = ATOMIC_FLAG_INIT;
+  return write_checkpoint(local_state, "launch-checkpoint.bin", report, writer);
+}
+
+bool launch_checkpoint_read(const std::string& local_state,
+                            launch_checkpoint* report) noexcept {
+  return read_checkpoint(local_state, "launch-checkpoint.bin", report);
+}
+
+bool launch_worker_fault_write(const std::string& local_state,
+                               const launch_checkpoint& report) noexcept {
+  static std::atomic_flag writer = ATOMIC_FLAG_INIT;
+  return write_checkpoint(local_state, "launch-worker-fault.bin", report, writer);
+}
+
+bool launch_worker_fault_read(const std::string& local_state,
+                              launch_checkpoint* report) noexcept {
+  return read_checkpoint(local_state, "launch-worker-fault.bin", report);
 }
 
 }  // namespace longan

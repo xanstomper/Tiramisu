@@ -160,10 +160,11 @@ static bool post_pointer_locked(u32 message, u32 change = 0, i32 wheel = 0) {
   const u32 high = message == k_pointer_wheel ? static_cast<u16>(wheel) : flags;
   const i64 pos = static_cast<i64>((static_cast<u32>(g.my) << 16) |
                                    (static_cast<u32>(g.mx) & 0xFFFFu));
-  const trt_msg msg{message, (high << 16) | 1u, pos, flags, change};
+  const trt_msg msg{message, (high << 16) | 1u, pos, flags, change, 0};
   if (message == k_pointer_update && !change && g.ring_count && !g.mouse_pointer_new) {
     auto& last = g.ring[(g.ring_head + g.ring_count - 1) % TRT_MSG_RING];
-    if (last.message == k_pointer_update && !last.pointer_change && last.pointer_flags == flags) {
+    if (last.message == k_pointer_update && !last.target_window &&
+        !last.pointer_change && last.pointer_flags == flags) {
       last = msg;
       return true;
     }
@@ -865,12 +866,12 @@ u32 trt_raw_read_buffer(void* out, u32* size) {
 unsigned long g_msg_dispatched_count = 0;  // STAGE 7 pump-dispatch counter
 unsigned trt_msg_dispatched(void);         // (definition below, in trt.h ABI)
 
-bool trt_msg_post(u32 message, u64 wparam, i64 lparam) {
+bool trt_msg_post_to(u64 target_window, u32 message, u64 wparam, i64 lparam) {
   std::lock_guard<std::recursive_mutex> lk(g_input_mu);
   if (message == 0x0200u && g.ring_count) {
     auto& last = g.ring[(g.ring_head + g.ring_count - 1) % TRT_MSG_RING];
-    if (last.message == message) {
-      last = {message, wparam, lparam, 0, 0};
+    if (last.message == message && last.target_window == target_window) {
+      last = {message, wparam, lparam, 0, 0, target_window};
       return true;
     }
   }
@@ -887,7 +888,7 @@ bool trt_msg_post(u32 message, u64 wparam, i64 lparam) {
     return false;
   }
   const int tail = (g.ring_head + g.ring_count) % TRT_MSG_RING;
-  g.ring[tail] = trt_msg{message, wparam, lparam, 0, 0};
+  g.ring[tail] = trt_msg{message, wparam, lparam, 0, 0, target_window};
   ++g.ring_count;
   if (message == 0x0100u || message == 0x0101u || message == 0x0010u ||
       message == 0x0012u) {
@@ -902,6 +903,10 @@ bool trt_msg_post(u32 message, u64 wparam, i64 lparam) {
     }
   }
   return true;
+}
+
+bool trt_msg_post(u32 message, u64 wparam, i64 lparam) {
+  return trt_msg_post_to(0, message, wparam, lparam);
 }
 
 bool trt_msg_peek_range(trt_msg* out, u32 minimum, u32 maximum, bool remove) {

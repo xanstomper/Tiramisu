@@ -66,7 +66,7 @@ static i64 GSTD wndproc(void* hwnd, u32 msg, u64 wp, i64 lp) {
   }
   g_wndproc_calls++;
   g_last_msg = msg;
-  return 0;
+  return msg == 0x0081u /*WM_NCCREATE*/ ? 1 : 0;
 }
 
 // winuser MSG (x64): hwnd, message, pad, wParam, lParam, time, pt = 48

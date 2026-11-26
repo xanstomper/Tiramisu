@@ -11,7 +11,6 @@ on top of the global settings. Missing keys fall back to the global settings.
 # All keys are optional; only listed keys override global settings.
 
 # ---- input ----
-default_input=controller    # auto | controller | kbm | pad2kbm
 mouse_speed=75
 wheel_speed=40
 input_deadzone=10
@@ -41,6 +40,13 @@ args=-windowed -novid
 appid=0                    # Steam app ID (0 = none)
 ```
 
+## Input
+
+Choose the input preference once in Tiramisu Settings. Auto passes connected
+devices through. Controller makes a keyboard-backed gamepad available when
+no physical controller is connected. Existing explicit input overrides from
+the library or dashboard still take precedence over the global preference.
+
 ## How it works
 
 1. Host loads global settings from `LocalState/settings.ini`
@@ -53,7 +59,6 @@ appid=0                    # Steam app ID (0 = none)
 
 ### Ultra Pool
 ```ini
-default_input=controller
 frame_rate_cap=60
 resolution_scale=100
 texture_quality=2
@@ -61,7 +66,6 @@ texture_quality=2
 
 ### RACCOIN
 ```ini
-default_input=controller
 frame_rate_cap=60
 memory_budget_mb=4096
 os_build=19045

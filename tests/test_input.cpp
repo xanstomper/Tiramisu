@@ -20,6 +20,7 @@ void* TRT_STDCALL trt_CreateWindowExW(u32, const wchar_t*, const wchar_t*, u32,
 void* TRT_STDCALL trt_SetFocus(void*);
 void* TRT_STDCALL trt_GetFocus(void);
 int TRT_STDCALL trt_ShowWindow(void*, int);
+int TRT_STDCALL trt_PostMessageW(void*, u32, u64, i64);
 int TRT_STDCALL trt_RegisterRawInputDevices(const void*, u32, u32);
 u32 TRT_STDCALL trt_GetRawInputData(void*, u32, void*, u32*, u32);
 u32 TRT_STDCALL trt_GetRawInputBuffer(void*, u32*, u32);
@@ -58,8 +59,17 @@ int failures = 0;
 struct focus_notification { u64 window; u32 message; u64 other; i64 reserved; };
 static focus_notification focus_events[8];
 static unsigned focus_event_count = 0;
+static u64 created_window[8]{};
+static unsigned created_window_count = 0;
+static u32 rejected_window_message = 0;
+
 
 static i64 TRT_STDCALL focus_window_proc(u64 window, u32 message, u64 other, i64 reserved) {
+  if (message == 0x81u && rejected_window_message == message) return 0;
+  if (message == 1) {
+    if (rejected_window_message == message) return -1;
+    if (created_window_count < 8) created_window[created_window_count++] = window;
+  }
   if ((message == 7 || message == 8) && focus_event_count < 8)
     focus_events[focus_event_count++] = {window, message, other, reserved};
   return message == 0x81;
@@ -598,6 +608,38 @@ int main() {
           "showing a top-level window with activation focuses it");
     focus_event_count = 0;
     CHECK(first && second && first != second, "created distinct guest windows");
+    struct {
+      u64 window;
+      u32 message;
+      u32 padding;
+      u64 wp;
+      i64 lp;
+      u32 time;
+      i32 point[2];
+    } queued{};
+    CHECK(created_window_count == 4 &&
+              created_window[0] == reinterpret_cast<u64>(first) &&
+              created_window[3] == reinterpret_cast<u64>(second),
+          "CreateWindowEx sends WM_CREATE synchronously even without creation data");
+    CHECK(!trt_PeekMessageW(&queued, nullptr, 1, 1, 1),
+          "registered windows receive no duplicate queued WM_CREATE");
+    rejected_window_message = 0x81u;
+    CHECK(!trt_CreateWindowExW(0, cls.name, nullptr, visible, 0, 0, 640, 480,
+                               nullptr, nullptr, nullptr, nullptr) && trt_GetFocus() == second,
+          "WM_NCCREATE can reject a window without taking focus");
+    rejected_window_message = 1;
+    CHECK(!trt_CreateWindowExW(0, cls.name, nullptr, visible, 0, 0, 640, 480,
+                               nullptr, nullptr, nullptr, nullptr) && trt_GetFocus() == second,
+          "WM_CREATE returning minus one aborts window creation");
+    rejected_window_message = 0;
+    CHECK(trt_PostMessageW(first, 0x0401u, 42, 0) &&
+              trt_PeekMessageW(&queued, nullptr, 0x0401u, 0x0401u, 1) &&
+              queued.window == reinterpret_cast<u64>(first) && queued.wp == 42,
+          "PostMessage delivers to the specified window despite a different focus");
+    CHECK(trt_PostMessageW(nullptr, 0x0402u, 0, 0) &&
+              trt_PeekMessageW(&queued, nullptr, 0x0402u, 0x0402u, 1) &&
+              queued.window == 0,
+          "PostMessage with a null window stays a thread message");
     CHECK(trt_SetFocus(first) == second && trt_GetFocus() == first,
           "SetFocus returns the previous window and updates the new focus");
     CHECK(focus_event_count == 2 &&

@@ -54,6 +54,10 @@ bool launch_checkpoint_write(const std::string& local_state,
                              const launch_checkpoint& report) noexcept;
 bool launch_checkpoint_read(const std::string& local_state,
                             launch_checkpoint* report) noexcept;
+bool launch_worker_fault_write(const std::string& local_state,
+                               const launch_checkpoint& report) noexcept;
+bool launch_worker_fault_read(const std::string& local_state,
+                              launch_checkpoint* report) noexcept;
 
 }  // namespace longan
 

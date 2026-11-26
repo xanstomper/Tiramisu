@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 extern "C" {
@@ -59,6 +60,7 @@ int TRT_STDCALL trt_GetClientRect(void*, void*);
 void* TRT_STDCALL trt_CreateFileW(const u16*, u32, u32, void*, u32, u32, void*);
 int TRT_STDCALL trt_WriteFile(void*, const void*, u32, u32*, void*);
 int TRT_STDCALL trt_CloseHandle(void*);
+int TRT_STDCALL trt_TerminateProcess(void*, u32);
 void* TRT_GUEST_ABI trt_GetStdHandle(u32);
 int TRT_GUEST_ABI trt_SetStdHandle(u32, void*);
 int TRT_GUEST_ABI trt_GetConsoleMode(void*, u32*);
@@ -318,6 +320,28 @@ int main(int argc, char** argv) {
   CHECK(ret & 0x40u, "CreateThread started a real worker thread");
   CHECK(ret & 0x80u, "the worker ran and WaitForSingleObject returned");
   CHECK(ret & 0x100u, "SetEvent/ResetEvent worked");
+  {
+    const pid_t child = fork();
+    if (!child) {
+      trt_SetLastError(0);
+      if (trt_TerminateProcess(nullptr, 73) || trt_GetLastError() != 6) _exit(1);
+      _exit(trt_TerminateProcess(reinterpret_cast<void*>(0x1234), 73) == 0 &&
+                    trt_GetLastError() == 6 ? 0 : 1);
+    }
+    int status = 0;
+    CHECK(child > 0 && waitpid(child, &status, 0) == child &&
+              WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "TerminateProcess rejects invalid handles without exiting the runtime");
+    const pid_t self_exit = fork();
+    if (!self_exit) {
+      trt_TerminateProcess(reinterpret_cast<void*>(uintptr_t(-1)), 73);
+      _exit(1);
+    }
+    CHECK(self_exit > 0 && waitpid(self_exit, &status, 0) == self_exit &&
+              WIFEXITED(status) && WEXITSTATUS(status) == 73,
+          "TerminateProcess still honors a valid current-process request");
+  }
+
   {
     constexpr u64 invalid_handle = 0x1234u;
     trt_sync_reset_launch_stats();

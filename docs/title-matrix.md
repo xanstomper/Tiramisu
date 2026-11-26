@@ -23,8 +23,8 @@ thinking).
 |---|---|---|---|---|---|---|---|---|
 | RACCOIN | Unity 6 IL2CPP, D3D11, Steam | PE32+ x64 | yes | yes | not measured | on-console pad | **yes** — menu + a full run (Round 8/15) | `docs/proof/raccoin-main-menu.png`, `docs/proof/raccoin-gameplay.png`, `docs/proof/raccoin-gameplay.mp4` |
 | Celeste v1.4.0.0 | XNA/Mono (FNA3D), managed .NET | PE32+ x64 + embedded Mono | yes | yes | **silent** — FSB5 Vorbis decode is disabled on console after it heap-corrupted | on-console pad | **yes** — title, menu, Chapter 1 gameplay | `docs/proof/celeste-title.jpg`, `docs/proof/celeste-menu.jpg`, `docs/proof/celeste-gameplay.mp4` |
-| Cuphead | Unity, D3D11 | PE32+ x64 | yes — guest GPU work verified | **no visible game frame** — dark guest framebuffer on 0.2.4.38 | not measured | game response unverified | **no** — menu unreached | `docs/proof/xbox-series-s-2026-11-26-launch-check.json` |
-| Sekiro | Windows PC | PE32+ x64 | guest entry invoked on 0.2.4.38 | **no** — process exits before D3D11 initialization | not measured | not reached | **no** — menu unreached | `docs/proof/xbox-series-s-2026-11-26-launch-check.json` |
+| Cuphead | Unity, D3D11 | PE32+ x64 | yes — guest GPU work verified | **no visible game frame** — dark guest framebuffer on 0.2.4.47 | not measured | game response unverified | **no** — menu unreached | `docs/proof/xbox-series-s-2026-11-26-launch-check.json` |
+| Sekiro | Windows PC | PE32+ x64 | guest entry invoked on 0.2.4.47 | **no** — process exits before D3D11 initialization | not measured | not reached | **no** — menu unreached | `docs/proof/xbox-series-s-2026-11-26-launch-check.json` |
 | God of War (PC) | AAA in-house engine, D3D11 | PE32+ x64 | yes | **yes** — opening forest across four boots | not measured | not reached | **no** — renders, does not yet reach gameplay | `docs/proof/gow-forest-01.webp`, `docs/proof/gow-forest-02.webp`, `docs/proof/gow-forest-03.webp`, `docs/proof/gow-forest-04.webp` |
 <!-- title-matrix:measured:end -->
 

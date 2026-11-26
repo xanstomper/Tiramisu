@@ -105,10 +105,8 @@ SKIP_BUILD=1 tools/edge-spoof.sh out_mousefix
 # prints the deploy command with the Edge PFN package + edge-dev.cer
 ```
 
-A mouse attached after launch is picked up by the host loop: GameInput device
-status or a fresh CoreWindow pointer event flips `g_host_mouse_present`, and an
-auto-selected pad-as-mouse cursor is released (`hardware mouse active ->
-pad-as-mouse OFF`) so the physical device drives the cursor immediately.
+Tiramisu can pick up a mouse attached after launch. Physical pointer input
+uses the same guest input bridge as a mouse present at startup.
 
 On a previously tested Series S, the Edge-identity package received physical
 mouse input (console log: `keyboard=1 mouse=1`, `PointerDevices count=1`,
@@ -169,14 +167,10 @@ What the host does instead, and what was fixed for it:
   (L/R/M) used to be confined to the launcher; it now feeds the guest during
   play too, and yields for 500 ms after any real CoreWindow pointer event so the
   two absolute sources never fight over a frame.
-- **A pad-driven pointer is selected automatically when the shell presents no
-  mouse.** The boot probe logs `input: Xbox device query keyboard=… mouse=…`; if
-  `MouseCapabilities()` reports no mouse, a title launched in `auto` input mode
-  starts with pad-as-mouse on (`input: auto input mode, no hardware pointer ->
-  pad-as-mouse ON for this launch`) instead of starting with a dead cursor.
-  `default_input=pad2kbm` or `F1` selects it explicitly; `F8` is the
-  keyboard-driven cursor.
-
+- **Auto exposes connected devices.** Choose Controller under Default input
+  mode to use a keyboard-backed gamepad when there is no physical controller.
+  Choose Pad as mouse, press F1, or click the right stick to drive the pointer
+  with a controller. F8 enables the keyboard-driven cursor.
 The spoof above remains the only path to actual hardware mouse on the console.
 It ships as the KBM edition (`tools/edge-spoof.sh` / `tools/release.sh`), but its
 premise is still unverified on real hardware — check the host log for `physical

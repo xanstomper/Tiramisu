@@ -1914,9 +1914,7 @@ int x86_step(x86_context* ctx) {
             int cc = op2 - 0x90;
             uint8_t val = x86_condition(ctx->regs.eflags, cc) ? 1 : 0;
             if (modrm_mod(modrm) == 3) {
-                // Write to low byte of register
-                uint32_t* reg = x86_reg_ptr(ctx, modrm_rm(modrm));
-                *reg = (*reg & 0xFFFFFF00) | val;
+                *r8p(ctx, modrm_rm(modrm)) = val;
             } else {
                 int consumed = 0;
                 uint32_t addr = calc_ea(ctx, modrm, &consumed);
@@ -2138,62 +2136,35 @@ int x86_step(x86_context* ctx) {
         return -1;
     }
 
-    // ---- MOV r32, r/m32 (0x8B) ----
-    if (op == 0x8B) {
-        uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
-        if (modrm_mod(modrm) == 3) {
-            *x86_reg_ptr(ctx, modrm_reg(modrm)) = *x86_reg_ptr(ctx, modrm_rm(modrm));
-        } else {
+    // MOV r/m,register and MOV register,r/m (88..8B).
+    if (op >= 0x88 && op <= 0x8B) {
+        const uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
+        const int rm = modrm_rm(modrm), reg = modrm_reg(modrm);
+        const bool byte = !(op & 1);
+        const bool word = !byte && operand_size == 16;
+        const bool to_reg = (op & 2) != 0;
+        const bool rm_is_register = modrm_mod(modrm) == 3;
+        uint32_t address = 0;
+        if (!rm_is_register) {
             int consumed = 0;
-            uint32_t addr = calc_ea(ctx, modrm, &consumed);
+            address = calc_ea(ctx, modrm, &consumed);
             ctx->regs.eip += consumed - 1;
-            *x86_reg_ptr(ctx, modrm_reg(modrm)) = x86_mem_read32(ctx, addr);
         }
-        return 0;
-    }
-
-    // ---- MOV r/m32, r32 (0x89) ----
-    if (op == 0x89) {
-        uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
-        if (modrm_mod(modrm) == 3) {
-            *x86_reg_ptr(ctx, modrm_rm(modrm)) = *x86_reg_ptr(ctx, modrm_reg(modrm));
-        } else {
-            int consumed = 0;
-            uint32_t addr = calc_ea(ctx, modrm, &consumed);
-            ctx->regs.eip += consumed - 1;
-            x86_mem_write32(ctx, addr, *x86_reg_ptr(ctx, modrm_reg(modrm)));
-        }
-        return 0;
-    }
-
-    // ---- MOV r/m8, r8 (0x88) ----
-    if (op == 0x88) {
-        uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
-        uint8_t val = (uint8_t)(*x86_reg_ptr(ctx, modrm_reg(modrm)) & 0xFF);
-        if (modrm_mod(modrm) == 3) {
-            *x86_reg_ptr(ctx, modrm_rm(modrm)) = (*x86_reg_ptr(ctx, modrm_rm(modrm)) & 0xFFFFFF00) | val;
-        } else {
-            int consumed = 0;
-            uint32_t addr = calc_ea(ctx, modrm, &consumed);
-            ctx->regs.eip += consumed - 1;
-            x86_mem_write8(ctx, addr, val);
-        }
-        return 0;
-    }
-
-    // ---- MOV r8, r/m8 (0x8A) ----
-    if (op == 0x8A) {
-        uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
-        uint8_t val;
-        if (modrm_mod(modrm) == 3) {
-            val = (uint8_t)(*x86_reg_ptr(ctx, modrm_rm(modrm)) & 0xFF);
-        } else {
-            int consumed = 0;
-            uint32_t addr = calc_ea(ctx, modrm, &consumed);
-            ctx->regs.eip += consumed - 1;
-            val = x86_mem_read8(ctx, addr);
-        }
-        *x86_reg_ptr(ctx, modrm_reg(modrm)) = (*x86_reg_ptr(ctx, modrm_reg(modrm)) & 0xFFFFFF00) | val;
+        const int src = to_reg ? rm : reg;
+        const uint32_t value = to_reg && !rm_is_register
+            ? byte ? x86_mem_read8(ctx, address)
+                   : word ? x86_mem_read16(ctx, address) : x86_mem_read32(ctx, address)
+            : byte ? *r8p(ctx, src) : *x86_reg_ptr(ctx, src);
+        if (to_reg || rm_is_register) {
+            const int dest = to_reg ? reg : rm;
+            if (byte) *r8p(ctx, dest) = uint8_t(value);
+            else {
+                auto* target = x86_reg_ptr(ctx, dest);
+                *target = word ? (*target & 0xFFFF0000u) | uint16_t(value) : value;
+            }
+        } else if (byte) x86_mem_write8(ctx, address, uint8_t(value));
+        else if (word) x86_mem_write16(ctx, address, uint16_t(value));
+        else x86_mem_write32(ctx, address, value);
         return 0;
     }
 
@@ -2201,14 +2172,19 @@ int x86_step(x86_context* ctx) {
     // Absolute-addressed forms the compiler emits for globals: OpenTTD's CRT
     // entry hits 0xA1 (`mov eax, ds:0x11bacc0`) right after the QPC probe.
     if (op >= 0xA0 && op <= 0xA3) {
-        uint32_t addr = read_imm32(ctx);
+        uint32_t addr = addr_size == 16 ? read_imm16(ctx) : read_imm32(ctx);
+        if (g_seg_override == 4) addr += ctx->regs.fs_base;
         if (op == 0xA0) {
             uint32_t v = x86_mem_read8(ctx, addr);
             ctx->regs.eax = (ctx->regs.eax & 0xFFFFFF00) | v;
         } else if (op == 0xA1) {
-            ctx->regs.eax = x86_mem_read32(ctx, addr);
+            ctx->regs.eax = operand_size == 16
+                ? (ctx->regs.eax & 0xFFFF0000u) | x86_mem_read16(ctx, addr)
+                : x86_mem_read32(ctx, addr);
         } else if (op == 0xA2) {
             x86_mem_write8(ctx, addr, (uint8_t)(ctx->regs.eax & 0xFF));
+        } else if (operand_size == 16) {
+            x86_mem_write16(ctx, addr, uint16_t(ctx->regs.eax));
         } else {
             x86_mem_write32(ctx, addr, ctx->regs.eax);
         }
@@ -2384,37 +2360,29 @@ int x86_step(x86_context* ctx) {
         return 0;
     }
 
-    // ---- CMP r/m32, r32 (0x39) ----
-    if (op == 0x39) {
-        uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
-        uint32_t src = *x86_reg_ptr(ctx, modrm_reg(modrm));
-        uint32_t dst;
+    // CMP r/m,reg and CMP reg,r/m (39/3B). Only the selected width
+    // contributes to flag state, even when stale bits remain above AX.
+    if (op == 0x39 || op == 0x3B) {
+        const uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
+        const bool word = operand_size == 16;
+        const uint32_t reg = *x86_reg_ptr(ctx, modrm_reg(modrm));
+        uint32_t rm;
         if (modrm_mod(modrm) == 3) {
-            dst = *x86_reg_ptr(ctx, modrm_rm(modrm));
+            rm = *x86_reg_ptr(ctx, modrm_rm(modrm));
         } else {
             int consumed = 0;
-            uint32_t addr = calc_ea(ctx, modrm, &consumed);
+            const uint32_t addr = calc_ea(ctx, modrm, &consumed);
             ctx->regs.eip += consumed - 1;
-            dst = x86_mem_read32(ctx, addr);
+            rm = word ? x86_mem_read16(ctx, addr) : x86_mem_read32(ctx, addr);
         }
-        x86_update_flags_sub(ctx, dst, src, dst - src);
-        return 0;
-    }
-
-    // ---- CMP r32, r/m32 (0x3B) ----
-    if (op == 0x3B) {
-        uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
-        uint32_t src;
-        if (modrm_mod(modrm) == 3) {
-            src = *x86_reg_ptr(ctx, modrm_rm(modrm));
+        const uint32_t lhs = op == 0x3B ? reg : rm;
+        const uint32_t rhs = op == 0x3B ? rm : reg;
+        if (word) {
+            ctx->regs.eflags &= ~X86_CF; // CMP subtracts without an incoming borrow
+            alu_with_carry(ctx, lhs, rhs, 16, true);
         } else {
-            int consumed = 0;
-            uint32_t addr = calc_ea(ctx, modrm, &consumed);
-            ctx->regs.eip += consumed - 1;
-            src = x86_mem_read32(ctx, addr);
+            x86_update_flags_sub(ctx, lhs, rhs, lhs - rhs);
         }
-        uint32_t dst = *x86_reg_ptr(ctx, modrm_reg(modrm));
-        x86_update_flags_sub(ctx, dst, src, dst - src);
         return 0;
     }
 
@@ -2545,6 +2513,7 @@ int x86_step(x86_context* ctx) {
     if (op == 0x85) {
         uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
         uint32_t src = *x86_reg_ptr(ctx, modrm_reg(modrm));
+        const bool word = operand_size == 16;
         uint32_t dst;
         if (modrm_mod(modrm) == 3) {
             dst = *x86_reg_ptr(ctx, modrm_rm(modrm));
@@ -2552,9 +2521,11 @@ int x86_step(x86_context* ctx) {
             int consumed = 0;
             uint32_t addr = calc_ea(ctx, modrm, &consumed);
             ctx->regs.eip += consumed - 1;
-            dst = x86_mem_read32(ctx, addr);
+            dst = word ? x86_mem_read16(ctx, addr) : x86_mem_read32(ctx, addr);
         }
-        x86_update_flags_logic(ctx, dst & src);
+        const uint32_t result = (dst & src) & (word ? 0xFFFFu : 0xFFFFFFFFu);
+        x86_update_flags_logic(ctx, result);
+        if (word && (result & 0x8000)) ctx->regs.eflags |= X86_SF;
         ctx->regs.eflags &= ~X86_CF;
         ctx->regs.eflags &= ~X86_OF;
         return 0;
@@ -3476,7 +3447,7 @@ int x86_step(x86_context* ctx) {
             uint32_t daddr = 0;
             if (is_reg) dptr = r8p(ctx, modrm_rm(modrm));
             else { int c = 0; daddr = calc_ea(ctx, modrm, &c); ctx->regs.eip += c - 1; }
-            uint8_t srcv = is_reg ? *r8p(ctx, modrm_reg(modrm)) : 0;
+            uint8_t srcv = *r8p(ctx, modrm_reg(modrm));
             uint8_t dstv = is_reg ? *dptr : x86_mem_read8(ctx, daddr);
             if (form == 2) { // r8 <- r/m8: operands swap
                 uint8_t t = dstv; dstv = srcv; srcv = t;
@@ -3547,11 +3518,11 @@ int x86_step(x86_context* ctx) {
     if (op == 0x80) {
         uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
         int ext = modrm_reg(modrm);
-        uint8_t imm = x86_mem_read8(ctx, ctx->regs.eip++);
         int is_reg = (modrm_mod(modrm) == 3);
         uint8_t* p = is_reg ? r8p(ctx, modrm_rm(modrm)) : nullptr;
         uint32_t ad = 0;
         if (!is_reg) { int c = 0; ad = calc_ea(ctx, modrm, &c); ctx->regs.eip += c - 1; }
+        const uint8_t imm = read_imm8(ctx);
         uint8_t a = is_reg ? *p : x86_mem_read8(ctx, ad);
         unsigned r;
         switch (ext) {
@@ -3922,7 +3893,8 @@ static bool install_main_tls(x86_context* ctx, const trt_image& image) {
     if (!image.tls_data_rva && !image.tls_index_rva && !image.tls_zero_fill)
         return true;
     const uint64_t size = uint64_t(image.tls_data_size) + image.tls_zero_fill;
-    if (size > UINT32_MAX || uint64_t(image.tls_index_rva) + 4 > ctx->image_size ||
+    if (!image.tls_index_rva || size > UINT32_MAX ||
+        uint64_t(image.tls_index_rva) + 4 > ctx->image_size ||
         uint64_t(image.tls_data_rva) + image.tls_data_size > ctx->image_size) return false;
     const uint32_t block = x86_guest_alloc(ctx, size ? uint32_t(size) : 1, 1);
     if (!block) return false;

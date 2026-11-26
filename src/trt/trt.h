@@ -425,6 +425,8 @@ typedef struct trt_sync_launch_stats {
   u32 wait_completed, wait_timed_out, wait_failed;
   u32 event_signaled, event_failed;
 } trt_sync_launch_stats;
+typedef void (*trt_guest_worker_fault_fn)(u32 code);
+void trt_set_guest_worker_fault_reporter(trt_guest_worker_fault_fn reporter);
 void trt_sync_reset_launch_stats(void);
 void trt_sync_get_launch_stats(trt_sync_launch_stats* stats);
 u32 gap_trace_launch_tail(trt_launch_api_entry* entries, u32 capacity, u64* calls);

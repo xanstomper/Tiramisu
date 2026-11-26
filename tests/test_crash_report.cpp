@@ -66,6 +66,23 @@ int main() {
             checkpoint.outcome == launch_outcome::host_fault &&
             checkpoint.code == 0xc0000005u,
         "recover the fault code and stage without reading the private bundle");
+  launch_checkpoint worker{};
+  CHECK(!longan::launch_worker_fault_read(local_state, &worker),
+        "no guest worker fault is reported before launch");
+  CHECK(longan::launch_worker_fault_write(local_state,
+        {launch_phase::native_entry, launch_outcome::guest_fault, 0xc000001du}),
+        "persist a contained guest worker fault");
+  CHECK(longan::launch_worker_fault_read(local_state, &worker) &&
+            worker.phase == launch_phase::native_entry &&
+            worker.outcome == launch_outcome::guest_fault && worker.code == 0xc000001du,
+        "read only the worker fault stage and code after process exit");
+  CHECK(longan::launch_checkpoint_read(local_state, &checkpoint) &&
+            checkpoint.outcome == launch_outcome::host_fault && checkpoint.code == 0xc0000005u,
+        "recording a worker fault preserves the primary launch outcome");
+  CHECK(longan::launch_worker_fault_write(local_state, {}) &&
+            longan::launch_worker_fault_read(local_state, &worker) &&
+            worker.outcome == launch_outcome::none,
+        "starting a new launch clears the previous worker fault");
   const std::string checkpoint_path = local_state + "/launch-checkpoint.bin";
   CHECK(slurp(checkpoint_path).size() == 16, "launch checkpoint stays bounded");
   if (FILE* corrupt = fopen(checkpoint_path.c_str(), "wb")) {

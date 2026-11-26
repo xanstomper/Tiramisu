@@ -477,3 +477,29 @@ Entries are appended as work lands; every claim points at a gate or a file.
   seven Edge manifest tests passed. Both MSIX signatures and the shared
   executable were verified under out/cursor-20261126. The console was not
   updated and physical mouse delivery on this build is unverified.
+
+### 2026-11-26 — Compact cursor, shared input routing, and PE32 startup in 0.2.4.26
+
+- Dashboard, quick menu, and guest overlays use a compact arrow sized
+  from output height. The 1080p target is 18 pixels high.
+- Auto passes real devices through and leaves native controller slot
+  numbers intact. Controller mode maps keyboard input to one virtual
+  gamepad only when no physical controller is present. Pad-as-mouse
+  mode avoids delivering the same controller events as both gamepad and
+  KBM. The preference is global, with existing explicit overrides
+  retained for compatibility.
+- GetProcAddress and dynamic export forwarders refuse synthesized-only
+  exports and preserve actual named and ordinal exports. Existing static
+  import fallback remains available.
+- PE32 main images now receive static TLS data, zero fill, a TLS slot, and
+  process-attach callbacks before entry. Fixed FS absolute addressing
+  and operand widths for several byte and word instructions used by
+  their C runtimes. The original OpenTTD executable advances beyond the
+  prior jump into non-code and into a later startup loop in the tree
+  insertion path, where it reaches the interpreter instruction limit.
+  The final trace is in the compact-input scratch directory under
+  openttd-width.log. No window or gameplay was verified.
+- Passed 97 input checks, the DirectInput guest, 221 x86 checks and 164
+  engine synthesizer checks. Both signed packages in
+  out/compact-input-20261126 contain the same host binary and reuse their
+  respective 0.2.4.25 certificates. No console deployment was performed.

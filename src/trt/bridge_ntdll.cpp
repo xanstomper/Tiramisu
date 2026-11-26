@@ -649,8 +649,9 @@ u32 TRT_GUEST_ABI nt_NtTerminateProcess(void* proc, u32 code) {
   char line[128];
   snprintf(line, sizeof(line), "ntdll: NtTerminateProcess(proc=%p code=0x%08x) called", proc, code);
   trt_core_log(line);
-  if (!proc || proc == (void*)-1) {
-    trt_TerminateProcess(proc, code);
+  // NT permits a null handle for termination of the calling process.
+  if (!proc || proc == (void*)-1 || reinterpret_cast<uintptr_t>(proc) == 0xffffffffu) {
+    trt_TerminateProcess(reinterpret_cast<void*>(uintptr_t(-1)), code);
     return 0;  // unreachable when the terminate path is honest
   }
   trt_core_log("ntdll: NtTerminateProcess foreign handle -> honest fail (no bridge kill)");

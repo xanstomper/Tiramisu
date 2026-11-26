@@ -2435,6 +2435,16 @@ void handle_client(sock_t s) {
   }
 #endif
 #ifdef TIRAMISU_UWP_HOST
+  if (strcmp(method, "GET") == 0 && url_path == "/api/launch-worker-fault") {
+    launch_checkpoint fault{};
+    const bool available = launch_worker_fault_read(g_local_state_dir, &fault) &&
+                           fault.outcome == launch_outcome::guest_fault;
+    char body[128];
+    snprintf(body, sizeof(body), "{\"available\":%s,\"phase\":%u,\"code\":%u}",
+             available ? "true" : "false", static_cast<unsigned>(fault.phase), fault.code);
+    respond(s, "200 OK", "application/json", body);
+    return;
+  }
   if (strcmp(method, "GET") == 0 && url_path == "/api/launch-checkpoint") {
     launch_checkpoint checkpoint{};
     if (!launch_checkpoint_read(g_local_state_dir, &checkpoint)) {
@@ -2471,7 +2481,8 @@ void handle_client(sock_t s) {
     trt_sync_launch_stats sync{};
     trt_sync_get_launch_stats(&sync);
     const auto draw = swapchain_guest_draw_probe();
-    char buf[2048];
+    const auto shader_input = swapchain_guest_shader_input_probe();
+    char buf[2304];
     snprintf(buf, sizeof(buf),
              "{\"d3d11_device_calls\":%u,\"d3d11_swapchains\":%u,"
              "\"d3d11_get_buffer_calls\":%u,\"d3d11_present_calls\":%u,"
@@ -2492,6 +2503,10 @@ void handle_client(sock_t s) {
              "\"surface_other_samples\":%u,\"surface_other_lit_pixels\":%u,"
              "\"surface_other_width\":%u,\"surface_other_height\":%u,"
              "\"surface_other_format\":%u,\"surface_other_result\":%d,"
+             "\"shader_input_snapshots\":%u,\"shader_input_bound_views\":%u,"
+             "\"shader_input_samples\":%u,\"shader_input_lit_pixels\":%u,"
+             "\"shader_input_slot\":%u,\"shader_input_width\":%u,\"shader_input_height\":%u,"
+             "\"shader_input_format\":%u,\"shader_input_result\":%d,"
              "\"sync_wait_completed\":%u,\"sync_wait_timeout\":%u,\"sync_wait_failed\":%u,"
              "\"sync_setevent_signaled\":%u,\"sync_setevent_failed\":%u,"
              "\"guest_commit_mib\":%llu,\"guest_commit_budget_mib\":%u}",
@@ -2509,6 +2524,9 @@ void handle_client(sock_t s) {
              draw.nonempty_draw_samples, draw.guest_rtv_samples, draw.other_rtv_samples,
              draw.other_surface_samples, draw.other_lit_pixels,
              draw.other_width, draw.other_height, draw.other_format, draw.other_surface_result,
+             shader_input.snapshots, shader_input.bound_views, shader_input.samples,
+             shader_input.lit_pixels, shader_input.slot, shader_input.width,
+             shader_input.height, shader_input.format, shader_input.result,
              sync.wait_completed, sync.wait_timed_out, sync.wait_failed,
              sync.event_signaled, sync.event_failed,
              static_cast<unsigned long long>(trt_mem_budget_committed() / 1048576ULL),

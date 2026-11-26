@@ -2231,17 +2231,25 @@ static void log_worker_fault(void* ep_v) {
   } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
+static std::atomic<trt_guest_worker_fault_fn> g_guest_worker_fault_reporter{nullptr};
+
 static int win_thread_seh_filter(void* ep) {
   if (trt_dispatch_win32_exception(ep) == -1) return EXCEPTION_CONTINUE_EXECUTION;
+  const auto* exception = static_cast<const EXCEPTION_POINTERS*>(ep);
+  const auto reporter = g_guest_worker_fault_reporter.load(std::memory_order_acquire);
+  if (reporter && exception && exception->ExceptionRecord)
+    reporter(exception->ExceptionRecord->ExceptionCode);
   log_worker_fault(ep);
   return EXCEPTION_EXECUTE_HANDLER;
 }
 
-static u64 win_call_guest_seh(void* routine, u64 arg, bool* seh_out = nullptr) {
+static u64 win_call_guest_seh(void* routine, u64 arg, bool* seh_out = nullptr,
+                              bool notify_attach = false) {
   // .227 DIAG: seh_out reports whether the __except path fired,
   // so the trampoline can tell routine-return from an SEH fault.
   if (seh_out) *seh_out = false;
   __try {
+    if (notify_attach) trt_images_notify_thread(2 /*DLL_THREAD_ATTACH*/);
     return trt_call_guest(routine, arg, 0, 0, 0);
   } __except (win_thread_seh_filter(GetExceptionInformation())) {
     if (seh_out) *seh_out = true;
@@ -2280,12 +2288,8 @@ DWORD WINAPI win_thread_trampoline(LPVOID raw) {
     }
   }
   trt_guest_tls_sync_thread();
-  trt_images_notify_thread(2 /*DLL_THREAD_ATTACH*/);
   {
-    // .203 diagnostic: did the worker reach its guest routine? (First 32.)
-    // Separates "blocked in DllMain/TLS notify" from "blocked inside the
-    // guest routine on a bridge primitive". The [tid=] prefix (trt_core_log)
-    // identifies the thread; the routine address identifies the worker.
+    // .203 diagnostic: entry into protected guest startup. (First 32.)
     static unsigned s_enter_logged = 0;
     if (s_enter_logged < 32) {
       ++s_enter_logged;
@@ -2296,7 +2300,7 @@ DWORD WINAPI win_thread_trampoline(LPVOID raw) {
     }
   }
   bool seh_took = false;
-  const u64 ret = win_call_guest_seh(routine, arg, &seh_took);
+  const u64 ret = win_call_guest_seh(routine, arg, &seh_took, true);
   // .227 DIAG: thread-exit path -- routine-return vs SEH fault,
   // with the exit code. The worker's fate in .226 was decided
   // at census (routine returned, exit 0); this line proves it
@@ -3144,6 +3148,14 @@ void trt_sync_get_launch_stats(trt_sync_launch_stats* stats) {
             g_launch_wait_failed.load(std::memory_order_relaxed),
             g_launch_event_signaled.load(std::memory_order_relaxed),
             g_launch_event_failed.load(std::memory_order_relaxed)};
+}
+
+extern "C" void trt_set_guest_worker_fault_reporter(trt_guest_worker_fault_fn reporter) {
+#ifdef _WIN32
+  g_guest_worker_fault_reporter.store(reporter, std::memory_order_release);
+#else
+  (void)reporter;
+#endif
 }
 
 u32 TRT_STDCALL trt_WaitForSingleObject(u64 handle, u32 ms) {

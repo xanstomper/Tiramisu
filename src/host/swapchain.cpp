@@ -64,6 +64,12 @@ std::atomic<unsigned> g_surface_guest_rtv{0}, g_surface_other_rtv{0};
 std::atomic<unsigned> g_other_surface_samples{0}, g_other_lit_pixels{0};
 std::atomic<unsigned> g_other_width{0}, g_other_height{0}, g_other_format{0};
 std::atomic<int> g_other_surface_result{0};
+surface_sample g_shader_input_surface;
+std::atomic<unsigned> g_shader_input_snapshots{0}, g_shader_input_bound{0};
+std::atomic<unsigned> g_shader_input_samples{0}, g_shader_input_lit{0};
+std::atomic<unsigned> g_shader_input_slot{0}, g_shader_input_width{0};
+std::atomic<unsigned> g_shader_input_height{0}, g_shader_input_format{0};
+std::atomic<int> g_shader_input_result{0};
 std::atomic<int> g_surface_probe_result{0};
 unsigned g_surface_probe_interval = 0;
 winrt::com_ptr<IDXGIFactory2> g_factory;
@@ -567,7 +573,49 @@ void sample_other_render_target(ID3D11RenderTargetView* view, ID3D11Resource* re
   g_other_surface_result.store(hr);
 }
 
+void sample_guest_shader_input() {
+  if (g_shader_input_surface.pending) return;
+  g_shader_input_snapshots.fetch_add(1);
+  ID3D11ShaderResourceView* bound[4]{};
+  g_ctx->PSGetShaderResources(0, static_cast<UINT>(std::size(bound)), bound);
+  bool chosen = false;
+  for (unsigned slot = 0; slot < std::size(bound); ++slot) {
+    winrt::com_ptr<ID3D11ShaderResourceView> view;
+    view.attach(bound[slot]);  // PSGetShaderResources retained every bound view.
+    if (!view) continue;
+    g_shader_input_bound.fetch_add(1);
+    if (chosen) continue;
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv{};
+    view->GetDesc(&srv);
+    if (srv.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D ||
+        srv.Texture2D.MostDetailedMip != 0) continue;
+    winrt::com_ptr<ID3D11Resource> resource;
+    view->GetResource(resource.put());
+    auto texture = resource.try_as<ID3D11Texture2D>();
+    if (!texture) continue;
+    D3D11_TEXTURE2D_DESC desc{};
+    texture->GetDesc(&desc);
+    g_shader_input_slot.store(slot);
+    g_shader_input_width.store(desc.Width);
+    g_shader_input_height.store(desc.Height);
+    g_shader_input_format.store(srv.Format);
+    const HRESULT hr = enqueue_surface_sample(g_shader_input_surface, texture.get(), srv.Format);
+    g_shader_input_result.store(hr);
+    chosen = SUCCEEDED(hr);
+  }
+}
+
 void measure_surface_pair(ID3D11Texture2D* guest, ID3D11Texture2D* host) {
+  if (g_shader_input_surface.pending) {
+    const HRESULT hr = poll_surface_sample(g_shader_input_surface);
+    if (hr == S_OK) {
+      g_shader_input_lit.store(std::max(g_shader_input_lit.load(), g_shader_input_surface.lit));
+      g_shader_input_samples.fetch_add(1);
+    } else if (FAILED(hr)) {
+      g_shader_input_surface.pending = false;
+      g_shader_input_result.store(hr);
+    }
+  }
   if (g_other_surface_probe.pending) {
     const HRESULT hr = poll_surface_sample(g_other_surface_probe);
     if (hr == S_OK) {
@@ -607,6 +655,7 @@ void measure_surface_pair(ID3D11Texture2D* guest, ID3D11Texture2D* host) {
     g_surface_probe_result.store(host_hr);
     return;
   }
+  sample_guest_shader_input();
   // Snapshot slot zero at Present without disturbing the guest context. A
   // completed rendering pass may already have unbound its render target.
   winrt::com_ptr<ID3D11RenderTargetView> view;
@@ -765,7 +814,25 @@ void swapchain_reset_guest_draw_probe() {
   g_other_height.store(0);
   g_other_format.store(0);
   g_other_surface_result.store(0);
+  g_shader_input_surface = {};
+  g_shader_input_snapshots.store(0);
+  g_shader_input_bound.store(0);
+  g_shader_input_samples.store(0);
+  g_shader_input_lit.store(0);
+  g_shader_input_slot.store(0);
+  g_shader_input_width.store(0);
+  g_shader_input_height.store(0);
+  g_shader_input_format.store(0);
+  g_shader_input_result.store(0);
   g_surface_probe_interval = 0;
+}
+
+guest_shader_input_probe swapchain_guest_shader_input_probe() {
+  return {g_shader_input_snapshots.load(), g_shader_input_bound.load(),
+          g_shader_input_samples.load(), g_shader_input_lit.load(),
+          g_shader_input_slot.load(), g_shader_input_width.load(),
+          g_shader_input_height.load(), g_shader_input_format.load(),
+          g_shader_input_result.load()};
 }
 
 guest_draw_probe swapchain_guest_draw_probe() {

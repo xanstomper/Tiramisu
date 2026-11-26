@@ -47,6 +47,12 @@ struct guest_draw_probe {
   unsigned other_width, other_height, other_format;
   int other_surface_result;
 };
+struct guest_shader_input_probe {
+  unsigned snapshots, bound_views, samples, lit_pixels;
+  unsigned slot, width, height, format;
+  int result;
+};
+guest_shader_input_probe swapchain_guest_shader_input_probe();
 void swapchain_reset_guest_draw_probe();
 guest_draw_probe swapchain_guest_draw_probe();
 

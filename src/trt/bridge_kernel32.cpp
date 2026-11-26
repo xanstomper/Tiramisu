@@ -4157,7 +4157,14 @@ void TRT_STDCALL trt_FatalExit(u32 code) {
 }
 
 int TRT_STDCALL trt_TerminateProcess(void* proc, u32 code) {
-  (void)proc;
+  // Only the guest current-process handle has terminate rights. The zero
+  // extension is the 32-bit encoding of the same pseudo handle.
+  if (proc != trt_GetCurrentProcess() && reinterpret_cast<uintptr_t>(proc) != 0xffffffffu) {
+    gap_trace_record("TerminateProcess.invalid_handle");
+    set_err_for_current_thread(6);  // ERROR_INVALID_HANDLE
+    return 0;
+  }
+  gap_trace_record("TerminateProcess.current_process");
   char line[128];
   snprintf(line, sizeof(line), "kernel32: TerminateProcess(%u) called", code);
   boot_log(line);

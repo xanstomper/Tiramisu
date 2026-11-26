@@ -206,7 +206,8 @@ int main(int argc, char** argv) {
            (unsigned long long)ret);
   CHECK((ret & 0x40000000u) == 0x40000000u, det);
   // exact: every term is a distinct bit (pumped=2 => +0x20)
-  CHECK(ret == 0x43F19120u, "checksum exact-match (all bridges verified)");
+  // WM_CREATE runs synchronously, leaving only WM_SHOWWINDOW for the pump.
+  CHECK(ret == 0x43F19110u, "checksum includes one queued startup notification");
   CHECK(ret & 0x00000100, "window created");
   CHECK(ret & 0x00001000, "WndProc invoked via DispatchMessage");
   CHECK(ret & 0x02000000, "WndProc Win64 ABI 4-arg + 64-bit return");

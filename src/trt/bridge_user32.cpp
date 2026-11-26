@@ -220,6 +220,7 @@ void* TRT_STDCALL trt_CreateWindowExW(u32 exstyle, const wchar_t* cls,
   u64 hwnd = 0;
   createstruct_w* cs_ptr = nullptr;
   const wchar_t* title_ptr = title;
+  void* previous_focus = nullptr;
   bool sync_create = false;
   const bool initially_visible = (style & 0x10000000u /*WS_VISIBLE*/) != 0;
   const bool activate = initially_visible && window_can_activate(style, exstyle);
@@ -283,11 +284,11 @@ void* TRT_STDCALL trt_CreateWindowExW(u32 exstyle, const wchar_t* cls,
     cs_ptr->y = y;
     cs_ptr->x = x;
     cs_ptr->style = (i32)style;
-    cs_ptr->lpszName = title_ptr;
+    sync_create = exact_class && found_proc != 0;
+    cs_ptr->lpszName = sync_create ? title : title_ptr;
     cs_ptr->lpszClass = cls;
     cs_ptr->dwExStyle = exstyle;
-    if (activate) g_focus_window = (void*)(uintptr_t)hwnd;
-    sync_create = (exact_class && found_proc != 0 && param != nullptr);
+    previous_focus = g_focus_window;
   }
 
   trt_SetWindowLongPtrW(hwnd, -16 /*GWL_STYLE*/, (i64)(i32)style);
@@ -298,12 +299,31 @@ void* TRT_STDCALL trt_CreateWindowExW(u32 exstyle, const wchar_t* cls,
            (unsigned long long)hwnd);
   log_line(msg);
   if (sync_create) {
-    dispatch(hwnd, 0x0081u /*WM_NCCREATE*/, 0, (i64)(uintptr_t)cs_ptr);
-    dispatch(hwnd, 0x0001u /*WM_CREATE*/, 0, (i64)(uintptr_t)cs_ptr);
+    const i64 creation = reinterpret_cast<i64>(cs_ptr);
+    const bool nonclient_created = dispatch(hwnd, 0x0081u /*WM_NCCREATE*/, 0, creation) != 0;
+    if (!nonclient_created || dispatch(hwnd, 0x0001u /*WM_CREATE*/, 0, creation) == -1) {
+      if (nonclient_created) dispatch(hwnd, 0x0002u /*WM_DESTROY*/, 0, 0);
+      dispatch(hwnd, 0x0082u /*WM_NCDESTROY*/, 0, 0);
+      std::lock_guard<std::mutex> lock(g_win_mu);
+      if (auto* rejected = find_win_locked(hwnd)) {
+        rejected->handle = 0;
+        rejected->class_atom = 0;
+        rejected->proc = 0;
+      }
+      if (g_focus_window == reinterpret_cast<void*>(hwnd)) {
+        g_focus_window = find_win_locked(reinterpret_cast<u64>(previous_focus))
+            ? previous_focus : nullptr;
+      }
+      return nullptr;
+    }
   } else {
-    trt_msg_post(0x0001, 0, (i64)(uintptr_t)cs_ptr);  // WM_CREATE
+    trt_msg_post_to(hwnd, 0x0001, 0, (i64)(uintptr_t)cs_ptr);  // WM_CREATE
   }
-  trt_msg_post(0x0018, 1, 0);                        // WM_SHOWWINDOW
+  if (activate) {
+    std::lock_guard<std::mutex> lock(g_win_mu);
+    g_focus_window = reinterpret_cast<void*>(hwnd);
+  }
+  trt_msg_post_to(hwnd, 0x0018, 1, 0);                        // WM_SHOWWINDOW
   if (style != 0 && !parent && !(style & 0x40000000u /*WS_CHILD*/)) {
     // The paint cycle every desktop window receives after being shown:
     // WM_MOVE, WM_SIZE, WM_NCPAINT, WM_ERASEBKGND, WM_PAINT. Without these a
@@ -313,19 +333,19 @@ void* TRT_STDCALL trt_CreateWindowExW(u32 exstyle, const wchar_t* cls,
     const i32 ch = h > 0 ? h : 1080;
     const i64 pos = (i64)((u32)(u16)x | ((u32)(u16)y << 16));
     const i64 size = (i64)((u32)(u16)cw | ((u32)(u16)ch << 16));
-    trt_msg_post(0x0003u /*WM_MOVE*/, 0, pos);
-    trt_msg_post(0x0005u /*WM_SIZE*/, 0 /*SIZE_RESTORED*/, size);
-    trt_msg_post(0x0085u /*WM_NCPAINT*/, 1, 0);
-    trt_msg_post(0x0014u /*WM_ERASEBKGND*/, 0, (i64)(uintptr_t)hwnd);
+    trt_msg_post_to(hwnd, 0x0003u /*WM_MOVE*/, 0, pos);
+    trt_msg_post_to(hwnd, 0x0005u /*WM_SIZE*/, 0 /*SIZE_RESTORED*/, size);
+    trt_msg_post_to(hwnd, 0x0085u /*WM_NCPAINT*/, 1, 0);
+    trt_msg_post_to(hwnd, 0x0014u /*WM_ERASEBKGND*/, 0, (i64)(uintptr_t)hwnd);
     trt_user32_invalidate((void*)(uintptr_t)hwnd,
                           nullptr);  // WM_PAINT owes the whole client
-    trt_msg_post(0x000Fu /*WM_PAINT*/, 0, 0);
+    trt_msg_post_to(hwnd, 0x000Fu /*WM_PAINT*/, 0, 0);
     // The console view already owns input focus. Deliver the activation
     // messages a desktop game receives for its foreground top-level window.
     if (activate) {
-      trt_msg_post(0x001Cu /*WM_ACTIVATEAPP*/, 1, 0);
-      trt_msg_post(0x0006u /*WM_ACTIVATE*/, 1 /*WA_ACTIVE*/, 0);
-      trt_msg_post(0x0007u /*WM_SETFOCUS*/, 0, 0);
+      trt_msg_post_to(hwnd, 0x001Cu /*WM_ACTIVATEAPP*/, 1, 0);
+      trt_msg_post_to(hwnd, 0x0006u /*WM_ACTIVATE*/, 1 /*WA_ACTIVE*/, 0);
+      trt_msg_post_to(hwnd, 0x0007u /*WM_SETFOCUS*/, 0, 0);
     }
   }
   return (void*)(uintptr_t)hwnd;
@@ -349,7 +369,7 @@ int TRT_STDCALL trt_DestroyWindow(void* hwnd) {
       }
     }
   }
-  trt_msg_post(0x0002, 0, (i64)(uintptr_t)hwnd);  // WM_DESTROY
+  trt_msg_post_to(hv, 0x0002, 0, 0);  // WM_DESTROY
   drop_window_dc(hv);  // frees (and dumps) the window's raster surface
   return 1;
 }
@@ -462,10 +482,13 @@ static bool fill_msg(guest_msg* m, void* filter_hwnd, u32 min, u32 max,
       const u64 raw_target = t.message == 0x00FFu /*WM_INPUT*/
                                  ? trt_raw_target_window(static_cast<u64>(t.lparam))
                                  : 0;
-      m->hwnd = raw_target ? raw_target
-                          : t.message == 0x0012u /*WM_QUIT*/
-                                ? 0
-                                : (u64)(uintptr_t)trt_GetActiveWindow();
+      if (t.message == 0x0012u /*WM_QUIT*/ || t.target_window == TRT_MSG_THREAD_TARGET) {
+        m->hwnd = 0;
+      } else if (t.target_window || raw_target) {
+        m->hwnd = t.target_window ? t.target_window : raw_target;
+      } else {
+        m->hwnd = reinterpret_cast<u64>(trt_GetActiveWindow());
+      }
       m->message = t.message;
       m->_pad = 0;
       m->wParam = t.wparam;
@@ -540,8 +563,10 @@ int TRT_STDCALL trt_PeekMessageW(guest_msg* out, void* hwnd, u32 min, u32 max,
 }
 
 int TRT_STDCALL trt_PostMessageW(void* hwnd, u32 msg, u64 wp, i64 lp) {
-  (void)hwnd;
-  return trt_msg_post(msg, wp, lp) ? 1 : 0;
+  const u64 target = reinterpret_cast<u64>(hwnd);
+  if (!target) return trt_msg_post_to(TRT_MSG_THREAD_TARGET, msg, wp, lp);
+  if (target == 0xffffu /*HWND_BROADCAST*/) return trt_msg_post(msg, wp, lp);
+  return trt_msg_post_to(target, msg, wp, lp);
 }
 
 int TRT_STDCALL trt_TranslateMessage(const void*) { return 1; }
@@ -553,9 +578,7 @@ i64 TRT_STDCALL trt_DispatchMessageW(const guest_msg* m) {
     return (i64)trt_call_guest((void*)(uintptr_t)m->lParam, m->hwnd, 0x0113u,
                                m->wParam, (u64)m->time);
   }
-  const u64 target = (m->message == 0x0002u && m->lParam != 0)
-                         ? (u64)m->lParam
-                         : m->hwnd;
+  const u64 target = m->hwnd;
   if (!target) return 0;
   if (m->message == 0x0002u || m->message == 0x0010u) {
     char line[110];

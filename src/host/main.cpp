@@ -1563,6 +1563,14 @@ DWORD g_guest_tid = 0;
 std::atomic<longan::launch_phase> g_launch_phase{longan::launch_phase::none};
 std::atomic<longan::launch_outcome> g_launch_outcome{longan::launch_outcome::none};
 
+std::atomic<bool> g_worker_fault_recorded{false};
+
+void checkpoint_worker_fault(u32 code) {
+  const auto phase = g_launch_phase.load();
+  if (phase == longan::launch_phase::none || g_worker_fault_recorded.exchange(true)) return;
+  longan::launch_worker_fault_write(g_local_state, {phase, longan::launch_outcome::guest_fault, code});
+}
+
 void checkpoint_phase(longan::launch_phase phase) {
   g_launch_phase.store(phase);
   g_launch_outcome.store(longan::launch_outcome::running);
@@ -2050,12 +2058,16 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   struct checkpoint_scope {
     const guest_run_result& result;
     ~checkpoint_scope() {
+      trt_set_guest_worker_fault_reporter(nullptr);
       checkpoint_outcome(longan::launch_outcome::returned, static_cast<uint32_t>(result.map_rc));
       g_launch_phase.store(longan::launch_phase::none);
     }
   } checkpoint{r};
   gap_trace_begin_launch();
   checkpoint_phase(longan::launch_phase::preparing);
+  g_worker_fault_recorded.store(false);
+  longan::launch_worker_fault_write(g_local_state, {});
+  trt_set_guest_worker_fault_reporter(&checkpoint_worker_fault);
   char line[256];
 
   trt_gpu_reset_render_stats();
