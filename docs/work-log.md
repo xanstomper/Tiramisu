@@ -535,3 +535,35 @@ Entries are appended as work lands; every claim points at a gate or a file.
 - The worktree uses `/dev/shm/tiramisu-resume-42/source`. Commits and
   verification logs are stored in the main Mineplex repository. Logs are in
   `.git/verification/xbox-0.2.4.42-resume`.
+
+### 2026-11-26 — Xbox One-family and game compatibility integration
+
+- Confirmed the Xbox One, One S, and One X profiles are in the integrated
+  source. The UWP host applies the detected profile, uses the D3D11
+  feature-level ceiling, and accounts for the ESRAM budget on One and One S
+  while the driver controls residency. The 73-check console profile suite,
+  ESRAM checks, and Device Portal console-type tests passed.
+- `24b7ede` ports the older two-phase DLL loading work into the shared engine.
+  PE64 circular imports can bind against relocated exports before any
+  initializer runs. The graph is protected before unwind registration and
+  publication. Missing cyclic exports and failed protection both roll back
+  the mapped images and memory charges. The PE32 path uses the current
+  interpreter and retains a named failure for circular imports.
+- `8f93982` restores MinGW CRT and WinMM compatibility exports on the current
+  CRT and virtual MIDI bridges. Both ANSI and UTF-16 MIDI error text use
+  the current bridge's result codes.
+- The same 123 game-related PE files passed the load-only corpus before and
+  after the merge. The title matrix's five evidence rows also passed its
+  consistency check. These checks cover mapping and evidence integrity.
+- Historical host import-table rewrites, trace builds, and per-title Steam
+  experiments remain on the captured agent branches. The shared engine
+  uses the more recent game library, input, and bridge implementations.
+- The ABI check identified missing PE32 metadata for the restored exports.
+  `a002349` supplies cdecl and stdcall arities, guest pointer translation,
+  and the EDX:EAX file offset return. The focused x86 execution and export
+  conformance tests passed with zero new ABI gaps.
+- The final Linux gate and UWP cross-build passed. The version-resource test
+  passed separately with the local real fixture. Logs and the unsigned
+  executable hash are in `.git/verification/xbox-0.2.4.42-resume`.
+  The integration remains local and Xbox One-family hardware validation
+  is pending.
