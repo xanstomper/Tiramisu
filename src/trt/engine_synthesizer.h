@@ -12,6 +12,13 @@
 // when it actually imports UnityPlayer.dll / mono, FNA when it imports FNA.dll,
 // D3D9 when it imports d3d9.dll, and so on. File names on disk are used as a
 // secondary signal only where the engine is loaded by name at runtime.
+//
+// PLUS: a UNIVERSAL path for "one engine for everything." When no engine
+// evidence is found, instead of the generic Custom Native bucket, we emit a
+// UNIVERSAL profile whose import surface is empty-by-default: the universal
+// guest *accepts anything*, and the dynamic API synthesizer fills unknowns
+// at boot. This is the default for anything that can't be classified —
+// PC games included.
 #ifndef TIRAMISU_ENGINE_SYNTHESIZER_H
 #define TIRAMISU_ENGINE_SYNTHESIZER_H
 
@@ -33,21 +40,18 @@ enum trt_engine_type {
   // Managed (.NET) image with no engine evidence: runs on the Mono host but is
   // not an FNA/XNA title. Appended so the existing enumerators keep their values.
   TRT_ENGINE_MANAGED_DOTNET,
-  // Universal: no engine evidence. The universal guest accepts any game, the
-  // import surface is "fill unknowns dynamically", and PC games can be cleared
-  // onto Xbox through the API-translation layer (Phase 3+). This is the
-  // default when a game cannot be classified as any specific engine.
+  // Universal: no engine evidence. The universal guest accepts any game,
+  // the import surface is "fill unknowns dynamically", and PC games are
+  // cleared onto Xbox through the API-translation layer (Phase 3+).
   TRT_ENGINE_UNIVERSAL
 };
 
-// Flags on trt_engine_profile::universal_flags (OR of these; 0 = plain).
 enum trt_universal_flag {
-  // TRT_UNIV_CLEAR_PC: PC games may be cleared to the Xbox universal path —
-  // dump the PC import surface, translate PC imports to Xbox equivalents,
-  // pack as universal guest. (Phase 3.)
+  // 0 = plain universal. 1 = "clear" mode: PC games may be cleared to the
+  // Xbox universal path (dump imports, translate PC imports to Xbox
+  // equivalents, pack as universal guest).
   TRT_UNIV_CLEAR_PC = 1,
-  // TRT_UNIV_FORCE: force universal even when engine evidence exists
-  // (manual override).
+  // 2 = force universal even when evidence exists (manual override).
   TRT_UNIV_FORCE = 2
 };
 
@@ -81,9 +85,9 @@ struct trt_engine_profile {
   trt_engine_type engine_type = TRT_ENGINE_UNKNOWN;
   trt_graphics_api preferred_gfx = TRT_GFX_D3D11;
   trt_audio_middleware preferred_audio = TRT_AUDIO_UNKNOWN;
+  uint32_t universal_flags = 0;      // OR of trt_universal_flag (0 = plain)
 
   uint32_t steam_appid = 480;
-  uint32_t universal_flags = 0;      // OR of trt_universal_flag (0 = plain)
   bool has_steam = false;
 
   std::vector<std::string> cmdline_args;
