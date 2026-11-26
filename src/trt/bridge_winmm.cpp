@@ -771,6 +771,38 @@ extern "C" unsigned long long trt_timer_fires(void) {
   return g_timer_fires.load();
 }
 
+namespace {
+const char* midi_error_text(u32 error) {
+  switch (error) {
+    case 0: return "No error.";
+    case 2: return "Invalid device ID.";
+    case 4: return "Invalid device handle.";
+    case 11: return "Invalid parameter.";
+    default: return nullptr;
+  }
+}
+}
+
+u32 TRT_GUEST_ABI trt_midiOutGetErrorTextA(u32 error, char* buf, u32 len) {
+  if (!len) return 0;
+  if (!buf) return 11;
+  const char* text = midi_error_text(error);
+  if (!text) return 9;  // MMSYSERR_BADERRNUM
+  snprintf(buf, len, "%s", text);
+  return 0;
+}
+
+u32 TRT_GUEST_ABI trt_midiOutGetErrorTextW(u32 error, u16* buf, u32 len) {
+  if (!len) return 0;
+  if (!buf) return 11;
+  const char* text = midi_error_text(error);
+  if (!text) return 9;  // MMSYSERR_BADERRNUM
+  u32 i = 0;
+  for (; i < len - 1 && text[i]; ++i) buf[i] = static_cast<u16>(text[i]);
+  buf[i] = 0;
+  return 0;
+}
+
 int trt_bridge_register_winmm(void) {
   static const trt_named_fn k_fns[] = {
       {"timeGetTime", (void*)&trt_timeGetTime},
@@ -819,6 +851,8 @@ int trt_bridge_register_winmm(void) {
       {"midiOutReset", (void*)&trt_midiOutReset},
       {"midiOutGetDevCapsW", (void*)&trt_midiOutGetDevCapsW},
       {"midiOutGetDevCapsA", (void*)&trt_midiOutGetDevCapsA},
+      {"midiOutGetErrorTextA", (void*)&trt_midiOutGetErrorTextA},
+      {"midiOutGetErrorTextW", (void*)&trt_midiOutGetErrorTextW},
       {"midiOutGetVolume", (void*)&trt_midiOutGetVolume},
       {"midiOutSetVolume", (void*)&trt_midiOutSetVolume},
       // Real now: a thread per timer fires the guest callback (or sets the

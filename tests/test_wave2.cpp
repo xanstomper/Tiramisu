@@ -467,6 +467,30 @@ void test_wave2c_vfs_cow() {
     return trt_resolve_module(nullptr, "msvcrt.dll", sym, 0);
   };
 
+  using Ultoa = char* (TRT_GUEST_ABI*)(u32, char*, i32);
+  using Strspn = u64 (TRT_GUEST_ABI*)(const char*, const char*);
+  using Tell = i64 (TRT_GUEST_ABI*)(i32);
+  using Open = void* (TRT_GUEST_ABI*)(const char*, const char*);
+  using Getc = i32 (TRT_GUEST_ABI*)(void*);
+  auto ultoa = reinterpret_cast<Ultoa>(crt("_ultoa"));
+  auto strspn_fn = reinterpret_cast<Strspn>(crt("strspn"));
+  auto tell = reinterpret_cast<Tell>(crt("_telli64"));
+  auto open_file = reinterpret_cast<Open>(crt("fopen"));
+  auto file_number = reinterpret_cast<Getc>(crt("_fileno"));
+  using Read = i32 (TRT_GUEST_ABI*)(i32, void*, u32);
+  auto read_bytes = reinterpret_cast<Read>(crt("_read"));
+  auto close_file = reinterpret_cast<Getc>(crt("fclose"));
+  char digits[33];
+  CHECK(ultoa && ultoa(0xffffffffu, digits, 10) == digits &&
+        strcmp(digits, "4294967295") == 0, "CRT converts Windows unsigned long");
+  CHECK(strspn_fn && strspn_fn("aac", "ab") == 2, "CRT strspn uses the requested character set");
+  void* stream = open_file ? open_file("Z:\\keep.txt", "rb") : nullptr;
+  const i32 fd = stream && file_number ? file_number(stream) : -1;
+  char first = 0;
+  CHECK(fd >= 0 && tell && read_bytes && read_bytes(fd, &first, 1) == 1 &&
+        first == 'R' && tell(fd) == 1, "CRT _telli64 uses the guest descriptor");
+  if (stream && close_file) close_file(stream);
+
   using SetDirW_t = int (TRT_STDCALL *)(const u16*);
   using GetDirW_t = u32 (TRT_STDCALL *)(u32, u16*);
   using SetDirA_t = int (TRT_STDCALL *)(const char*);

@@ -62,6 +62,19 @@ int main() {
   auto fn_getVol = (fn_midiGetVolume)get_fn("midiOutGetVolume");
   auto fn_setVol = (fn_midiSetVolume)get_fn("midiOutSetVolume");
 
+  using error_text_a = u32 (GUEST_ABI*)(u32, char*, u32);
+  using error_text_w = u32 (GUEST_ABI*)(u32, u16*, u32);
+  auto error_a = reinterpret_cast<error_text_a>(get_fn("midiOutGetErrorTextA"));
+  auto error_w = reinterpret_cast<error_text_w>(get_fn("midiOutGetErrorTextW"));
+  char ascii[64]{};
+  u16 wide[4]{};
+  CHECK(error_a && error_a(2, ascii, sizeof(ascii)) == 0 &&
+        strcmp(ascii, "Invalid device ID.") == 0, "MIDI device error has an ANSI message");
+  CHECK(error_w && error_w(4, wide, 4) == 0 && wide[0] == 'I' && wide[3] == 0,
+        "MIDI error text truncates and terminates a UTF-16 buffer");
+  CHECK(error_a && error_a(999, ascii, sizeof(ascii)) == 9,
+        "MIDI rejects unknown error numbers");
+
   CHECK(fn_getNumDevs != nullptr, "midiOutGetNumDevs resolves");
   CHECK(fn_getCapsW != nullptr, "midiOutGetDevCapsW resolves");
   CHECK(fn_getCapsA != nullptr, "midiOutGetDevCapsA resolves");

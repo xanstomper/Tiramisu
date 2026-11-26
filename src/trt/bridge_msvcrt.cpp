@@ -763,6 +763,7 @@ char* TRT_GUEST_ABI crt_strrchr(const char* s, i32 c) { return (char*)strrchr(s,
 char* TRT_GUEST_ABI crt_strstr(const char* h, const char* n) { return (char*)strstr(h, n); }
 char* TRT_GUEST_ABI crt_strpbrk(const char* s, const char* a) { return (char*)strpbrk(s, a); }
 u64   TRT_GUEST_ABI crt_strcspn(const char* s, const char* r) { return (u64)strcspn(s, r); }
+u64   TRT_GUEST_ABI crt_strspn(const char* s, const char* a) { return (u64)strspn(s, a); }
 char* TRT_GUEST_ABI crt__strdup(const char* s) {
   if (!s) return nullptr;
   const size_t n = strlen(s) + 1;
@@ -791,6 +792,23 @@ i32   TRT_GUEST_ABI crt__itoa_s(i32 val, char* buf, u64 sz, i32 radix) {
   for (int i = 0; i < pos; ++i) buf[i] = tmp[pos - 1 - i];
   buf[pos] = 0;
   return 0;
+}
+
+char* TRT_GUEST_ABI crt__ultoa(u32 value, char* buf, i32 radix) {
+  if (!buf || radix < 2 || radix > 36) {
+    set_errno_from_host(EINVAL);
+    return nullptr;
+  }
+  const char* digits = "0123456789abcdefghijklmnopqrstuvwxyz";
+  char reversed[32];
+  size_t length = 0;
+  do {
+    reversed[length++] = digits[value % static_cast<u32>(radix)];
+    value /= static_cast<u32>(radix);
+  } while (value);
+  for (size_t i = 0; i < length; ++i) buf[i] = reversed[length - i - 1];
+  buf[length] = '\0';
+  return buf;
 }
 
 // Wide UTF-16LE string functions
@@ -1412,6 +1430,11 @@ i64 TRT_GUEST_ABI crt__lseeki64(i32 gfd, i64 off, i32 origin) {
 #else
   return (i64)lseek(hfd, (off_t)off, origin);
 #endif
+}
+i64 TRT_GUEST_ABI crt__telli64(i32 gfd) {
+  const i64 offset = crt__lseeki64(gfd, 0, SEEK_CUR);
+  if (offset < 0) set_errno_from_host(errno ? errno : EBADF);
+  return offset;
 }
 i64 TRT_GUEST_ABI crt__filelengthi64(i32 gfd) {
   int hfd = host_fd_of(gfd);
@@ -2764,6 +2787,7 @@ const trt_named_fn k_msvcrt_fns[] = {
     {"strstr",             (void*)&crt_strstr},
     {"strpbrk",            (void*)&crt_strpbrk},
     {"strcspn",            (void*)&crt_strcspn},
+    {"strspn",             (void*)&crt_strspn},
     {"_strdup",            (void*)&crt__strdup},
     {"strerror",           (void*)&crt_strerror},
     {"strtol",             (void*)&crt_strtol},
@@ -2773,6 +2797,7 @@ const trt_named_fn k_msvcrt_fns[] = {
     {"atoi",               (void*)&crt_atoi},
     {"atof",               (void*)&crt_atof},
     {"_itoa_s",            (void*)&crt__itoa_s},
+    {"_ultoa",             (void*)&crt__ultoa},
     {"wcslen",             (void*)&crt_wcslen},
     {"wcscmp",             (void*)&crt_wcscmp},
     {"wcscoll",            (void*)&crt_wcscoll},
@@ -2862,6 +2887,7 @@ const trt_named_fn k_msvcrt_fns[] = {
     {"_read",              (void*)&crt__read},
     {"_write",             (void*)&crt__write},
     {"_lseeki64",          (void*)&crt__lseeki64},
+    {"_telli64",           (void*)&crt__telli64},
     {"_filelengthi64",     (void*)&crt__filelengthi64},
     {"_chsize",            (void*)&crt__chsize},
     {"_fstat",             (void*)&crt__fstat},
