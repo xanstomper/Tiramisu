@@ -67,8 +67,8 @@ find "$out/layout/Assets" -type f ! -name 'StoreLogo.png' \
 find "$out/layout/Assets" -type d -empty -delete
 
 # ---- test cert (never committed; subject == Publisher) ----------------------
-# Compare the cert subject to the manifest Publisher. OpenSSL prints the RDNs
-# in the reverse of the /C=.../CN=... input order; normalize S/ST and spaces.
+# Compare the cert with the staged manifest Publisher in RFC2253 order.
+# The slash-delimited openssl req argument uses a different order and syntax.
 cert_normalize() {
   local s="$1"
   s="${s#subject=}"
@@ -87,7 +87,14 @@ cert_matches() {
   [[ "$got" == "$want" ]]
 }
 
-if ! cert_matches "$cert_prefix" "$cert_subj"; then
+manifest_publisher="$(python3 - "$out/layout/AppxManifest.xml" <<'PACK_PUBLISHER'
+import sys
+import xml.etree.ElementTree as ET
+root = ET.parse(sys.argv[1]).getroot()
+print(root.find("{*}Identity").attrib["Publisher"])
+PACK_PUBLISHER
+)"
+if ! cert_matches "$cert_prefix" "$manifest_publisher"; then
   if [[ -f "$cert_prefix.pfx" ]]; then
     echo "note: regenerating $cert_label cert (subject changed or missing)"
     rm -f "$cert_prefix.pfx" "$cert_prefix.cer" "$cert_prefix.key" \
