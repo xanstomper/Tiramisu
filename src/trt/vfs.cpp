@@ -477,6 +477,49 @@ void trt_vfs_mount(const char* drive_prefix, const char* host_path) {
     strncpy(g_cwd_drive, m.prefix, sizeof(g_cwd_drive) - 1);
 }
 
+int trt_vfs_host_to_guest(const char* host_path, char* out, size_t out_cap) {
+  if (!host_path || !out || !out_cap) return -1;
+  const auto separator = [](char c) { return c == '/' || c == '\\'; };
+  const size_t host_len = strlen(host_path);
+  size_t best = 0;
+  int slot = -1;
+  for (int i = 0; i < g_mount_count; ++i) {
+    const char* root = g_mounts[i].target;
+    size_t len = strlen(root);
+    while (len > 1 && separator(root[len - 1])) --len;
+    if (len <= best || len > host_len) continue;
+    // A mount at the filesystem root already ends at a path boundary.
+    if (!separator(root[len - 1]) && host_path[len] && !separator(host_path[len]))
+      continue;
+
+    size_t matched = 0;
+    for (; matched < len; ++matched) {
+      char a = separator(root[matched]) ? '/' : root[matched];
+      char b = separator(host_path[matched]) ? '/' : host_path[matched];
+#if defined(_WIN32)
+      a = lower_of(a);
+      b = lower_of(b);
+#endif
+      if (a != b) break;
+    }
+    if (matched == len) {
+      best = len;
+      slot = i;
+    }
+  }
+  if (slot < 0) return -1;
+  const char* rest = host_path + best;
+  while (separator(*rest)) ++rest;
+  const char* prefix = g_mounts[slot].prefix;
+  if (strlen(prefix) + 1 + strlen(rest) >= out_cap) return -1;
+  snprintf(out, out_cap, "%s\\%s", prefix, rest);
+  out[0] = upper_of(out[0]);
+  for (char* p = out; *p; ++p) {
+    if (*p == '/') *p = '\\';
+  }
+  return 0;
+}
+
 int trt_vfs_stat(const char* host_path, int* is_dir, u64* size_out) {
   if (!host_path || !*host_path) return -1;
   char tmp[1024];

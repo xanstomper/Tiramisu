@@ -218,10 +218,15 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   -o "$out/test_libload"
 "$out/test_libload" "$out/guest_libload.exe" "$out"
 split_dir="$out/test_libload_split"
-mkdir -p "$split_dir/bin"
+mkdir -p "$split_dir/bin" "$split_dir/sub"
 cp "$out/guest_libload.exe" "$split_dir/bin/"
 cp "$out/guestdll.dll" "$split_dir/"
-"$out/test_libload" "$split_dir/bin/guest_libload.exe" "$split_dir/bin" "$split_dir"
+cp "$out/guestdll.dll" "$split_dir/sub/nested.dll"
+"$out/test_libload" "$split_dir/bin/guest_libload.exe" "$split_dir/bin" "$split_dir" \
+  "$split_dir/sub/nested.dll"
+clang++ -std=c++20 -O2 -Wall -no-pie tests/test_formatmessage_alloc.cpp "$out/libtrt.a" \
+  -lpthread -o "$out/test_formatmessage_alloc"
+"$out/test_formatmessage_alloc"
 
 # --- 8. the graphics bridge: the guest's D3D11 calls must reach the host's GPU ---
 SDK="$HOME/.cache/uwp-crossbuild/xwin/sdk/include"

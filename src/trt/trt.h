@@ -263,6 +263,8 @@ void trt_bridge_boot(const trt_backend* be);
 int trt_bridge_register_kernel32(void);
 void trt_bridge_new_thread_id(u32 id);
 void trt_vfs_mount(const char* drive_prefix, const char* host_path);
+// Translate a mounted host path back to its Windows guest path.
+int trt_vfs_host_to_guest(const char* host_path, char* out, size_t out_cap);
 // Disc images: a read-only drive served straight out of a .iso/.bin/.img.
 // Files are extracted lazily into the cache root; the image is never written.
 struct trt_iso;

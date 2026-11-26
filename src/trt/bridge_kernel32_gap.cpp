@@ -350,16 +350,13 @@ u32 TRT_STDCALL trt_FormatMessageW(u32 flags, const void* src, u32 msgid,
     alloc_buf[len] = 0;
     *(u16**)buf = alloc_buf;
     return len;
-  } else {
-    if (size == 0) {
-      trt_SetLastError(87);
-      return 0;
-    }
-    u32 n = 0;
-    for (; n < len && n < size - 1; ++n) buf[n] = (u16)(u8)narrow[n];
-    buf[n] = 0;
-    return n;
   }
+  if (!size || size <= len) {
+    trt_SetLastError(size ? 122 : 87);
+    return 0;
+  }
+  for (u32 i = 0; i <= len; ++i) buf[i] = (u16)(u8)narrow[i];
+  return len;
 }
 
 // ---- loader search path ------------------------------------------------------

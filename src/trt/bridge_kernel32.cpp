@@ -2830,7 +2830,7 @@ int TRT_STDCALL trt_FreeEnvironmentStringsW(const u16* b) {
 
 u32 TRT_STDCALL trt_GetModuleFileNameW(void* mod, u16* buf, u32 len) {
   // Honor the handle: NULL (or the exe's own handle) -> the exe path; a
-  // guest DLL handle -> the game's directory + the DLL's file name; a
+  // guest DLL handle -> its mounted path, with the game directory as fallback; a
   // synthetic system-module handle -> System32 + the module name. The old
   // code ignored the handle and always returned the exe path.
   char path[512];
@@ -2846,6 +2846,12 @@ u32 TRT_STDCALL trt_GetModuleFileNameW(void* mod, u16* buf, u32 len) {
           snprintf(path, sizeof(path), "%.*s\\%s", (int)dirlen, g_exepath, nm);
           value = path;
         }
+      }
+      for (int i = 0; i < trt_images_count(); ++i) {
+        if (trt_images_nth(i) != img) continue;
+        if (trt_vfs_host_to_guest(trt_images_nth_path(i), path, sizeof(path)) == 0)
+          value = path;
+        break;
       }
     } else if (!img && trt_images_is_synthetic(mod)) {
       const char* nm = trt_images_synth_name(mod);
@@ -8966,12 +8972,11 @@ u32 TRT_STDCALL trt_FormatMessageA(u32 flags, const void* src, u32 msgid,
   }
   u16* wbuf_ptr = nullptr;
   u16 wbuf_stack[256];
-  u32 wflags = flags;
   u32 wn = 0;
   if (flags & 0x100u) {
-    wn = trt_FormatMessageW(wflags, src, msgid, langid, (u16*)&wbuf_ptr, size, args);
+    wn = trt_FormatMessageW(flags, src, msgid, langid, (u16*)&wbuf_ptr, 0, args);
   } else {
-    wn = trt_FormatMessageW(wflags, src, msgid, langid, wbuf_stack, 256, args);
+    wn = trt_FormatMessageW(flags, src, msgid, langid, wbuf_stack, 256, args);
     wbuf_ptr = wbuf_stack;
   }
   if (wn == 0 || !wbuf_ptr) return 0;
@@ -8983,7 +8988,8 @@ u32 TRT_STDCALL trt_FormatMessageA(u32 flags, const void* src, u32 msgid,
       trt_LocalFree(wbuf_ptr);
       return 0;
     }
-    char* abuf = (char*)trt_LocalAlloc(0x40, (u64)(n + 1));
+    const u64 min_bytes = (u64)n + 1;
+    char* abuf = (char*)trt_LocalAlloc(0x40, size > min_bytes ? size : min_bytes);
     if (!abuf) {
       extern void* TRT_STDCALL trt_LocalFree(void* p);
       trt_LocalFree(wbuf_ptr);
@@ -9001,10 +9007,18 @@ u32 TRT_STDCALL trt_FormatMessageA(u32 flags, const void* src, u32 msgid,
       err_ref_for_current_thread() = 87;
       return 0;
     }
-    int n = trt_WideCharToMultiByte(65001, 0, wbuf_ptr, (int)wn, buf, (int)size - 1, nullptr, nullptr);
-    if (n < 0) n = 0;
-    buf[n] = 0;
-    return (u32)n;
+    const int required = trt_WideCharToMultiByte(
+        65001, 0, wbuf_ptr, (int)wn, nullptr, 0, nullptr, nullptr);
+    if (required <= 0) return 0;
+    if (size <= (u32)required) {
+      err_ref_for_current_thread() = 122;
+      return 0;
+    }
+    const int written = trt_WideCharToMultiByte(
+        65001, 0, wbuf_ptr, (int)wn, buf, required, nullptr, nullptr);
+    if (written <= 0) return 0;
+    buf[written] = 0;
+    return (u32)written;
   }
 }
 

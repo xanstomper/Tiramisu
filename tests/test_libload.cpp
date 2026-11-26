@@ -145,6 +145,7 @@ void* fake_system_load(const char* module, const char* symbol) {
 extern "C" void* TRT_STDCALL trt_LoadLibraryW(const u16*);
 extern "C" void* TRT_STDCALL trt_GetProcAddress(void*, const char*);
 extern "C" void* TRT_STDCALL trt_GetProcessHeap(void);
+extern "C" u32 TRT_STDCALL trt_GetModuleFileNameW(void*, u16*, u32);
 
 // NOTE: the arguments are read through MEMORY constraints and BEFORE %rsp
 // is adjusted. With register constraints the compiler may pick a register
@@ -241,6 +242,30 @@ int main(int argc, char** argv) {
       dll_main_called_host = true;
   CHECK(dll_main_called_host, "DllMain reached the host with the right arguments");
   CHECK(g_fake_calls >= 3, "cross-image calls landed (DllMain + 2 exports)");
+
+  if (argc > 4) {
+    trt_vfs_mount("z:", argv[3]);
+    trt_image* nested = trt_load_pe(argv[4], "nested.dll", 0);
+    CHECK(nested != nullptr, "nested DLL mapped");
+    if (nested) {
+      u16 actual[128] = {};
+      const char16_t expected[] = u"Z:\\sub\\nested.dll";
+      const u32 length = trt_GetModuleFileNameW(trt_images_handle(nested), actual, 128);
+      CHECK(length == sizeof(expected) / sizeof(expected[0]) - 1 &&
+            memcmp(actual, expected, sizeof(expected)) == 0,
+            "GetModuleFileNameW preserves the loaded DLL's subdirectory");
+    }
+    char path[128];
+    trt_vfs_mount("x:", "/");
+    trt_vfs_mount("y:", "/games/example/");
+    CHECK(trt_vfs_host_to_guest("/games/example/sub/a.dll", path, sizeof(path)) == 0 &&
+          strcmp(path, "Y:\\sub\\a.dll") == 0, "most specific mount wins");
+    CHECK(trt_vfs_host_to_guest("/games/example2/a.dll", path, sizeof(path)) == 0 &&
+          strcmp(path, "X:\\games\\example2\\a.dll") == 0,
+          "a partial directory name does not shadow the root mount");
+    CHECK(trt_vfs_host_to_guest("/games/example/sub/a.dll", path, 4) != 0,
+          "short mounted-path buffer is rejected");
+  }
 
   printf("\nRESULT: %s\n", failures ? "FAILURES" : "ALL PASS");
   return failures ? 1 : 0;
