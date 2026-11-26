@@ -119,6 +119,10 @@ void  trt_guest_tls_bind_host_slots(void** host_tls, void** guest_tls);
 // fails TRT_ERR_NOT_PE64.
 int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
                 const u8* file, size_t file_size, trt_image** out);
+// During PE64 import binding, exports briefly points to the relocated image.
+int trt_map_pe_for_dll(const trt_backend* be, const trt_resolver* rs,
+                        const u8* file, size_t file_size, trt_image** out,
+                        const trt_image** exports);
 
 // Map a PE32 (32-bit) image: same stages as trt_map_pe, with 4-byte thunks,
 // HIGHLOW relocations against a GUEST-VA base (independent of the host
@@ -163,6 +167,9 @@ u32 trt_pe32_image_overlap_end(u32 base, u32 size);
 // Flip sections to final protections (code -> RX). Call once after
 // relocation/import/TLS writes are complete. Returns TRT_OK or TRT_ERR_SEAL.
 int trt_seal_image(const trt_backend* be, trt_image* img);
+// Protect the whole dependency graph before registering any unwind tables.
+int trt_protect_image(const trt_backend* be, trt_image* img);
+void trt_register_image_unwind(const trt_backend* be, trt_image* img);
 // Undo the seal (all sections RW). Only the legacy 32-bit runner needs it,
 // for the data copy-back into an image that trt_seal_image already made RX.
 // The caller re-seals immediately: the image is never RWX.
