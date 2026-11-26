@@ -118,6 +118,11 @@ static uint32_t x86_call_fn(x86_context* ctx, void* fn, const char* module,
         }
     }
 
+    if (mod_eq(module, "msvcrt")) {
+        // Win32 returns a 64-bit offset in EDX:EAX and a pointer in EAX.
+        if (sym_eq(symbol, "_telli64")) ctx->regs.edx = (uint32_t)(r >> 32);
+        if (sym_eq(symbol, "_ultoa")) return r ? args[1] : 0;
+    }
     return (uint32_t)r;
 }
 
@@ -513,6 +518,7 @@ static int lookup_arg_count(const char* module, const char* symbol) {
         {"msvcrt","fopen",2},{"msvcrt","fclose",1},{"msvcrt","fread",4},
         {"msvcrt","fwrite",4},{"msvcrt","fseek",3},{"msvcrt","ftell",1},
         {"msvcrt","exit",1},{"msvcrt","_exit",1},{"msvcrt","abort",0},
+        {"msvcrt","_telli64",1},{"msvcrt","_ultoa",3},{"msvcrt","strspn",2},
         {"msvcrt","__CxxFrameHandler3",4},
         // d3d / dxgi
         {"d3d9","Direct3DCreate9",1},{"d3d9","Direct3DCreate9Ex",2},
@@ -576,6 +582,7 @@ static int lookup_arg_count(const char* module, const char* symbol) {
         {"winmm","midiOutGetNumDevs",0},
         {"winmm","midiOutGetDevCapsW",3},
         {"winmm","midiOutGetDevCapsA",3},
+        {"winmm","midiOutGetErrorTextA",3},{"winmm","midiOutGetErrorTextW",3},
         {"winmm","midiOutGetVolume",2},
         {"winmm","midiOutSetVolume",2},
         {"winmm","midiOutOpen",5},
@@ -1017,7 +1024,8 @@ static int sym_eq(const char* a, const char* b) { return strcmp(a, b) == 0; }
 // __cdecl / variadic exports: the CALLER cleans the stack, so the trap
 // dispatcher pops only the return address.
 static int lookup_cdecl(const char* module, const char* symbol) {
-    (void)module;
+    if (mod_eq(module, "msvcrt") && (sym_eq(symbol, "_telli64") ||
+        sym_eq(symbol, "_ultoa") || sym_eq(symbol, "strspn"))) return 1;
     static const char* k_cdecl[] = {
         "printf", "fprintf", "sprintf", "snprintf", "_snprintf", "vsprintf",
         "vprintf", "scanf", "fscanf", "sscanf", "malloc", "calloc", "realloc",
@@ -1097,6 +1105,15 @@ static uint32_t lookup_ptr_mask(x86_context* ctx, const char* module,
         if (sym_eq(symbol, "strlen") || sym_eq(symbol, "strcmp") ||
             sym_eq(symbol, "strcpy") || sym_eq(symbol, "memcpy") ||
             sym_eq(symbol, "memset")) P(0x3);
+    }
+    if (mod_eq(module, "msvcrt")) {
+        if (sym_eq(symbol, "_telli64")) P(0x0);
+        if (sym_eq(symbol, "_ultoa")) P(0x2);
+        if (sym_eq(symbol, "strspn")) P(0x3);
+    }
+    if (mod_eq(module, "winmm") || mod_eq(module, "winmmbase")) {
+        if (sym_eq(symbol, "midiOutGetErrorTextA") ||
+            sym_eq(symbol, "midiOutGetErrorTextW")) P(0x2);
     }
     #undef P
     // Heuristic: a value in user space that lands on a committed page is

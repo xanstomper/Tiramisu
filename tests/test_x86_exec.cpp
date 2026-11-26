@@ -7,6 +7,8 @@
 // This is the execution-level gate for the 32-bit interpreter: it proves the
 // new opcodes actually compute, not merely compile.
 #include "../src/trt/x86_cpu.h"
+#include "../src/trt/bridge_msvcrt.h"
+#include "../src/trt/bridge_winmm.h"
 
 #include <cstdio>
 #include <cstring>
@@ -528,6 +530,37 @@ int main() {
               "msvcrt free returns void");
         CHECK(x86_guest_blocksize(&ctx, mb) == 0,
               "the freed malloc block is no longer live");
+    }
+
+    printf("== PE32 compatibility calls ==\n");
+    {
+        trt_bridge_register_msvcrt();
+        trt_bridge_register_winmm();
+        const uint32_t buffer = 0x10400;
+        int nargs = -1, cdecl_call = -1;
+        ctx.regs.esp = 0x0010E000;
+        x86_mem_write32(&ctx, ctx.regs.esp + 4, 42);
+        x86_mem_write32(&ctx, ctx.regs.esp + 8, buffer);
+        x86_mem_write32(&ctx, ctx.regs.esp + 12, 10);
+        const auto converted = x86_dispatch_import(&ctx, -1, "msvcrt.dll", "_ultoa",
+                                                    &nargs, &cdecl_call);
+        CHECK(nargs == 3 && cdecl_call && converted == buffer &&
+              x86_mem_read8(&ctx, buffer) == '4' && x86_mem_read8(&ctx, buffer + 1) == '2',
+              "_ultoa returns the guest buffer to a cdecl caller");
+
+        ctx.regs.edx = 0;
+        x86_mem_write32(&ctx, ctx.regs.esp + 4, 0xffffffffu);
+        const auto position = x86_dispatch_import(&ctx, -1, "msvcrt.dll", "_telli64",
+                                                   &nargs, &cdecl_call);
+        CHECK(nargs == 1 && cdecl_call && position == 0xffffffffu && ctx.regs.edx == 0xffffffffu,
+              "_telli64 returns its complete signed result in EDX:EAX");
+
+        x86_mem_write32(&ctx, ctx.regs.esp + 4, 2);
+        x86_mem_write32(&ctx, ctx.regs.esp + 12, 24);
+        const auto midi = x86_dispatch_import(&ctx, -1, "winmmbase.dll", "midiOutGetErrorTextA",
+                                               &nargs, &cdecl_call);
+        CHECK(nargs == 3 && !cdecl_call && midi == 0 && x86_mem_read8(&ctx, buffer) == 'I',
+              "winmmbase writes error text to the guest buffer using stdcall");
     }
 
     printf("== calling-convention metadata ==\n");
