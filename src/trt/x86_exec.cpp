@@ -3477,7 +3477,7 @@ int x86_step(x86_context* ctx) {
             uint32_t daddr = 0;
             if (is_reg) dptr = r8p(ctx, modrm_rm(modrm));
             else { int c = 0; daddr = calc_ea(ctx, modrm, &c); ctx->regs.eip += c - 1; }
-            uint8_t srcv = is_reg ? *r8p(ctx, modrm_reg(modrm)) : 0;
+            uint8_t srcv = *r8p(ctx, modrm_reg(modrm));
             uint8_t dstv = is_reg ? *dptr : x86_mem_read8(ctx, daddr);
             if (form == 2) { // r8 <- r/m8: operands swap
                 uint8_t t = dstv; dstv = srcv; srcv = t;
