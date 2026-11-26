@@ -6,7 +6,10 @@
 #include "x86_32.h"
 #include "dynamic_api.h"
 
+#include <deque>
 #include <mutex>
+#include <string>
+#include <vector>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,13 +66,20 @@ struct extra_dll_dir {
 extra_dll_dir g_extra_dll_dirs[32] = {};
 thread_local char g_load_dir_stack[16][512] = {};
 thread_local int g_load_dir_depth = 0;
-thread_local int g_load_depth = 0;
-thread_local bool g_import_cycle = false;
-struct pending_guest_image {
-  const char* name;
-  const char* path;
+struct staged_dll {
+  std::string name;
+  std::string path;
+  bool run_entry;
+  const trt_image* exports = nullptr;
+  trt_image* image = nullptr;
 };
-thread_local pending_guest_image g_pending_images[32] = {};
+struct dll_load_graph {
+  std::deque<staged_dll> dlls;
+  std::vector<size_t> load_order;
+  bool failed_cycle = false;
+};
+std::mutex g_dll_load_mu;
+thread_local dll_load_graph* g_load_graph = nullptr;
 // Load-only mode (corpus dry-run): map + bind + seal guest DLLs but do NOT
 // run their TLS callbacks or DllMain — the corpus test proves the load
 // path, it does not execute game code. Default 1 = full boot semantics.
@@ -278,6 +288,7 @@ trt_resolver* trt_runtime_resolver(void) { return &g_rs; }
 
 trt_image* trt_images_find(const char* name) {
   if (!name) return nullptr;
+  std::lock_guard<std::mutex> lock(g_img_mu);
   const char* base = base_name(name);
   for (int i = 0; i < g_image_count; ++i)
     if (ieq(g_images[i].name, base)) return g_images[i].img;
@@ -501,9 +512,52 @@ static trt_image* try_load_sibling(const char* module) {
   return trt_load_pe(host, base_name(host), 1);
 }
 
+static bool same_dll_name(const char* name, const char* query) {
+  if (ieq(name, query)) return true;
+  if (has_dot_in_base(query) || ends_with_dot(query)) return false;
+  char with_ext[128];
+  return snprintf(with_ext, sizeof(with_ext), "%s.dll", query) < (int)sizeof(with_ext) &&
+         ieq(name, with_ext);
+}
+
+static staged_dll* find_staged_dll(const char* name, const char* path = nullptr) {
+  if (!g_load_graph) return nullptr;
+  for (auto& pending : g_load_graph->dlls) {
+    if (same_dll_name(pending.name.c_str(), name) ||
+        (path && path_ieq(pending.path.c_str(), path))) return &pending;
+  }
+  return nullptr;
+}
+
 static void* resolve_guest_symbol(const char* module, const char* symbol,
                                   u16 ordinal, bool optional) {
   if (!module) return nullptr;
+  static thread_local unsigned resolution_depth = 0;
+  if (resolution_depth == 64) return nullptr;
+  struct resolution_scope {
+    unsigned& depth;
+    ~resolution_scope() { --depth; }
+  } scope{++resolution_depth};
+
+  if (auto* pending = find_staged_dll(base_name(module))) {
+    auto* image = pending->image ? pending->image : pending->exports;
+    const auto* resolver = optional ? trt_runtime_export_resolver() : &g_rs;
+    if (image) {
+      if (void* fn = trt_pe_find_export(g_be, resolver, image, symbol, ordinal))
+        return fn;
+    }
+    if (!pending->image) {
+      // PE32 does not expose exports during its own mapping. A missing
+      // export from a PE64 back edge must not turn into a synthetic import.
+      char line[192];
+      snprintf(line, sizeof(line), "trt: unresolved cyclic DLL import: %s!%s",
+               module, symbol ? symbol : "#ordinal");
+      trt_core_log(line);
+      g_load_graph->failed_cycle = true;
+    }
+    return nullptr;
+  }
+
   // Respect the loaded image and normal sibling DLL search in either path.
   trt_image* img = trt_images_find(module);
   if (!img) img = try_load_sibling(module);
@@ -532,107 +586,62 @@ const trt_resolver* trt_runtime_export_resolver(void) {
 // loading
 // ---------------------------------------------------------------------------
 
-trt_image* trt_load_pe(const char* host_path, const char* guest_name,
-                       int run_entry) {
-  if (!g_be || !host_path) return nullptr;
-  // STAGE 7 guard: re-entrant trt_load_pe (the exe's static CRT init or a
-  // DllMain loads a DLL) would run tls callbacks again for the SAME image
-  // object that already ran them — each pass burns a TEB TLS index and the
-  // exe's index slot would end up pointing at the FIRST block while later
-  // callbacks write later blocks. The load is the same file: skip the
-  // callback/entry re-run, return the already-mapped image.
-  const char* req_base = base_name(guest_name ? guest_name : host_path);
-  char req_with_ext[128] = "";
-  if (!has_dot_in_base(req_base) && !ends_with_dot(req_base)) {
-    snprintf(req_with_ext, sizeof(req_with_ext), "%s.dll", req_base);
-  }
-  for (int i = 0; i < g_image_count; ++i)
-    if (path_ieq(g_images[i].path, host_path) ||
-        ieq(g_images[i].name, req_base) ||
-        (req_with_ext[0] && ieq(g_images[i].name, req_with_ext))) {
-      char line[320];
-      snprintf(line, sizeof(line), "trt: load_pe %s -> already mapped (slot %d), re-entry guard",
-               g_images[i].name, i);
-      trt_core_log(line);
+static trt_image* registered_dll(const char* name, const char* path) {
+  std::lock_guard<std::mutex> lock(g_img_mu);
+  for (int i = 0; i < g_image_count; ++i) {
+    if (path_ieq(g_images[i].path, path) || same_dll_name(g_images[i].name, name))
       return g_images[i].img;
-    }
-  // Neither image in a cyclic import can be published by this loader
-  // until its imports bind. Reject re-entry before allocating another copy.
-  for (int i = 0; i < g_load_depth; ++i) {
-    const auto& pending = g_pending_images[i];
-    if (ieq(pending.name, req_base) || path_ieq(pending.path, host_path)) {
-      char line[192];
-      snprintf(line, sizeof(line), "trt: cyclic guest DLL import: %s", req_base);
-      trt_core_log(line);
-      g_import_cycle = true;
-      return nullptr;
-    }
   }
-  if (g_load_depth == 32) {
-    trt_core_log("trt: guest DLL dependency depth exceeded");
+  return nullptr;
+}
+
+static void discard_staged_dlls(dll_load_graph& graph, size_t first, size_t order_start) {
+  while (graph.dlls.size() > first) {
+    if (auto* image = graph.dlls.back().image) trt_unmap(g_be, image);
+    graph.dlls.pop_back();
+  }
+  graph.load_order.resize(order_start);
+}
+
+static trt_image* stage_dll(dll_load_graph& graph, const char* path,
+                            const char* name, bool run_entry) {
+  if (auto* image = registered_dll(name, path)) return image;
+  if (auto* pending = find_staged_dll(name, path)) return pending->image;
+  if (graph.dlls.size() + trt_images_count() >= TRT_MAX_GUEST_IMAGES) {
+    trt_core_log("trt: guest image registry full");
     return nullptr;
   }
   size_t size = 0;
-  u8* file = read_whole_file(host_path, &size);
+  u8* file = read_whole_file(path, &size);
   if (!file) {
     char line[320];
-    snprintf(line, sizeof(line), "trt: cannot read %s", host_path);
+    snprintf(line, sizeof(line), "trt: cannot read %s", path);
     trt_core_log(line);
     return nullptr;
   }
 
-  LoadDirGuard load_dir_guard(host_path);
-  trt_image* img = nullptr;
-  if (g_load_depth == 0) g_import_cycle = false;
-  g_pending_images[g_load_depth++] = {req_base, host_path};
-  const int rc = trt_map_pe(g_be, &g_rs, file, size, &img);
-  g_pending_images[--g_load_depth] = {};
+  // Path arguments in recursive resolution often refer to stack buffers.
+  // Store stable copies until the graph has been published.
+  const size_t slot = graph.dlls.size();
+  const size_t order_start = graph.load_order.size();
+  auto& pending = graph.dlls.emplace_back(staged_dll{name, path, run_entry});
+  LoadDirGuard dir_guard(path);
+  const int rc = trt_map_pe_for_dll(g_be, &g_rs, file, size, &pending.image,
+                                   &pending.exports);
   free(file);
-  // The import resolver can install a placeholder for a missing export.
-  // A real cyclic dependency must still fail before either image is published.
-  if (g_import_cycle) {
-    if (img) trt_unmap(g_be, img);
-    return nullptr;
-  }
-  if (rc != TRT_OK || !img) {
+  if (rc != TRT_OK || !pending.image || graph.failed_cycle) {
+    discard_staged_dlls(graph, slot, order_start);
     char line[320];
     snprintf(line, sizeof(line), "trt: guest image %s failed to map (%s)",
-             guest_name ? guest_name : host_path, trt_errstr(rc));
-    trt_core_log(line);
-    if (img) trt_unmap(g_be, img);
-    return nullptr;
-  }
-
-  // register BEFORE the entry runs: the DLL may load another DLL that
-  // imports back into this one
-  const char* base = base_name(guest_name ? guest_name : host_path);
-  int slot = -1;
-  {
-    std::lock_guard<std::mutex> lk(g_img_mu);
-    if (g_image_count < TRT_MAX_GUEST_IMAGES) {
-      slot = g_image_count;
-      guest_image& g = g_images[slot];
-      memset(&g, 0, sizeof(g));
-      snprintf(g.name, sizeof(g.name), "%s", base);
-      snprintf(g.path, sizeof(g.path), "%s", host_path);
-      g.img = img;
-      // STAGE 7: HMODULE == image base (see trt_images_register_main).
-      // M7 Phase 1: a 32-bit HMODULE must be a 32-bit-safe value — the guest
-      // VA base, not the 64-bit host pointer (a 32-bit slot cannot hold it).
-      g.handle = img->is_pe32 ? (void*)(uintptr_t)img->guest_base
-                              : (void*)(uintptr_t)img->base;
-      g.is_dll = true;
-      ++g_image_count;
-    }
-  }
-
-  if (trt_seal_image(g_be, img) != TRT_OK) {
-    char line[320];
-    snprintf(line, sizeof(line), "trt: seal failed for %s", base);
+             name, trt_errstr(rc == TRT_OK ? TRT_ERR_IMPORT : rc));
     trt_core_log(line);
     return nullptr;
   }
+  graph.load_order.push_back(slot);
+  return pending.image;
+}
 
+static void attach_dll(trt_image* img, const char* base, bool run_entry, int slot) {
   // PE32 code runs through the clean-room x86 interpreter. In load-only mode
   // (corpus dry-run) nothing executes, exactly like the PE64 path.
   if (img->is_pe32 && !g_run_image_code) {
@@ -646,7 +655,8 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
   // runner executes a private copy and copies the guest's data writes back
   // into the image, which is sealed RX at this point: unseal for that window
   // and re-seal afterwards, so no page is ever writable and executable.
-  if (img->is_pe32 && g_run_image_code) trt_unseal_image(g_be, img);
+  if (img->is_pe32 && g_run_image_code &&
+      trt_unseal_image(g_be, img) != TRT_OK) return;
   if (img->is_pe32 && g_run_image_code) {
     const u32 hinst = img->guest_base;
     for (int i = 0; i < img->tls_callback_count; ++i) {
@@ -694,7 +704,61 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
       }
     }
   }
-  return img;
+}
+
+trt_image* trt_load_pe(const char* host_path, const char* guest_name, int run_entry) {
+  if (!g_be || !host_path) return nullptr;
+  const char* name = base_name(guest_name ? guest_name : host_path);
+  if (g_load_graph) return stage_dll(*g_load_graph, host_path, name, run_entry != 0);
+
+  // Mapping transactions publish only complete graphs. Initializers run
+  // after releasing the mapping lock, so guest code can load more DLLs.
+  std::unique_lock<std::mutex> lock(g_dll_load_mu);
+  dll_load_graph graph;
+  trt_image* image;
+  {
+    struct active_graph_scope {
+      ~active_graph_scope() { g_load_graph = nullptr; }
+    } scope;
+    g_load_graph = &graph;
+    image = stage_dll(graph, host_path, name, run_entry != 0);
+  }
+  if (!image || graph.dlls.empty()) return image;
+  for (const size_t index : graph.load_order) {
+    if (trt_protect_image(g_be, graph.dlls[index].image) != TRT_OK) {
+      discard_staged_dlls(graph, 0, 0);
+      return nullptr;
+    }
+  }
+
+  int first;
+  {
+    std::lock_guard<std::mutex> registry_lock(g_img_mu);
+    if (g_image_count + graph.dlls.size() > TRT_MAX_GUEST_IMAGES) {
+      discard_staged_dlls(graph, 0, 0);
+      return nullptr;
+    }
+    first = g_image_count;
+    for (const size_t index : graph.load_order) {
+      auto& pending = graph.dlls[index];
+      trt_register_image_unwind(g_be, pending.image);
+      auto& entry = g_images[g_image_count++];
+      entry = {};
+      snprintf(entry.name, sizeof(entry.name), "%s", pending.name.c_str());
+      snprintf(entry.path, sizeof(entry.path), "%s", pending.path.c_str());
+      entry.img = pending.image;
+      entry.handle = pending.image->is_pe32
+          ? reinterpret_cast<void*>(static_cast<uintptr_t>(pending.image->guest_base))
+          : pending.image->base;
+      entry.is_dll = true;
+    }
+  }
+  lock.unlock();
+  for (const size_t index : graph.load_order) {
+    auto& pending = graph.dlls[index];
+    attach_dll(pending.image, pending.name.c_str(), pending.run_entry, first++);
+  }
+  return image;
 }
 
 int trt_images_disable_thread_calls(void* handle) {

@@ -599,6 +599,16 @@ extern "C" const char* trt_errstr(int code) {
 
 extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
                            const u8* file, size_t file_size, trt_image** out) {
+  return trt_map_pe_for_dll(be, rs, file, file_size, out, nullptr);
+}
+
+extern "C" int trt_map_pe_for_dll(const trt_backend* be, const trt_resolver* rs,
+                                  const u8* file, size_t file_size, trt_image** out,
+                                  const trt_image** exports) {
+  struct export_scope {
+    const trt_image** target;
+    ~export_scope() { if (target) *target = nullptr; }
+  } scope{exports};
   if (!be || !rs || !file || !out || file_size < sizeof(trt_dos_header))
     return TRT_ERR_BAD_ARGS;
   *out = nullptr;
@@ -806,6 +816,8 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
     logf_be(be, "trt: loaded at preferred base, no reloc pass");
   }
 
+  // An import can resolve an export from this image without executing it.
+  if (exports) *exports = &img;
   // ---- 6. imports ----
   const u64 imp_va = dirs[TRT_PE_DIR_IMPORT].virtual_address;
   const u64 imp_sz = dirs[TRT_PE_DIR_IMPORT].size;
@@ -1569,18 +1581,14 @@ extern "C" int trt_unseal_image(const trt_backend* be, trt_image* img) {
   return TRT_OK;
 }
 
-extern "C" int trt_seal_image(const trt_backend* be, trt_image* img) {
+extern "C" int trt_protect_image(const trt_backend* be, trt_image* img) {
   if (!be || !img || !img->base) return TRT_ERR_BAD_ARGS;
   // walk section table in the mapped copy of the headers (NT headers sit at
   // e_lfanew, not at offset 0 — the DOS header occupies the page start)
   const trt_dos_header* dos = (const trt_dos_header*)img->base;
   const trt_nt_headers64* nt =
       (const trt_nt_headers64*)(img->base + dos->e_lfanew);
-  // The section table is located via size_of_optional_header, which is
-  // width-agnostic — but the exception directory is NOT (PE32 dirs start
-  // 16 bytes earlier), so read the magic first.
-  const u16 magic = rd16((const u8*)&nt->optional_header.magic);
-  const int is_pe32 = (magic == TRT_PE_OPT32_MAGIC);
+  // The section table offset is the same calculation for PE32 and PE64.
   const u8* sec_base = (const u8*)&nt->optional_header +
                        rd16((const u8*)&nt->file_header.size_of_optional_header);
   for (u32 i = 0; i < img->section_count; ++i) {
@@ -1599,33 +1607,32 @@ extern "C" int trt_seal_image(const trt_backend* be, trt_image* img) {
   }
   logf_be(be, "trt: SEALED (W^X: code pages now RX, no RWX ever)");
 
-  // PE32 has no .pdata unwind tables: 32-bit SEH is the runtime FS:0
-  // chain, and register_unwind (RtlAddFunctionTable) has no 32-bit
-  // meaning. The Phase 2 emulator owns fault mapping. Seal is complete.
-  if (is_pe32) {
-    logf_be(be, "trt: PE32: no .pdata unwind (SEH is the FS:0 chain; Phase 2 owns it)");
-    return TRT_OK;
-  }
-
-  // ---- unwind registration: the OS unwinder cannot see VirtualAlloc'd code
-  // until its .pdata is registered. Without this, the FIRST guest C++
-  // exception kills the whole process. This is boot-critical, not optional.
-  const trt_data_directory* ex =
-      trt_pe_directories(&nt->optional_header, magic) + TRT_PE_DIR_EXCEPTION;
-  if (ex->virtual_address && ex->size && be->register_unwind) {
-    const u32 count = ex->size / 12;  // RUNTIME_FUNCTION = 12 bytes (3 x u32)
-    const int rc = be->register_unwind(img->base, img->base + ex->virtual_address,
-                                       count);
-    char line[128];
-    snprintf(line, sizeof(line),
-             "trt: unwind .pdata registered funcs=%u rc=%d (RtlAddFunctionTable)",
-             count, rc);
-    logf_be(be, line);
-  } else if (ex->virtual_address && ex->size) {
-    logf_be(be, "trt: NOTE .pdata present but backend cannot register unwind "
-               "(exceptions in guest code will be fatal)");
-  }
   return TRT_OK;
+}
+
+extern "C" void trt_register_image_unwind(const trt_backend* be, const trt_image* img) {
+  if (img->is_pe32) {
+    logf_be(be, "trt: PE32: no .pdata unwind (SEH is the FS:0 chain; Phase 2 owns it)");
+    return;
+  }
+  if (!img->pdata || !img->pdata_count) return;
+  if (!be->register_unwind) {
+    logf_be(be, "trt: NOTE .pdata present but backend cannot register unwind "
+                 "(exceptions in guest code will be fatal)");
+    return;
+  }
+  const int rc = be->register_unwind(img->base, img->pdata, img->pdata_count);
+  char line[128];
+  snprintf(line, sizeof(line),
+           "trt: unwind .pdata registered funcs=%u rc=%d (RtlAddFunctionTable)",
+           img->pdata_count, rc);
+  logf_be(be, line);
+}
+
+extern "C" int trt_seal_image(const trt_backend* be, trt_image* img) {
+  const int rc = trt_protect_image(be, img);
+  if (rc == TRT_OK) trt_register_image_unwind(be, img);
+  return rc;
 }
 
 extern "C" void trt_unmap(const trt_backend* be, trt_image* img) {
