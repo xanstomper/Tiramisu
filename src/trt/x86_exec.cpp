@@ -3916,10 +3916,28 @@ int x86_run(x86_context* ctx) {
     return ctx->execution;
 }
 
+// Install the main image's static TLS before process-attach callbacks and
+// CRT startup. FS:[0x2c] points to a vector of 32-bit guest TLS addresses.
+static bool install_main_tls(x86_context* ctx, const trt_image& image) {
+    if (!image.tls_data_rva && !image.tls_index_rva && !image.tls_zero_fill)
+        return true;
+    const uint64_t size = uint64_t(image.tls_data_size) + image.tls_zero_fill;
+    if (size > UINT32_MAX || uint64_t(image.tls_index_rva) + 4 > ctx->image_size ||
+        uint64_t(image.tls_data_rva) + image.tls_data_size > ctx->image_size) return false;
+    const uint32_t block = x86_guest_alloc(ctx, size ? uint32_t(size) : 1, 1);
+    if (!block) return false;
+    memcpy(ctx->mem.base + block, ctx->mem.base + ctx->image_va + image.tls_data_rva,
+           image.tls_data_size);
+    constexpr uint32_t main_index = 0;
+    x86_mem_write32(ctx, ctx->image_va + image.tls_index_rva, main_index);
+    x86_mem_write32(ctx, ctx->tls_array + main_index * 4, block);
+    return true;
+}
+
 // ---- Run a 32-bit PE through the interpreter ----
 int x86_run_pe32(x86_context* ctx, void* image_base, size_t image_size,
                  uint32_t guest_base, uint32_t entry_rva, uint32_t stack_base,
-                 size_t stack_size) {
+                 size_t stack_size, const trt_image* image) {
     // The caller normally initializes first (to install the log hook); only
     // initialize when it did not, so a second call never leaks the 4GB
     // reservation.
@@ -3946,26 +3964,49 @@ int x86_run_pe32(x86_context* ctx, void* image_base, size_t image_size,
     // A PE32 guest uses the 24-byte i386 CRITICAL_SECTION layout: bridges that
     // initialize one must not write the Win64 40-byte struct over it.
     // Set up stack
-    if (x86_mem_commit(ctx, stack_base, stack_size) != 0) {
+    if (stack_size < 16 || uint64_t(stack_base) + stack_size > UINT32_MAX ||
+        x86_mem_commit(ctx, stack_base, stack_size) != 0) {
         if (ctx->log) ctx->log("x86: failed to commit stack");
         return -1;
     }
-    ctx->regs.esp = stack_base + (uint32_t)stack_size - 4;
-    ctx->regs.ebp = ctx->regs.esp;
+    const uint32_t stack_top = stack_base + static_cast<uint32_t>(stack_size);
+    x86_mem_write32(ctx, ctx->regs.fs_base + 0x04, stack_top);
+    x86_mem_write32(ctx, ctx->regs.fs_base + 0x08, stack_base);
     if (!ctx->seh_sentinel) {
         if (ctx->log) ctx->log("x86: could not reserve an entry return sentinel");
-        return -1;
+        return X86_EXEC_MEMORY;
     }
-    x86_mem_write32(ctx, ctx->regs.esp, ctx->seh_sentinel);
+    if (image && !install_main_tls(ctx, *image)) {
+        if (ctx->log) ctx->log("x86: could not initialize static TLS for the main image");
+        return X86_EXEC_MEMORY;
+    }
 
-    // Set entry point
-    ctx->regs.eip = guest_base + entry_rva;
+    // Use PE32 argument widths for bridge calls even during TLS callbacks.
+    struct pointer_width_scope {
+        int previous = trt_cs_size_for_guest() == 24 ? 32 : 64;
+        pointer_width_scope() { trt_set_guest_ptr_bits(32); }
+        ~pointer_width_scope() { trt_set_guest_ptr_bits(previous); }
+    } pointer_width;
     ctx->insn_count = 0;
+    if (image) {
+        for (int index = 0; index < image->tls_callback_count; ++index) {
+            const auto callback = image->tls_callback_rvas[index];
+            if (callback >= image_size) return X86_EXEC_BAD_INSTRUCTION;
+            ctx->regs.esp = stack_top - 16;
+            ctx->regs.ebp = ctx->regs.esp;
+            x86_mem_write32(ctx, stack_top - 16, ctx->seh_sentinel);
+            x86_mem_write32(ctx, stack_top - 12, guest_base);
+            x86_mem_write32(ctx, stack_top - 8, 1); // DLL_PROCESS_ATTACH
+            x86_mem_write32(ctx, stack_top - 4, 0);
+            ctx->regs.eip = guest_base + static_cast<uint32_t>(callback);
+            const int result = x86_run(ctx);
+            if (result != X86_EXEC_OK) return result;
+        }
+    }
 
-    // Run
-    const int previous_bits = trt_cs_size_for_guest() == 24 ? 32 : 64;
-    trt_set_guest_ptr_bits(32);
-    const int result = x86_run(ctx);
-    trt_set_guest_ptr_bits(previous_bits);
-    return result;
+    ctx->regs.esp = stack_top - 4;
+    ctx->regs.ebp = ctx->regs.esp;
+    x86_mem_write32(ctx, ctx->regs.esp, ctx->seh_sentinel);
+    ctx->regs.eip = guest_base + entry_rva;
+    return x86_run(ctx);
 }

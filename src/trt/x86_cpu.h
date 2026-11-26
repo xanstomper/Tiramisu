@@ -326,7 +326,7 @@ int x86_mem_map_host(x86_context* ctx, uint32_t guest_addr, void* host_ptr, size
 // Returns 0 on success, -1 on error.
 int x86_run_pe32(x86_context* ctx, void* image_base, size_t image_size,
                  uint32_t guest_base, uint32_t entry_rva, uint32_t stack_base,
-                 size_t stack_size);
+                 size_t stack_size, const trt_image* image = nullptr);
 
 // ---- CPU lifecycle ----
 // Initialize CPU state

@@ -351,7 +351,7 @@ static int run_pe32_image(trt_image* img, const char* name) {
   fflush(stdout);
   const int rc = x86_run_pe32(&ctx, img->base, img->size_of_image,
                               img->guest_base, img->entry_rva, 0x00100000,
-                              0x00100000);
+                              0x00100000, img);
   printf("  run32: engine rc=%d after %llu instructions (eip=0x%08X "
          "eax=0x%08X esp=0x%08X ebp=0x%08X)\n",
          rc, (unsigned long long)ctx.insn_count, ctx.regs.eip, ctx.regs.eax,

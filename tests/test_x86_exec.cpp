@@ -905,6 +905,40 @@ int main() {
         x86_mem_free(&c);
     }
 
+    printf("== x86: PE32 static TLS and process-attach callbacks ==\n");
+    {
+        uint8_t bytes[64]{};
+        const uint8_t entry[] = {
+            0x64, 0xA1, 0x2C, 0, 0, 0, 0x8B, 0x00, // eax = FS:[2c][0]
+            0x8B, 0x40, 0x04, 0xC3                 // return TLS dword at +4
+        };
+        const uint8_t attach[] = {
+            0x64, 0xA1, 0x2C, 0, 0, 0, 0x8B, 0x00,
+            0x8B, 0x4C, 0x24, 0x08, // ecx = reason argument
+            0x02, 0x08,             // add cl,[eax], first TLS template byte
+            0x88, 0x48, 0x04,       // store the sum in the zero-fill tail
+            0xC2, 0x0C, 0x00
+        };
+        memcpy(bytes, entry, sizeof(entry));
+        memcpy(bytes + 32, attach, sizeof(attach));
+        bytes[20] = 41;
+        memset(bytes + 16, 0xFF, 4); // loader has to write the TLS index
+        trt_image image{};
+        image.tls_data_rva = 20;
+        image.tls_data_size = 4;
+        image.tls_zero_fill = 4;
+        image.tls_index_rva = 16;
+        image.tls_callback_count = 1;
+        image.tls_callback_rvas[0] = 32;
+        x86_context c = {};
+        x86_cpu_init(&c);
+        CHECK(x86_run_pe32(&c, bytes, sizeof(bytes), 0x400000, 0, 0x100000, 0x10000, &image) ==
+                  X86_EXEC_OK && c.regs.eax == 42 &&
+                  x86_mem_read32(&c, 0x400010) == 0,
+              "TLS data, zero fill, index and process attach are ready before entry");
+        x86_mem_free(&c);
+    }
+
     printf("== x86: unsupported two-byte opcodes fail the run ==\n");
     {
         const uint8_t bytes[] = {0x0F, 0x0B};  // UD2

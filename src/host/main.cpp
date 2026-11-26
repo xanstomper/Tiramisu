@@ -2567,7 +2567,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     xctx.log = [](const char* s) { longan::log_line(s); };
     checkpoint_phase(longan::launch_phase::x86_execution);
     int rc = x86_run_pe32(&xctx, img->base, img->size_of_image,
-                          img->guest_base, img->entry_rva, 0x00100000, 0x00100000);
+                          img->guest_base, img->entry_rva, 0x00100000, 0x00100000, img);
     if (rc != X86_EXEC_OK) {
       r.map_rc = TRT_ERR_PE32_EXECUTION;
       snprintf(r.detail, sizeof(r.detail), "x86 stopped with status %d at EIP %08X",
