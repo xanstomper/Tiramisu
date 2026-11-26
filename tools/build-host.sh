@@ -35,6 +35,10 @@ MONO_LIB="$("$here/third_party/mono-uwp/build-mono-uwp.sh")" \
 [[ -f "$MONO_LIB" ]] || { echo "ERROR: Mono UWP lib missing: $MONO_LIB" >&2; exit 4; }
 echo "Mono for UWP: $MONO_LIB"
 
+# Generate the Mono door sources from the tracked interface maps before
+# compiling UWP. This also covers builds that skip the Linux test gate.
+bash "$here/third_party/mono-bridges/build-real-bridges.sh" --generate-only
+
 # --- 2. compile + link the host (UWP profile) --------------------------------
 # FNA3D D3D11 (Path B step 3): the D3D11 driver + FNA3D core are compiled
 # into the host so a managed game renders on the host's CoreWindow

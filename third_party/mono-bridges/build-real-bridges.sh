@@ -18,8 +18,19 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
+generate_bridge_includes() {
+  mkdir -p "$here/gen"
+  python3 "$here/gen-failvisible.py"
+  python3 "$here/door-gen.py"
+}
+
+if [[ "${1:-}" == "--generate-only" ]]; then
+  generate_bridge_includes
+  exit 0
+fi
+
 out="$here/out"
-mkdir -p "$out" "$here/gen"
+mkdir -p "$out"
 
 CXX="${CXX:-clang++}"
 CC="${CC:-clang}"
@@ -32,7 +43,10 @@ cd "$root"
 # newer than every input (the gate builds the FNA stack twice). Pass
 # --force to rebuild unconditionally.
 if [[ "${1:-}" != "--force" ]] && [[ -f "$out/libfmod-real.so" ]] &&
-   [[ -f "$out/libcsteamworks-real.so" ]]; then
+   [[ -f "$out/libcsteamworks-real.so" ]] &&
+   [[ -f "$here/gen/gen_studio_doors.inc" ]] &&
+   [[ -f "$here/gen/gen_fmod_failvisible.inc" ]] &&
+   [[ -f "$here/gen/gen_steam_failvisible.inc" ]]; then
   stale=0
   for src in src/trt/bridge_fmod.cpp src/trt/bridge_fmod_studio.cpp \
              src/trt/trt_trace.cpp src/trt/trt_trace.h \
@@ -60,8 +74,7 @@ if [[ "${1:-}" != "--force" ]] && [[ -f "$out/libfmod-real.so" ]] &&
 fi
 
 # 1. Generate the door + fail-visible includes from the implmaps.
-python3 "$here/gen-failvisible.py"
-python3 "$here/door-gen.py"
+generate_bridge_includes
 
 # 2. Compile the bridge sources (with -fPIC; libtrt.a objects are
 #    -fno-pie and cannot go into a shared object).
