@@ -214,10 +214,23 @@ LONG WINAPI mono_veh(EXCEPTION_POINTERS* ep) {
   const DWORD code = ep->ExceptionRecord->ExceptionCode;
   if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_ILLEGAL_INSTRUCTION ||
       code == EXCEPTION_STACK_OVERFLOW || code == EXCEPTION_BREAKPOINT) {
-    char line[320];
-    std::snprintf(line, sizeof(line), "VEH: exception 0x%08lX at %p",
-                  (unsigned long)code, ep->ExceptionRecord->ExceptionAddress);
-    mono_log(line);
+    // Keep repeated exception logs from hiding the first fault on this thread.
+    static thread_local DWORD last_code = 0;
+    static thread_local void* last_address = nullptr;
+    static thread_local unsigned repeats = 0;
+    void* address = ep->ExceptionRecord->ExceptionAddress;
+    if (code != last_code || address != last_address) {
+      last_code = code;
+      last_address = address;
+      repeats = 0;
+    }
+    ++repeats;
+    if (repeats <= 5 || (repeats - 5) % 100 == 0) {
+      char line[320];
+      std::snprintf(line, sizeof(line), "VEH: exception 0x%08lX at %p (occurrence %u)",
+                    (unsigned long)code, address, repeats);
+      mono_log(line);
+    }
   }
   return EXCEPTION_CONTINUE_SEARCH;
 }

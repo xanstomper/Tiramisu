@@ -85,6 +85,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -1727,10 +1728,10 @@ bool recv_exact_all(sock_t s, const char* pre, size_t pre_len, uint64_t len,
   return got == len;
 }
 
-uint64_t stream_to_file(sock_t s, const char* pre, size_t pre_len,
+bool stream_to_file(sock_t s, const char* pre, size_t pre_len,
                         const char* path, uint64_t len) {
   FILE* f = fopen(path, "wb");
-  if (!f) return 0;
+  if (!f) return false;
   uint64_t got = 0;
   bool write_ok = true;
   if (pre && pre_len) {
@@ -1763,9 +1764,9 @@ uint64_t stream_to_file(sock_t s, const char* pre, size_t pre_len,
              "webxfer: upload write failed for %s (disk full or I/O error)",
              path);
     log_line(line);
-    return 0;  // caller removes the partial file + 500s
+    return false;  // caller removes the partial file + 500s
   }
-  if (got != len) return 0;  // short read (client disconnect); caller cleans up
+  if (got != len) return false;  // short read (client disconnect); caller cleans up
   // verify the bytes actually landed on disk before reporting success: a
   // truncated filesystem write must never come back ok:true
 #if defined(_WIN32)
@@ -1785,9 +1786,9 @@ uint64_t stream_to_file(sock_t s, const char* pre, size_t pre_len,
              (unsigned long long)len);
     log_line(line);
     remove(path);
-    return 0;
+    return false;
   }
-  return got;
+  return true;
 }
 
 bool stream_chunked_to_file(sock_t s, const char* pre, size_t pre_len,
@@ -1806,6 +1807,7 @@ bool stream_chunked_to_file(sock_t s, const char* pre, size_t pre_len,
   };
   uint64_t written = 0;
   bool ok = true;
+  bool complete = false;
   while (ok && !g_stop) {
     size_t crlf = buf.find("\r\n");
     while (crlf == std::string::npos) {
@@ -1821,8 +1823,11 @@ bool stream_chunked_to_file(sock_t s, const char* pre, size_t pre_len,
     buf.erase(0, crlf + 2);
     size_t semi = line.find(';');
     if (semi != std::string::npos) line.resize(semi);
-    uint64_t csz = strtoull(line.c_str(), nullptr, 16);
-    if (csz == 0) break;
+    char* end = nullptr;
+    errno = 0;
+    uint64_t csz = strtoull(line.c_str(), &end, 16);
+    if (end == line.c_str() || *end || errno == ERANGE) { ok = false; break; }
+    if (csz == 0) { complete = true; break; }
     uint64_t rem = csz;
     while (rem > 0) {
       if (buf.empty() && !ensure(1)) { ok = false; break; }
@@ -1833,10 +1838,13 @@ bool stream_chunked_to_file(sock_t s, const char* pre, size_t pre_len,
       written += take;
       g_upload_done += take;
     }
-    if (!ok || !ensure(2)) { ok = false; break; }
-    buf.erase(0, 2); // trailing CRLF
+    if (!ok || !ensure(2) || buf.compare(0, 2, "\r\n") != 0) {
+      ok = false;
+      break;
+    }
+    buf.erase(0, 2);
   }
-  if (fclose(f) != 0) ok = false;
+  if (fclose(f) != 0 || !complete) ok = false;
   if (!ok) remove(path);
   if (out_written) *out_written = written;
   return ok;
@@ -2706,8 +2714,8 @@ void handle_client(sock_t s) {
     if (is_chunked) {
       upload_ok = stream_chunked_to_file(s, pre, pre_len, tmp_zip.c_str(), &got);
     } else {
-      got = stream_to_file(s, pre, pre_len, tmp_zip.c_str(), content_len);
-      upload_ok = (got == content_len && got > 0);
+      got = content_len;
+      upload_ok = got > 0 && stream_to_file(s, pre, pre_len, tmp_zip.c_str(), got);
     }
     if (!upload_ok) {
       remove(tmp_zip.c_str());
@@ -3033,18 +3041,35 @@ void handle_client(sock_t s) {
     const size_t sl = out_path.rfind(XFER_SEP);
     if (sl != std::string::npos) mkdirs(out_path.substr(0, sl));
     set_upload_label(game);
+    // Stage on the destination volume so committing a complete file is
+    // atomic. A disconnected sender never replaces the previous file.
+    static std::atomic<uint64_t> upload_id{0};
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::string staged = out_path.substr(0, sl + 1) + ".tiramisu-upload-" +
+        std::to_string(stamp) + "-" + std::to_string(upload_id.fetch_add(1));
     uint64_t got = 0;
     bool upload_ok = false;
     if (is_chunked) {
-      upload_ok = stream_chunked_to_file(s, pre, pre_len, out_path.c_str(), &got);
+      upload_ok = stream_chunked_to_file(s, pre, pre_len, staged.c_str(), &got);
     } else {
-      g_upload_total += content_len;
-      got = stream_to_file(s, pre, pre_len, out_path.c_str(), content_len);
-      upload_ok = (got == content_len);
+      got = content_len;
+      g_upload_total += got;
+      upload_ok = stream_to_file(s, pre, pre_len, staged.c_str(), got);
     }
     if (!upload_ok) {
-      remove(out_path.c_str());
+      remove(staged.c_str());
       respond(s, "500 Server Error", "text/plain", "incomplete file");
+      return;
+    }
+#if defined(_WIN32)
+    const bool committed = MoveFileExA(staged.c_str(), out_path.c_str(),
+                                       MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+    const bool committed = rename(staged.c_str(), out_path.c_str()) == 0;
+#endif
+    if (!committed) {
+      remove(staged.c_str());
+      respond(s, "500 Server Error", "text/plain", "could not commit uploaded file");
       return;
     }
     const bool is_batch = (query_param(query, "batch") == "1");
@@ -3099,8 +3124,8 @@ void handle_client(sock_t s) {
     if (is_chunked) {
       upload_ok = stream_chunked_to_file(s, pre, pre_len, tmp.c_str(), &got);
     } else {
-      got = stream_to_file(s, pre, pre_len, tmp.c_str(), content_len);
-      upload_ok = (got == content_len);
+      got = content_len;
+      upload_ok = stream_to_file(s, pre, pre_len, tmp.c_str(), got);
     }
     if (!upload_ok) {
       remove(tmp.c_str());

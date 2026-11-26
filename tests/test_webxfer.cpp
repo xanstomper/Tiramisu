@@ -9,10 +9,12 @@
 
 #include <arpa/inet.h>
 #include <cstdio>
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <netinet/in.h>
 #include <string>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -88,6 +90,32 @@ std::string http_req(unsigned short port, const std::string& method,
   }
   close(fd);
   return resp;
+}
+
+std::string interrupted_upload(unsigned short port, const char* headers,
+                               const char* body) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return {};
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  std::string response;
+  if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+    const std::string req =
+        "PUT /api/upload-file?game=HollowDemo&rel=HollowDemo.exe HTTP/1.1\r\n"
+        "Host: localhost\r\nConnection: close\r\n" +
+        std::string(headers) + "\r\n" + body;
+    const ssize_t sent = send(fd, req.data(), req.size(), 0);
+    shutdown(fd, SHUT_WR);
+    if (sent == static_cast<ssize_t>(req.size())) {
+      char reply[512];
+      ssize_t n;
+      while ((n = recv(fd, reply, sizeof(reply), 0)) > 0) response.append(reply, n);
+    }
+  }
+  close(fd);
+  return response;
 }
 
 std::string read_str_file(const std::string& p) {
@@ -190,6 +218,37 @@ int main() {
               read_str_file(root + "/games/HollowDemo/HollowDemo_Data/resources.assets") == asset_bytes,
           "Uploaded folder hierarchy & bytes persisted identically on disk");
     CHECK(longan::webxfer_poll_rescan(), "Folder upload flagged host rescan");
+
+    const auto fixed = interrupted_upload(port, "Content-Length: 100\r\n", "partial");
+    const auto chunked = interrupted_upload(port, "Transfer-Encoding: chunked\r\n",
+                                            "7\r\npartial\r\n");
+    CHECK(fixed.find("500 Server Error") != std::string::npos &&
+              chunked.find("500 Server Error") != std::string::npos &&
+              read_str_file(root + "/games/HollowDemo/HollowDemo.exe") == exe_bytes,
+          "Interrupted fixed and chunked replacements preserve the existing file");
+
+    struct rlimit saved_limit{};
+    const bool got_limit = getrlimit(RLIMIT_FSIZE, &saved_limit) == 0;
+    struct rlimit short_limit = saved_limit;
+    short_limit.rlim_cur = 1;
+    const auto saved_handler = signal(SIGXFSZ, SIG_IGN);
+    const bool limited = got_limit && setrlimit(RLIMIT_FSIZE, &short_limit) == 0;
+    std::string write_failure;
+    if (limited) {
+      write_failure = http_req(port, "PUT",
+          "/api/upload-file?game=HollowDemo&rel=HollowDemo.exe", "replacement");
+      setrlimit(RLIMIT_FSIZE, &saved_limit);
+    }
+    signal(SIGXFSZ, saved_handler);
+    CHECK(limited && write_failure.find("500 Server Error") != std::string::npos &&
+              read_str_file(root + "/games/HollowDemo/HollowDemo.exe") == exe_bytes,
+          "Storage write failure preserves the existing file");
+
+    const auto empty = http_req(port, "PUT",
+        "/api/upload-file?game=HollowDemo&rel=empty.dat&batch=1", "");
+    CHECK(empty.find("200 OK") != std::string::npos &&
+              file_exists(root + "/games/HollowDemo/empty.dat"),
+          "An intentional empty file upload succeeds");
   }
 
   // 6. .zip streaming upload + Expect: 100-continue + zip-slip protection

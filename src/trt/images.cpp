@@ -61,9 +61,15 @@ struct extra_dll_dir {
   bool used;
 };
 extra_dll_dir g_extra_dll_dirs[32] = {};
-char g_load_dir_stack[16][512] = {};
-int g_load_dir_depth = 0;
-int g_load_depth = 0;
+thread_local char g_load_dir_stack[16][512] = {};
+thread_local int g_load_dir_depth = 0;
+thread_local int g_load_depth = 0;
+thread_local bool g_import_cycle = false;
+struct pending_guest_image {
+  const char* name;
+  const char* path;
+};
+thread_local pending_guest_image g_pending_images[32] = {};
 // Load-only mode (corpus dry-run): map + bind + seal guest DLLs but do NOT
 // run their TLS callbacks or DllMain — the corpus test proves the load
 // path, it does not execute game code. Default 1 = full boot semantics.
@@ -484,7 +490,7 @@ static bool is_forced_builtin_module(const char* name) {
 
 // Try to load a DLL the game ships with us (from the game's directory).
 static trt_image* try_load_sibling(const char* module) {
-  if (!g_be || g_load_depth > 32) return nullptr;
+  if (!g_be) return nullptr;
   if (is_forced_builtin_module(module)) return nullptr;
   const char* base = base_name(module);
   char host[1024];
@@ -550,6 +556,22 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
       trt_core_log(line);
       return g_images[i].img;
     }
+  // Neither image in a cyclic import can be published by this loader
+  // until its imports bind. Reject re-entry before allocating another copy.
+  for (int i = 0; i < g_load_depth; ++i) {
+    const auto& pending = g_pending_images[i];
+    if (ieq(pending.name, req_base) || path_ieq(pending.path, host_path)) {
+      char line[192];
+      snprintf(line, sizeof(line), "trt: cyclic guest DLL import: %s", req_base);
+      trt_core_log(line);
+      g_import_cycle = true;
+      return nullptr;
+    }
+  }
+  if (g_load_depth == 32) {
+    trt_core_log("trt: guest DLL dependency depth exceeded");
+    return nullptr;
+  }
   size_t size = 0;
   u8* file = read_whole_file(host_path, &size);
   if (!file) {
@@ -561,10 +583,17 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
 
   LoadDirGuard load_dir_guard(host_path);
   trt_image* img = nullptr;
-  ++g_load_depth;
+  if (g_load_depth == 0) g_import_cycle = false;
+  g_pending_images[g_load_depth++] = {req_base, host_path};
   const int rc = trt_map_pe(g_be, &g_rs, file, size, &img);
-  --g_load_depth;
+  g_pending_images[--g_load_depth] = {};
   free(file);
+  // The import resolver can install a placeholder for a missing export.
+  // A real cyclic dependency must still fail before either image is published.
+  if (g_import_cycle) {
+    if (img) trt_unmap(g_be, img);
+    return nullptr;
+  }
   if (rc != TRT_OK || !img) {
     char line[320];
     snprintf(line, sizeof(line), "trt: guest image %s failed to map (%s)",

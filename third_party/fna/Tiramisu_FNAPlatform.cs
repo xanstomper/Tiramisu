@@ -64,6 +64,7 @@ namespace Microsoft.Xna.Framework
 		 * dropped (the managed game is the ring's only consumer).
 		 */
 		private const int WM_ACTIVATE = 0x0006;
+		private const int WM_CLOSE = 0x0010;
 		private const int WM_KEYDOWN = 0x0100;
 		private const int WM_KEYUP = 0x0101;
 		private const int WM_CHAR = 0x0102;
@@ -460,6 +461,14 @@ namespace Microsoft.Xna.Framework
 					{
 						game.IsActive = (wparam & 0xFFFF) != 0;
 					}
+				}
+				else if (message == WM_CLOSE)
+				{
+					if (game != null)
+					{
+						game.Exit();
+					}
+					return;
 				}
 				else if (message == WM_KEYDOWN)
 				{

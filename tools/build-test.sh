@@ -227,6 +227,7 @@ cp "$out/guestdll.dll" "$split_dir/sub/nested.dll"
 clang++ -std=c++20 -O2 -Wall -no-pie tests/test_formatmessage_alloc.cpp "$out/libtrt.a" \
   -lpthread -o "$out/test_formatmessage_alloc"
 "$out/test_formatmessage_alloc"
+bash tests/test_cycle_loader.sh
 
 # --- 8. the graphics bridge: the guest's D3D11 calls must reach the host's GPU ---
 SDK="$HOME/.cache/uwp-crossbuild/xwin/sdk/include"
