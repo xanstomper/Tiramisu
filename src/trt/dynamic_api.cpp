@@ -2,6 +2,7 @@
 // Universal Dynamic API Synthesizer & Intelligent Blanket Thunking.
 #include "dynamic_api.h"
 #include "thunk.h"
+#include "trt.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -11,18 +12,68 @@
 
 namespace {
 
-char lower_ascii(char c) {
-  return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
-}
-
 std::mutex g_synth_mu;
 std::unordered_set<std::string> g_synthesized_symbols;
+
+// Universal COM Object Implementation
+// Vtable containing 256 slots following Microsoft x64 calling convention (TRT_GUEST_ABI / ms_abi).
+// QueryInterface returns the universal COM object itself with S_OK.
+// AddRef returns 2, Release returns 1.
+// All interface methods return S_OK (0).
+
+static int TRT_GUEST_ABI universal_com_QueryInterface(void* self, const void* riid, void** ppv) {
+  (void)riid;
+  if (ppv) {
+    *ppv = self;
+    return 0; // S_OK
+  }
+  return (int)0x80004003; // E_POINTER
+}
+
+static uint32_t TRT_GUEST_ABI universal_com_AddRef(void* self) {
+  (void)self;
+  return 2;
+}
+
+static uint32_t TRT_GUEST_ABI universal_com_Release(void* self) {
+  (void)self;
+  return 1;
+}
+
+static int TRT_GUEST_ABI universal_com_stub_method(void* self, void* a1, void* a2, void* a3) {
+  (void)self; (void)a1; (void)a2; (void)a3;
+  return 0; // S_OK
+}
+
+struct UniversalComObject {
+  const void* const* lpVtbl;
+};
+
+static const void* g_universal_com_vtable[256] = { nullptr };
+static UniversalComObject g_universal_com_instance = { nullptr };
+static std::once_flag g_com_init_flag;
+
+void init_universal_com() {
+  g_universal_com_vtable[0] = (const void*)&universal_com_QueryInterface;
+  g_universal_com_vtable[1] = (const void*)&universal_com_AddRef;
+  g_universal_com_vtable[2] = (const void*)&universal_com_Release;
+  for (int i = 3; i < 256; ++i) {
+    g_universal_com_vtable[i] = (const void*)&universal_com_stub_method;
+  }
+  g_universal_com_instance.lpVtbl = g_universal_com_vtable;
+}
 
 } // namespace
 
 extern "C" {
 
+void* trt_dynamic_universal_com_object(void) {
+  std::call_once(g_com_init_flag, init_universal_com);
+  return &g_universal_com_instance;
+}
+
 uint64_t trt_dynamic_deduce_return_val(const char* module, const char* symbol) {
+  (void)module;
   if (!symbol) return 0;
 
   // Ordinal fallback
@@ -35,19 +86,102 @@ uint64_t trt_dynamic_deduce_return_val(const char* module, const char* symbol) {
   }
   uint64_t pseudo_handle = 0x77000000ULL | (uint64_t)((h & 0x00FFFFFE) + 2);
 
-  // 1. Handle & Object Creators / Openers / Loaders
+  // 1. Steamworks API
+  if (strncmp(symbol, "SteamAPI_Init", 13) == 0 ||
+      strncmp(symbol, "SteamAPI_IsSteamRunning", 23) == 0) {
+    return 1; // true
+  }
+  if (strncmp(symbol, "SteamAPI_RestartAppIfNecessary", 30) == 0) {
+    return 0; // false: no need to restart through Steam client
+  }
+  if (strncmp(symbol, "SteamInternal_CreateInterface", 29) == 0 ||
+      strncmp(symbol, "SteamInternal_FindOrCreateUserInterface", 39) == 0 ||
+      strncmp(symbol, "SteamInternal_FindOrCreateGameServerInterface", 45) == 0 ||
+      strcmp(symbol, "SteamAppList") == 0 ||
+      strcmp(symbol, "SteamApps") == 0 ||
+      strcmp(symbol, "SteamFriends") == 0 ||
+      strcmp(symbol, "SteamUtils") == 0 ||
+      strcmp(symbol, "SteamUser") == 0 ||
+      strcmp(symbol, "SteamUserStats") == 0 ||
+      strcmp(symbol, "SteamRemoteStorage") == 0 ||
+      strcmp(symbol, "SteamScreenshots") == 0 ||
+      strcmp(symbol, "SteamMatchmaking") == 0 ||
+      strcmp(symbol, "SteamMatchmakingServers") == 0 ||
+      strcmp(symbol, "SteamNetworking") == 0 ||
+      strcmp(symbol, "SteamHTTP") == 0 ||
+      strcmp(symbol, "SteamController") == 0 ||
+      strcmp(symbol, "SteamUGC") == 0 ||
+      strcmp(symbol, "SteamInput") == 0) {
+    return (uint64_t)(uintptr_t)trt_dynamic_universal_com_object();
+  }
+  if (strncmp(symbol, "SteamAPI_GetHSteamUser", 22) == 0 ||
+      strncmp(symbol, "SteamAPI_GetHSteamPipe", 22) == 0) {
+    return pseudo_handle;
+  }
+
+  // 2. Audio Middleware (FMOD, Wwise, Bink, OpenAL, Miles)
+  if (strncmp(symbol, "FMOD_", 5) == 0) {
+    return 0; // FMOD_OK (0)
+  }
+  if (strncmp(symbol, "Ak", 2) == 0 || strncmp(symbol, "AK::", 4) == 0) {
+    return 1; // AK_Success (1) in Audiokinetic Wwise SDK
+  }
+  if (strncmp(symbol, "BinkOpen", 8) == 0) {
+    return pseudo_handle;
+  }
+  if (strncmp(symbol, "Bink", 4) == 0) {
+    return 0;
+  }
+
+  // 3. Epic Online Services (EOS) & Discord & Galaxy & NVAPI & AMD AGS & NVIDIA GFSDK
+  if (strncmp(symbol, "EOS_Initialize", 14) == 0 ||
+      strncmp(symbol, "EOS_Shutdown", 12) == 0) {
+    return 0; // EOS_Success (0)
+  }
+  if (strncmp(symbol, "EOS_Platform_Create", 19) == 0 ||
+      strncmp(symbol, "EOS_Platform_Get", 16) == 0) {
+    return pseudo_handle;
+  }
+  if (strncmp(symbol, "DiscordCreate", 13) == 0) {
+    return 0; // DiscordResult_Ok (0)
+  }
+  if (strncmp(symbol, "NvAPI_Initialize", 16) == 0 ||
+      strncmp(symbol, "NvAPI_", 6) == 0) {
+    return 0; // NVAPI_OK (0)
+  }
+  if (strncmp(symbol, "ags", 3) == 0) {
+    return 0; // AGS_SUCCESS (0)
+  }
+  if (strncmp(symbol, "GFSDK_", 6) == 0) {
+    return 0; // GFSDK_OK (0)
+  }
+  if (strncmp(symbol, "Crashpad_", 9) == 0 ||
+      strncmp(symbol, "Breakpad_", 9) == 0 ||
+      strncmp(symbol, "sentry_", 7) == 0) {
+    return 0;
+  }
+
+  // 4. Handle & Object Creators / Openers / Loaders
   if (strncmp(symbol, "Create", 6) == 0 ||
       strncmp(symbol, "Open", 4) == 0 ||
       strncmp(symbol, "FindFirst", 9) == 0 ||
       strncmp(symbol, "LoadLibrary", 11) == 0 ||
       strncmp(symbol, "GetModuleHandle", 15) == 0 ||
       strncmp(symbol, "GetStdHandle", 12) == 0 ||
-      strncmp(symbol, "BeginPaint", 10) == 0) {
+      strncmp(symbol, "BeginPaint", 10) == 0 ||
+      strncmp(symbol, "VirtualAlloc", 12) == 0 ||
+      strncmp(symbol, "HeapAlloc", 9) == 0 ||
+      strncmp(symbol, "GlobalAlloc", 11) == 0 ||
+      strncmp(symbol, "LocalAlloc", 10) == 0) {
     return pseudo_handle;
   }
 
-  // 2. Booleans & Success-by-default modifiers
-  if (strncmp(symbol, "Is", 2) == 0 ||
+  // 5. Booleans & Success-by-default modifiers
+  if (strncmp(symbol, "QueryPerformance", 16) == 0 ||
+      strncmp(symbol, "GetClientRect", 13) == 0 ||
+      strncmp(symbol, "GetWindowRect", 13) == 0 ||
+      strncmp(symbol, "AdjustWindowRect", 16) == 0 ||
+      strncmp(symbol, "Is", 2) == 0 ||
       strncmp(symbol, "Set", 3) == 0 ||
       strncmp(symbol, "Close", 5) == 0 ||
       strncmp(symbol, "Delete", 6) == 0 ||
@@ -63,11 +197,17 @@ uint64_t trt_dynamic_deduce_return_val(const char* module, const char* symbol) {
       strncmp(symbol, "Play", 4) == 0 ||
       strncmp(symbol, "Stop", 4) == 0 ||
       strncmp(symbol, "Pause", 5) == 0 ||
+      strncmp(symbol, "VirtualFree", 11) == 0 ||
+      strncmp(symbol, "HeapFree", 8) == 0 ||
       strncmp(symbol, "Release", 7) == 0) {
     return 1;
   }
 
-  // 3. COM / HRESULT / Win32 Status
+  if (strcmp(symbol, "GetSystemMetrics") == 0) {
+    return 1080;
+  }
+
+  // 6. COM / HRESULT / Win32 Status
   if (strncmp(symbol, "Co", 2) == 0 ||
       strncmp(symbol, "Reg", 3) == 0 ||
       strncmp(symbol, "D3D", 3) == 0 ||
@@ -80,7 +220,7 @@ uint64_t trt_dynamic_deduce_return_val(const char* module, const char* symbol) {
     return 0; // S_OK / ERROR_SUCCESS
   }
 
-  // 4. Versioning & Dimensions
+  // 7. Versioning & Dimensions
   if (strncmp(symbol, "GetVersion", 10) == 0) {
     return 0x0A00; // Windows 10
   }
@@ -88,7 +228,7 @@ uint64_t trt_dynamic_deduce_return_val(const char* module, const char* symbol) {
     return 1;
   }
 
-  // 5. Memory queries
+  // 8. Memory queries
   if (strncmp(symbol, "VirtualQuery", 12) == 0) {
     return 48; // sizeof(MEMORY_BASIC_INFORMATION64)
   }
@@ -97,6 +237,7 @@ uint64_t trt_dynamic_deduce_return_val(const char* module, const char* symbol) {
 }
 
 int trt_dynamic_deduce_arg_count(const char* module, const char* symbol) {
+  (void)module;
   if (!symbol) return 0;
   if (symbol[0] == '#') return 4;
 

@@ -39,6 +39,7 @@ struct ui_steam_item {
   std::wstring size_str;
   bool installed;
   bool downloading;
+  bool queued = false;
   float download_pct;
   std::wstring status_str;
   std::wstring install_dir;
@@ -59,7 +60,8 @@ struct ui_steam_ach {
 
 void ui_steam_nav_up();
 void ui_steam_nav_down();
-int ui_steam_selected_index();
+unsigned ui_steam_selected_app();
+void ui_steam_cycle_filter(int direction);
 void ui_set_steam_account(bool signed_in, uint64_t steamid64,
                           std::wstring persona, std::wstring status_line);
 void ui_set_steam_items(const std::vector<ui_steam_item>& items);
@@ -77,6 +79,9 @@ void ui_set_input_mode(bool controller_active, bool pad_connected);
 // Live mouse/pointer position & visibility for crisp D2D vector cursor
 void ui_set_pointer_pos(int x, int y);
 void ui_set_cursor_visible(bool visible);
+bool ui_can_draw_cursor();
+int ui_settings_step(int direction);
+int ui_settings_next_section();
 
 // Sleek top-center glassmorphic toast banner (auto-fades after duration_sec)
 void ui_toast(std::wstring message, float duration_sec = 3.2f);
@@ -140,6 +145,7 @@ enum class ui_click_type {
   delete_game,
   open_transfer,
   select_setting,
+  select_settings_section,
   reset_settings,
   select_steam,
   steam_action,

@@ -27,6 +27,12 @@ static int g_passed = 0, g_failed = 0;
   } while (0)
 
 extern "C" int trt_bridge_register_res(void);
+extern "C" void* TRT_STDCALL trt_LoadImageA(void* inst, const char* name,
+                                            u32 type, int cx, int cy,
+                                            u32 flags);
+extern "C" void* TRT_STDCALL trt_DialogBoxParamA(void* inst, const char* tmpl,
+                                                 void* parent, void* proc,
+                                                 i64 init);
 
 // real backend: plain mmap host (same pattern as test_corpus.cpp)
 struct extent { void* base; size_t len; };
@@ -44,7 +50,7 @@ static void* be_alloc(size_t bytes, u64 preferred_base) {
 #endif
   void* p = mmap(preferred_base ? (void*)(uintptr_t)preferred_base : nullptr,
                  bytes, PROT_READ | PROT_WRITE,
-                 preferred_base ? (MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS)
+                 preferred_base ? (MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS)
                                 : (MAP_PRIVATE | MAP_ANONYMOUS),
                  -1, 0);
   if (p == MAP_FAILED) return nullptr;
@@ -191,6 +197,26 @@ int main(int argc, char** argv) {
   // ---- 11. FreeResource/UnlockResource succeed ----
   CHECK(trt_FreeResource(hglob) == 0, "FreeResource == 0 (success)");
   CHECK(trt_UnlockResource(hglob) == 0, "UnlockResource == 0 (success)");
+
+  // ---- 12. MAKEINTRESOURCE atoms are never dereferenced as strings ----
+  // Measured on Putty: LoadImageA(hinst, MAKEINTRESOURCE(200), IMAGE_ICON)
+  // and DialogBoxParamA(hinst, MAKEINTRESOURCE(101)) log their name, and the
+  // old %s formatting read address 0xc8 and faulted the host in strlen.
+  {
+    void* icon = trt_LoadImageA(hmod, (const char*)(uintptr_t)200, 1, 0, 0, 0);
+    CHECK(icon != nullptr,
+          "LoadImageA(MAKEINTRESOURCE(200), IMAGE_ICON) -> icon handle");
+    void* cur = trt_LoadImageA(hmod, (const char*)(uintptr_t)201, 2, 0, 0, 0);
+    CHECK(cur != nullptr,
+          "LoadImageA(MAKEINTRESOURCE(201), IMAGE_CURSOR) -> cursor handle");
+    CHECK(trt_LoadImageA(hmod, (const char*)(uintptr_t)202, 0, 0, 0, 0) ==
+              nullptr,
+          "LoadImageA type 0 -> NULL (named, no image decode)");
+    void* dlg = trt_DialogBoxParamA(hmod, (const char*)(uintptr_t)101, nullptr,
+                                    nullptr, 0);
+    CHECK((intptr_t)dlg == -1,
+          "DialogBoxParamA(MAKEINTRESOURCE(101)) -> -1 without a host fault");
+  }
 
   printf("RESULT: %s (%d passed, %d failed)\n",
          g_failed == 0 ? "ALL PASS" : "FAILURES", g_passed, g_failed);

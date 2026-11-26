@@ -55,10 +55,12 @@ void line(const char* s) { trt_core_log(s); }
 // ---- shared with bridge_kernel32.cpp (extern-C accessors live there) ------
 extern "C" FILE* trt_file_os(void* h);        // handle -> FILE* (or null)
 extern "C" const char* trt_file_vpath(void* h); // handle -> guest path ("C:\...")
+extern "C" int trt_file_copy_vpath(void* handle, char* path, size_t capacity);
 extern "C" char* trt_gap_cwd(void);           // the guest cwd (g_cwd)
 extern "C" const char* trt_gap_exepath(void);  // the guest exe path (g_exepath)
 extern "C" void TRT_STDCALL trt_SetLastError(u32 e);
 extern "C" u32 TRT_STDCALL trt_GetLastError(void);
+extern "C" u32 TRT_STDCALL trt_GetTempFileNameW(const u16*, const u16*, u32, u16*);
 extern "C" int TRT_STDCALL trt_CreateDirectoryW(const u16* path, void* sa);
 extern "C" u32 TRT_STDCALL trt_GetCurrentProcessId(void);
 extern "C" void* TRT_GUEST_ABI trt_GetStdHandle(u32 handle_id);
@@ -312,25 +314,52 @@ int TRT_STDCALL trt_MulDiv(int a, int b, int c) {
 }
 
 // ---- diagnostics formatting -------------------------------------------------
+extern void* TRT_STDCALL trt_LocalAlloc(u32 flags, u64 bytes);
+
 u32 TRT_STDCALL trt_FormatMessageW(u32 flags, const void* src, u32 msgid,
                                    u32 langid, u16* buf, u32 size, void* args) {
-  (void)langid; (void)args;
-  // FORMAT_MESSAGE_FROM_SYSTEM (0x1000): a numeric error code only — the
-  // honest answer is the code itself; full message tables are a named gap.
-  if (flags & 0x1000) {
-    char narrow[96];
-    snprintf(narrow, sizeof(narrow), "error %lu", (unsigned long)msgid);
+  (void)langid; (void)args; (void)src;
+  if (!buf) {
+    trt_SetLastError(87);
+    return 0;
+  }
+
+  char narrow[256];
+  switch (msgid) {
+    case 0: snprintf(narrow, sizeof(narrow), "The operation completed successfully.\r\n"); break;
+    case 2: snprintf(narrow, sizeof(narrow), "The system cannot find the file specified.\r\n"); break;
+    case 3: snprintf(narrow, sizeof(narrow), "The system cannot find the path specified.\r\n"); break;
+    case 5: snprintf(narrow, sizeof(narrow), "Access is denied.\r\n"); break;
+    case 6: snprintf(narrow, sizeof(narrow), "The handle is invalid.\r\n"); break;
+    case 14: snprintf(narrow, sizeof(narrow), "Not enough storage is available to complete this operation.\r\n"); break;
+    case 87: snprintf(narrow, sizeof(narrow), "The parameter is incorrect.\r\n"); break;
+    case 126: snprintf(narrow, sizeof(narrow), "The specified module could not be found.\r\n"); break;
+    case 127: snprintf(narrow, sizeof(narrow), "The specified procedure could not be found.\r\n"); break;
+    default: snprintf(narrow, sizeof(narrow), "Error code %lu.\r\n", (unsigned long)msgid); break;
+  }
+
+  u32 len = (u32)strlen(narrow);
+  if (flags & 0x0100) {  // FORMAT_MESSAGE_ALLOCATE_BUFFER
+    u32 alloc_chars = (size > len + 1) ? size : (len + 1);
+    u16* alloc_buf = (u16*)trt_LocalAlloc(0x40 /* LMEM_ZEROINIT */, (u64)alloc_chars * sizeof(u16));
+    if (!alloc_buf) {
+      trt_SetLastError(8);
+      return 0;
+    }
+    for (u32 i = 0; i < len; ++i) alloc_buf[i] = (u16)(u8)narrow[i];
+    alloc_buf[len] = 0;
+    *(u16**)buf = alloc_buf;
+    return len;
+  } else {
+    if (size == 0) {
+      trt_SetLastError(87);
+      return 0;
+    }
     u32 n = 0;
-    for (; narrow[n] && n < size - 1; ++n) buf[n] = (u16)(u8)narrow[n];
+    for (; n < len && n < size - 1; ++n) buf[n] = (u16)(u8)narrow[n];
     buf[n] = 0;
     return n;
   }
-  char line[128];
-  snprintf(line, sizeof(line),
-           "kernel32: FormatMessageW flags=0x%lx unsupported (only "
-           "FROM_SYSTEM) -> 0", (unsigned long)flags);
-  LOG(line);
-  return 0;
 }
 
 // ---- loader search path ------------------------------------------------------
@@ -460,9 +489,8 @@ u32 TRT_STDCALL trt_K32GetModuleFileNameExW(void* proc, void* mod, u16* buf,
 // ---- paths ------------------------------------------------------------------------
 u32 TRT_STDCALL trt_GetFinalPathNameByHandleW(void* h, u16* buf, u32 len,
                                               u32 flags) {
-  FILE* os = trt_file_os(h);
-  const char* vpath = trt_file_vpath(h);
-  if (!os || !vpath || !vpath[0]) {
+  char vpath[512];
+  if (!trt_file_copy_vpath(h, vpath, sizeof(vpath))) {
     trt_SetLastError(6);  // ERROR_INVALID_HANDLE
     return 0;
   }
@@ -573,6 +601,30 @@ int TRT_STDCALL trt_SystemTimeToTzSpecificLocalTime(const void* tzi,
   return 1;
 }
 
+int TRT_STDCALL trt_FileTimeToLocalFileTime(const u64* ft, u64* local_ft) {
+  if (!ft || !local_ft) { trt_SetLastError(87); return 0; }
+  *local_ft = *ft;
+  return 1;
+}
+
+int TRT_STDCALL trt_LocalFileTimeToFileTime(const u64* local_ft, u64* ft) {
+  if (!local_ft || !ft) { trt_SetLastError(87); return 0; }
+  *ft = *local_ft;
+  return 1;
+}
+
+int TRT_STDCALL trt_FileTimeToDosDateTime(const u64* ft, u16* fat_date, u16* fat_time) {
+  if (!ft || !fat_date || !fat_time) { trt_SetLastError(87); return 0; }
+  u16 st[8];
+  if (!trt_FileTimeToSystemTime(ft, st)) return 0;
+  u16 year = st[0];
+  if (year < 1980) year = 1980;
+  else if (year > 2107) year = 2107;
+  *fat_date = (u16)(((year - 1980) << 9) | ((st[1] & 0x0F) << 5) | (st[3] & 0x1F));
+  *fat_time = (u16)(((st[4] & 0x1F) << 11) | ((st[5] & 0x3F) << 5) | ((st[6] / 2) & 0x1F));
+  return 1;
+}
+
 // ---- files ---------------------------------------------------------------------------
 int TRT_STDCALL trt_SetEndOfFile(void* h) {
   FILE* os = trt_file_os(h);
@@ -590,23 +642,66 @@ int TRT_STDCALL trt_SetEndOfFile(void* h) {
 // < 2GB in the VFS so long works on both hosts. (_ftelli64 exists but the
 // handle table stores FILE* only — no size caching needed for <2GB.)
 
+// ---- forward declarations ---------------------------------------------------
+int TRT_STDCALL trt_GetFileTime(void* h, u64* created, u64* accessed, u64* modified);
+
+// Win32 BY_HANDLE_FILE_INFORMATION ABI (52 bytes on x86 and x64):
+// Exactly 13 32-bit DWORD fields. Any 64-bit field inside forces alignment/padding
+// that breaks callers (such as Mono's _fstat which reads nFileSizeLow at offset 0x24).
+struct trt_by_handle_file_information {
+  u32 dwFileAttributes;
+  u32 ftCreationTime_low;
+  u32 ftCreationTime_high;
+  u32 ftLastAccessTime_low;
+  u32 ftLastAccessTime_high;
+  u32 ftLastWriteTime_low;
+  u32 ftLastWriteTime_high;
+  u32 dwVolumeSerialNumber;
+  u32 nFileSizeHigh;
+  u32 nFileSizeLow;
+  u32 nNumberOfLinks;
+  u32 nFileIndexHigh;
+  u32 nFileIndexLow;
+};
+static_assert(sizeof(trt_by_handle_file_information) == 52,
+              "BY_HANDLE_FILE_INFORMATION must be exactly 52 bytes");
+
 int TRT_STDCALL trt_GetFileInformationByHandle(void* h, void* info) {
-  // BY_HANDLE_FILE_INFORMATION: attributes u32, times 8+8, volume/serial
-  // u32+u32... 52 bytes total on x64. Size + attributes are the fields
-  // games actually read; times are zero (named gap).
-  struct bhfi { u32 attrs; u64 created, accessed, modified;
-                u32 vol_serial, index_hi, index_lo; u64 size; };
   FILE* os = trt_file_os(h);
   if (!os) { trt_SetLastError(6); return 0; }
   if (!info) { trt_SetLastError(87); return 0; }
-  bhfi* b = (bhfi*)info;
+  trt_by_handle_file_information* b = (trt_by_handle_file_information*)info;
   memset(b, 0, sizeof(*b));
-  b->attrs = 0x80;  // FILE_ATTRIBUTE_NORMAL
-  const long pos = ftell(os);
-  fseek(os, 0, SEEK_END);
-  const long sz = ftell(os);
-  fseek(os, pos, SEEK_SET);
-  b->size = (u64)sz;
+  b->dwFileAttributes = 0x80;  // FILE_ATTRIBUTE_NORMAL
+  b->nNumberOfLinks = 1;
+
+  u64 ft = 0;
+  trt_GetFileTime(h, &ft, nullptr, nullptr);
+  b->ftCreationTime_low = (u32)ft;
+  b->ftCreationTime_high = (u32)(ft >> 32);
+  b->ftLastAccessTime_low = (u32)ft;
+  b->ftLastAccessTime_high = (u32)(ft >> 32);
+  b->ftLastWriteTime_low = (u32)ft;
+  b->ftLastWriteTime_high = (u32)(ft >> 32);
+
+  u64 sz = 0;
+  struct stat st;
+#ifdef _WIN32
+  const int fd = _fileno(os);
+#else
+  const int fd = fileno(os);
+#endif
+  if (fd >= 0 && fstat(fd, &st) == 0) {
+    sz = (u64)st.st_size;
+  } else {
+    const long pos = ftell(os);
+    fseek(os, 0, SEEK_END);
+    const long lsz = ftell(os);
+    fseek(os, pos, SEEK_SET);
+    if (lsz >= 0) sz = (u64)lsz;
+  }
+  b->nFileSizeLow = (u32)(sz & 0xFFFFFFFFull);
+  b->nFileSizeHigh = (u32)(sz >> 32);
   return 1;
 }
 
@@ -1051,6 +1146,19 @@ int TRT_STDCALL trt_SystemTimeToFileTime(const u16* st_in, u64* ft_out) {
   return 1;
 }
 
+int TRT_STDCALL trt_DosDateTimeToFileTime(u16 fat_date, u16 fat_time, u64* ft) {
+  if (!ft) { trt_SetLastError(87); return 0; }
+  u16 st[8];
+  memset(st, 0, sizeof(st));
+  st[0] = 1980 + ((fat_date >> 9) & 0x7F);
+  st[1] = (fat_date >> 5) & 0x0F;
+  st[3] = fat_date & 0x1F;
+  st[4] = (fat_time >> 11) & 0x1F;
+  st[5] = (fat_time >> 5) & 0x3F;
+  st[6] = (fat_time & 0x1F) * 2;
+  return trt_SystemTimeToFileTime(st, ft);
+}
+
 // ============================================================================
 // InitOnce state machine (exact Win32 INIT_ONCE)
 // ============================================================================
@@ -1422,10 +1530,20 @@ u32 TRT_STDCALL trt_GetTempPathA(u32 len, char* buf) {
 
 u32 TRT_STDCALL trt_GetTempFileNameA(const char* path, const char* prefix,
                                      u32 uniq, char* out) {
-  if (!path || !out) { trt_SetLastError(87); return 0; }
-  static u32 counter = 1;
-  const u32 id = uniq ? uniq : counter++;
-  snprintf(out, 260, "%s\\%.3s%04X.tmp", path, prefix ? prefix : "tmp", id);
+  if (!path || !prefix || !out) { trt_SetLastError(87); return 0; }
+  if (strlen(path) >= 260) { trt_SetLastError(206); return 0; }
+  u16 wide_path[260], wide_prefix[4], wide_result[260];
+  gap_ascii_to_u16(path, wide_path, 260);
+  gap_ascii_to_u16(prefix, wide_prefix, 4);
+  const u32 id = trt_GetTempFileNameW(wide_path, wide_prefix, uniq, wide_result);
+  if (id) {
+    size_t i = 0;
+    while (wide_result[i]) {
+      out[i] = static_cast<char>(wide_result[i]);
+      ++i;
+    }
+    out[i] = '\0';
+  }
   return id;
 }
 
@@ -3427,6 +3545,10 @@ static const trt_named_fn k_gap_fns[] = {
   {"GetFullPathNameW", (void*)&trt_GetFullPathNameW},
   {"GetTimeZoneInformation", (void*)&trt_GetTimeZoneInformation},
   {"FileTimeToSystemTime", (void*)&trt_FileTimeToSystemTime},
+  {"FileTimeToLocalFileTime", (void*)&trt_FileTimeToLocalFileTime},
+  {"LocalFileTimeToFileTime", (void*)&trt_LocalFileTimeToFileTime},
+  {"FileTimeToDosDateTime", (void*)&trt_FileTimeToDosDateTime},
+  {"DosDateTimeToFileTime", (void*)&trt_DosDateTimeToFileTime},
   {"SystemTimeToTzSpecificLocalTime", (void*)&trt_SystemTimeToTzSpecificLocalTime},
   {"SetEndOfFile", (void*)&trt_SetEndOfFile},
   {"GetFileInformationByHandle", (void*)&trt_GetFileInformationByHandle},

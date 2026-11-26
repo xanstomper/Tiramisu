@@ -193,6 +193,7 @@ struct trt_gl_hooks {
 
 int trt_bridge_register_opengl32(void);
 void trt_gl_set_hooks(const trt_gl_hooks* hooks);
+int trt_gl_render_hooks_present(void);
 int trt_wgl_swap_buffers(void* hdc);
 
 #ifdef __cplusplus

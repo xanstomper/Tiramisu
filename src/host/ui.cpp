@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -32,6 +33,7 @@ namespace {
 
 float g_w = 1920.0f, g_h = 1080.0f;
 ID2D1Factory1* g_factory = nullptr;
+ID2D1PathGeometry* g_cursor_shape = nullptr;
 ID2D1DeviceContext* g_ctx = nullptr;
 ID2D1Device* g_d2d_device = nullptr;
 IDXGISwapChain1* g_swap = nullptr;
@@ -103,6 +105,51 @@ float g_fps = 0.0f;
 std::wstring g_sysinfo;
 std::vector<ui_setting> g_set_rows;
 int g_set_selected = 0;
+struct settings_section {
+  const wchar_t* title;
+  const wchar_t* description;
+  std::vector<int> rows;
+};
+const settings_section k_settings_sections[] = {
+    {L"Input", L"Default controls, cursor speed and controller response.", {0, 1, 2, 3, 15}},
+    {L"Display", L"Frame pacing, render targets and on-screen indicators.", {12, 13, 18, 19, 9, 10}},
+    {L"Audio", L"Audio latency and decoding options for compatible games.", {16, 20}},
+    {L"Console", L"Steam, the LAN dashboard and the in-game overlay.", {7, 8, 11}},
+    {L"Compatibility", L"Guest OS, memory budget and engine compatibility.", {4, 5, 6, 14, 17}},
+};
+
+int selected_settings_section() {
+  for (int i = 0; i < static_cast<int>(std::size(k_settings_sections)); ++i) {
+    const auto& rows = k_settings_sections[i].rows;
+    if (std::find(rows.begin(), rows.end(), g_set_selected) != rows.end()) return i;
+  }
+  return 0;
+}
+
+constexpr const wchar_t* k_setting_help[] = {
+    L"Used when a game has its input mode set to Auto.",
+    L"Controls movement speed when a controller drives the pointer.",
+    L"Controls scroll speed for the controller wheel shortcut.",
+    L"Passes game vibration to a connected controller.",
+    L"Reports this Windows version to guest apps.",
+    L"Reports a Windows 11 build to compatible guest apps.",
+    L"Enables write tracking for guest runtimes that request it.",
+    L"Enables Steam account linking on the console.",
+    L"Shows the transfer address and QR code on the TV.",
+    L"Adds an FPS indicator to the on-screen overlay.",
+    L"Shows runtime and console information on the TV.",
+    L"Enables the Shift+Tab shortcut for the in-game menu.",
+    L"Synchronizes presentation with the display refresh where supported.",
+    L"Limits the runtime's target frame rate. Off removes the cap.",
+    L"Limits the guest heap inside the console's available memory.",
+    L"Ignores small stick movements around the controller's neutral position.",
+    L"Sets the requested audio buffer duration.",
+    L"Reuses compiled shaders in runtime paths that support caching.",
+    L"Sets the render scale used by compatible runtime graphics paths.",
+    L"Sets the texture preference used by compatible graphics paths.",
+    L"Enables the runtime's FSB5 decoding path.",
+};
+
 std::vector<std::wstring> g_log_tail;
 int g_log_scroll_offset = 0;
 float g_anim_time = 0.0f;
@@ -146,6 +193,28 @@ std::wstring g_tool_result;
 // Steam state
 int g_steam_selected = 0;
 std::vector<ui_steam_item> g_steam_items;
+std::vector<ui_steam_item> g_steam_library;
+int g_steam_filter = 0;
+constexpr const wchar_t* k_steam_filters[] = {L"Library", L"Installed", L"Downloads"};
+size_t g_steam_installed = 0;
+size_t g_steam_downloading = 0;
+
+void filter_steam_items(unsigned selected_app) {
+  g_steam_items.clear();
+  for (const auto& item : g_steam_library) {
+    if ((g_steam_filter == 1 && !item.installed) ||
+        (g_steam_filter == 2 && !item.downloading && !item.queued)) continue;
+    g_steam_items.push_back(item);
+  }
+  const auto selected = std::find_if(g_steam_items.begin(), g_steam_items.end(),
+      [selected_app](const auto& item) { return item.app_id == selected_app; });
+  if (selected != g_steam_items.end())
+    g_steam_selected = static_cast<int>(selected - g_steam_items.begin());
+  else
+    g_steam_selected = std::clamp(g_steam_selected, 0,
+                                std::max(0, static_cast<int>(g_steam_items.size()) - 1));
+}
+
 bool g_steam_signed_in = false;
 uint64_t g_steam_id64 = 0;
 std::wstring g_steam_persona;
@@ -1012,7 +1081,7 @@ void draw_home_screen() {
       wchar_t st_buf[64];
       float pct = 0.0f;
       if (g_storage_total_gb > 0.1) {
-        pct = (float)std::clamp(g_storage_used_gb / g_storage_total_gb, 0.04, 1.0);
+        pct = (float)std::clamp(g_storage_used_gb / g_storage_total_gb, 0.0, 1.0);
         if (g_storage_total_gb >= 900.0) {
           swprintf(st_buf, 64, L"%.1f GB / %.1f TB", g_storage_used_gb,
                    g_storage_total_gb / 1000.0);
@@ -1021,8 +1090,7 @@ void draw_home_screen() {
                    g_storage_total_gb);
         }
       } else {
-        swprintf(st_buf, 64, L"Xbox Dev Storage Ready");
-        pct = 0.12f;
+        swprintf(st_buf, 64, L"Storage usage unavailable");
       }
       text_out(g_f_nav, right_x + sx(22.0f), st_y + sy(74.0f), right_w - sx(44.0f),
                sy(28.0f), st_buf, g_br_white);
@@ -1034,9 +1102,11 @@ void draw_home_screen() {
       const float fill_p =
           ease_out_quart(std::clamp((anim_clk - 0.34f) / 0.50f, 0.0f, 1.0f));
       fill_rrect(trk_x, trk_y, trk_w, trk_h, trk_h * 0.5f, g_br_pill_bg);
-      fill_rrect(trk_x + sc(2.0f), trk_y + sc(2.0f),
-                 std::max(trk_h - sc(4.0f), (trk_w - sc(4.0f)) * pct * fill_p),
-                 trk_h - sc(4.0f), (trk_h - sc(4.0f)) * 0.5f, g_br_white);
+      if (pct > 0.0f && fill_p > 0.0f) {
+        const float width = (trk_w - sc(4.0f)) * pct * fill_p;
+        fill_rrect(trk_x + sc(2.0f), trk_y + sc(2.0f), width,
+                   trk_h - sc(4.0f), std::min(width, trk_h - sc(4.0f)) * 0.5f, g_br_white);
+      }
     }
   }
 
@@ -1173,10 +1243,21 @@ void draw_library_screen() {
 
   text_out(g_f_small, pad_x + sx(24.0f), pill_y + sy(60.0f), left_w - sx(48.0f),
            sy(26.0f), L"Add Games", g_br_accent);
-  text_out(g_f_small, pad_x + sx(24.0f), pill_y + sy(90.0f), left_w - sx(48.0f),
-           sy(90.0f),
-           L"• Open Tools tab to drop folders, .zip archives, or direct URLs over LAN.\n• Open Steam tab to download owned games.",
-           g_br_dim);
+  constexpr const wchar_t* add_actions[] = {L"Transfer over LAN", L"Open Steam library"};
+  for (int i = 0; i < 2; ++i) {
+    const float x = pad_x + sx(18.0f);
+    const float y = top_y + sy(190.0f + i * 48.0f);
+    const float w = left_w - sx(36.0f);
+    const bool hover = ptr_in(x, y, w, sy(40.0f));
+    fill_rrect(x, y, w, sy(40.0f), sy(20.0f), hover ? g_br_glass2 : g_br_pill_bg);
+    stroke_rrect(x, y, w, sy(40.0f), sy(20.0f),
+                 hover ? g_br_border_hi : g_br_border, sc(1.1f));
+    text_out_line(g_f_small, x + sx(14.0f), y, w - sx(28.0f), sy(40.0f),
+                  add_actions[i], g_br_white, DWRITE_TEXT_ALIGNMENT_LEADING,
+                  DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+  }
+  text_out(g_f_small, pad_x + sx(24.0f), top_y + sy(292.0f), left_w - sx(48.0f),
+           sy(64.0f), L"USB games appear here when Xbox can read the drive's game folder.", g_br_dim);
 
   // Right Top: Selected Game Inspector Banner
   const float insp_h = sy(196.0f);
@@ -1371,15 +1452,34 @@ void draw_steam_screen() {
            g_steam_signed_in ? L"Your Steam Library" : L"Steam Library",
            g_br_white);
 
-  const float list_y0 = top_y + sy(66.0f);
+  const float filter_x = pad_x + sx(16.0f);
+  const float filter_y = top_y + sy(62.0f);
+  const float filter_w = (left_w - sx(48.0f)) / 3;
+  const size_t counts[] = {g_steam_library.size(), g_steam_installed, g_steam_downloading};
+  for (int i = 0; i < 3; ++i) {
+    const float x = filter_x + i * (filter_w + sx(8.0f));
+    const auto title = std::wstring(k_steam_filters[i]) + L"  " + std::to_wstring(counts[i]);
+    if (i == g_steam_filter) {
+      draw_champagne_pill(x, filter_y, filter_w, sy(36.0f));
+    } else {
+      fill_rrect(x, filter_y, filter_w, sy(36.0f), sy(18.0f), g_br_pill_bg);
+      if (ptr_in(x, filter_y, filter_w, sy(36.0f)))
+        stroke_rrect(x, filter_y, filter_w, sy(36.0f), sy(18.0f), g_br_border_hi, sc(1.4f));
+    }
+    text_out_line(g_f_small, x + sx(6.0f), filter_y, filter_w - sx(12.0f),
+                  sy(36.0f), title.c_str(), i == g_steam_filter ? g_br_ink : g_br_sub,
+                  DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+  }
+  const float list_y0 = top_y + sy(112.0f);
   const float row_h = sy(68.0f);
-  const int max_vis = std::max(1, (int)((full_h - sy(84.0f)) / row_h));
+  const int max_vis = std::max(1, (int)((full_h - sy(128.0f)) / row_h));
   if (g_steam_items.empty()) {
     text_out(g_f_body, pad_x + sx(26.0f), list_y0 + sy(24.0f),
              left_w - sx(52.0f), sy(120.0f),
-             g_steam_signed_in
-                 ? L"No Steam titles returned yet.\nPress Refresh to fetch your owned Steam games."
-                 : L"Sign in with Steam QR to view your owned Steam purchases and download them directly onto your Xbox.",
+             g_steam_filter == 2 ? L"No downloads or queued installs."
+             : g_steam_filter == 1 ? L"No installed Steam games."
+             : g_steam_signed_in ? L"No titles found. Refresh to reload your Steam library."
+             : L"Sign in with Steam QR to view your library and install games on Xbox.",
              g_br_dim);
   } else {
     int start = 0;
@@ -1404,7 +1504,9 @@ void draw_steam_screen() {
                     it.title.c_str(), sel ? g_br_white : g_br_sub);
 
       std::wstring st;
-      if (it.downloading) {
+      if (it.queued) {
+        st = L"Queued";
+      } else if (it.downloading) {
         wchar_t b[128];
         swprintf(b, 128, L"%d%% · %s", (int)(it.download_pct * 100.0f),
                  it.status_str.empty() ? L"Downloading..." : it.status_str.c_str());
@@ -1429,6 +1531,12 @@ void draw_steam_screen() {
     }
   }
 
+  const int total = static_cast<int>(g_steam_items.size());
+  const int first_visible = total > max_vis
+      ? std::clamp(g_steam_selected - max_vis / 2, 0, total - max_vis) : 0;
+  draw_scrollbar(pad_x + left_w - sx(9.0f), list_y0,
+                 full_h - sy(128.0f), first_visible, max_vis, total);
+
   // Right Card: Account Status + Action Button + Centered Steam QR Code
   draw_glass_card(right_x, top_y, right_w, full_h, 24.0f);
   wchar_t hdr[160];
@@ -1448,17 +1556,22 @@ void draw_steam_screen() {
              sy(38.0f), sel.title.c_str(), g_br_white);
 
     const float by = top_y + sy(104.0f);
-    draw_champagne_pill(right_x + sx(24.0f), by, right_w - sx(48.0f), sy(48.0f));
+    const bool action_enabled = sel.installed || sel.downloading || sel.queued || g_steam_signed_in;
+    if (action_enabled)
+      draw_champagne_pill(right_x + sx(24.0f), by, right_w - sx(48.0f), sy(48.0f));
+    else
+      fill_rrect(right_x + sx(24.0f), by, right_w - sx(48.0f), sy(48.0f), sy(24.0f), g_br_pill_bg);
     if (g_controller_active) {
       draw_xbox_btn(right_x + sx(52.0f), by + sy(24.0f), sc(11.0f), L'A',
                     g_br_xbox_a, true);
     }
-    std::wstring bt = sel.downloading
-                          ? (sel.status_str.empty() ? L"Downloading..." : sel.status_str)
+    std::wstring bt = sel.downloading || sel.queued
+                          ? L"Cancel download"
                           : (sel.installed ? L"▶  Launch on Xbox"
-                                           : L"Download from Steam to Xbox");
+                                           : g_steam_signed_in ? L"Install on Xbox"
+                                                                  : L"Sign in to install");
     text_out(g_f_nav, right_x + sx(24.0f), by, right_w - sx(48.0f), sy(48.0f),
-             bt.c_str(), g_br_ink, DWRITE_TEXT_ALIGNMENT_CENTER,
+             bt.c_str(), action_enabled ? g_br_ink : g_br_dim, DWRITE_TEXT_ALIGNMENT_CENTER,
              DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
   }
 
@@ -1472,6 +1585,35 @@ void draw_steam_screen() {
     draw_qr_in_box(right_x + (right_w - qsz) * 0.5f, qy + sy(56.0f), qsz);
   } else {
     const float qbtn_y = top_y + full_h - sy(74.0f);
+    const float content_x = right_x + sx(24.0f);
+    const float content_w = right_w - sx(48.0f);
+    float y = qy + sy(58.0f);
+    if (g_steam_signed_in && y + sy(84.0f) < qbtn_y) {
+      text_out_line(g_f_nav, content_x, y, content_w, sy(28.0f), L"Friends", g_br_white);
+      y += sy(32.0f);
+      int shown = 0;
+      for (const auto& friend_info : g_steam_friends) {
+        if (friend_info.state == 0 || y + sy(62.0f) >= qbtn_y || shown == 4) continue;
+        const auto line = friend_info.game_name.empty() ? friend_info.persona
+            : friend_info.persona + L"  ·  " + friend_info.game_name;
+        text_out_line(g_f_small, content_x, y, content_w, sy(23.0f), line.c_str(), g_br_sub);
+        y += sy(24.0f);
+        ++shown;
+      }
+      if (!shown) {
+        text_out_line(g_f_small, content_x, y, content_w, sy(24.0f),
+                      L"No online friends reported", g_br_dim);
+        y += sy(24.0f);
+      }
+      if (!g_steam_achs.empty() && y + sy(50.0f) < qbtn_y) {
+        const auto unlocked = std::count_if(g_steam_achs.begin(), g_steam_achs.end(),
+            [](const auto& achievement) { return achievement.achieved; });
+        const auto label = L"Achievement activity  ·  " + std::to_wstring(unlocked) +
+                           L" of " + std::to_wstring(g_steam_achs.size()) + L" unlocked";
+        text_out_line(g_f_small, content_x, y + sy(10.0f), content_w, sy(24.0f),
+                      label.c_str(), g_br_accent);
+      }
+    }
     fill_rrect(right_x + sx(24.0f), qbtn_y, right_w - sx(48.0f), sy(46.0f),
                sy(23.0f), g_br_glass2);
     stroke_rrect(right_x + sx(24.0f), qbtn_y, right_w - sx(48.0f), sy(46.0f),
@@ -1490,8 +1632,13 @@ void draw_steam_screen() {
 
   draw_controller_footer({{L'A', L"Download / Play"},
                           {L'Y', L"Steam QR Login"},
-                          {L'X', L"Refresh Library"},
-                          {L'B', L"Back to Home"}});
+                          {L'X', L"Refresh"},
+                          {L'B', L"Back"}});
+  if (!g_controller_active) {
+    text_out_line(g_f_small, pad_x + sx(18.0f), top_y + full_h - sy(24.0f),
+                  left_w - sx(36.0f), sy(20.0f),
+                  L"Left / Right switches library views", g_br_dim);
+  }
 }
 
 // ============================================================================
@@ -1596,7 +1743,8 @@ void draw_tools_screen() {
       fill_rrect(rx, ry, rw, trow_h - sy(5.0f), sc(12.0f), g_br_glass2);
       stroke_rrect(rx, ry, rw, trow_h - sy(5.0f), sc(12.0f), g_br_white, sc(1.6f));
     } else {
-      fill_rrect(rx, ry, rw, trow_h - sy(5.0f), sc(12.0f), g_br_pill_bg);
+      fill_rrect(rx, ry, rw, trow_h - sy(5.0f), sc(12.0f),
+                 ptr_in(rx, ry, rw, trow_h - sy(5.0f)) ? g_br_glass2 : g_br_pill_bg);
     }
     text_out_line(g_f_small, rx + sx(14.0f), ry, rw * 0.35f, trow_h - sy(5.0f),
                   g_tools[i].title.c_str(), sel ? g_br_white : g_br_sub,
@@ -1667,14 +1815,20 @@ void draw_settings_screen() {
   text_out(g_f_small, pad_x + sx(22.0f), top_y + sy(58.0f), left_w - sx(44.0f),
            sy(42.0f), L"Tiramisu UWP Runtime & Xbox Dev Mode Config", g_br_dim);
 
-  draw_champagne_pill(pad_x + sx(18.0f), top_y + sy(116.0f), left_w - sx(36.0f),
-                      sy(40.0f));
-  text_out(g_f_body, pad_x + sx(34.0f), top_y + sy(116.0f), left_w - sx(68.0f),
-           sy(40.0f), L"All Console Settings", g_br_ink,
-           DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+  const int section = selected_settings_section();
+  for (int i = 0; i < static_cast<int>(std::size(k_settings_sections)); ++i) {
+    const float x = pad_x + sx(18.0f);
+    const float y = top_y + sy(116.0f + 48.0f * i);
+    const float w = left_w - sx(36.0f);
+    if (i == section) draw_champagne_pill(x, y, w, sy(40.0f));
+    else fill_rrect(x, y, w, sy(40.0f), sy(20.0f),
+                    ptr_in(x, y, w, sy(40.0f)) ? g_br_glass2 : g_br_pill_bg);
+    text_out_line(g_f_body, x + sx(16.0f), y, w - sx(32.0f), sy(40.0f),
+                  k_settings_sections[i].title, i == section ? g_br_ink : g_br_white,
+                  DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+  }
 
-  // Reset Defaults button on left rail (clickable + Y)
-  const float rbtn_y = top_y + sy(172.0f);
+  const float rbtn_y = top_y + full_h - sy(144.0f);
   const bool rhov = ptr_in(pad_x + sx(18.0f), rbtn_y, left_w - sx(36.0f), sy(40.0f));
   fill_rrect(pad_x + sx(18.0f), rbtn_y, left_w - sx(36.0f), sy(40.0f),
              sy(20.0f), g_br_glass2);
@@ -1688,13 +1842,6 @@ void draw_settings_screen() {
            left_w - sx(g_controller_active ? 72.0f : 36.0f), sy(40.0f),
            L"Reset Defaults", g_br_white, DWRITE_TEXT_ALIGNMENT_CENTER,
            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-
-  if (!g_set_rows.empty()) {
-    wchar_t posb[48];
-    swprintf(posb, 48, L"Setting %d of %zu", g_set_selected + 1, g_set_rows.size());
-    text_out(g_f_small, pad_x + sx(22.0f), top_y + sy(226.0f), left_w - sx(44.0f),
-             sy(24.0f), posb, g_br_accent);
-  }
 
   text_out(g_f_small, pad_x + sx(22.0f), top_y + full_h - sy(92.0f),
            left_w - sx(44.0f), sy(72.0f),
@@ -1710,14 +1857,16 @@ void draw_settings_screen() {
     return;
   }
 
-  const float row_h = sy(52.0f);
-  const int max_vis = std::max(1, (int)((full_h - sy(44.0f)) / row_h));
-  const int count = (int)g_set_rows.size();
-  const int start =
-      count > max_vis ? std::clamp(g_set_selected - max_vis / 2, 0, count - max_vis) : 0;
-
-  for (int i = start; i < count && (i - start) < max_vis; ++i) {
-    const float ry = top_y + sy(22.0f) + (i - start) * row_h;
+  const auto& group = k_settings_sections[section];
+  text_out_line(g_f_nav, right_x + sx(24.0f), top_y + sy(18.0f),
+                right_w - sx(48.0f), sy(28.0f), group.title, g_br_white);
+  text_out(g_f_small, right_x + sx(24.0f), top_y + sy(52.0f),
+           right_w - sx(48.0f), sy(28.0f), group.description, g_br_dim);
+  const float row_h = sy(58.0f);
+  int slot = 0;
+  for (int i : group.rows) {
+    if (i >= static_cast<int>(g_set_rows.size())) continue;
+    const float ry = top_y + sy(90.0f) + slot++ * row_h;
     const float rx = right_x + sx(20.0f);
     const float rw = right_w - sx(40.0f);
     const bool sel = (i == g_set_selected);
@@ -1746,7 +1895,7 @@ void draw_settings_screen() {
       disp_val = on ? L"ON" : L"OFF";
     }
     const bool is_on = (disp_val == L"ON");
-    if (sel && !g_set_rows[i].is_bool) {
+    if (sel && (g_set_rows[i].is_int || g_set_rows[i].is_choice)) {
       disp_val = L"◀  " + disp_val + L"  ▶";
     }
     if (is_on || sel) {
@@ -1762,12 +1911,16 @@ void draw_settings_screen() {
     }
   }
 
-  draw_scrollbar(right_x + right_w - sx(12.0f), top_y + sy(22.0f),
-                 full_h - sy(44.0f), start, max_vis, count);
+  if (g_set_selected >= 0 &&
+      g_set_selected < static_cast<int>(std::size(k_setting_help))) {
+    const float help_y = top_y + sy(104.0f) + slot * row_h;
+    text_out(g_f_small, right_x + sx(24.0f), help_y,
+             right_w - sx(48.0f), sy(64.0f), k_setting_help[g_set_selected], g_br_accent);
+  }
 
-  draw_controller_footer({{L'A', L"Toggle / Change"},
-                          {L'Y', L"Reset Defaults"},
-                          {L'B', L"Back to Home"}});
+  draw_controller_footer({{L'A', L"Change setting"}, {L'X', L"Next section"},
+                          {L'Y', L"Reset defaults"}, {L'B', L"Back"}});
+
 }
 
 // ============================================================================
@@ -1904,7 +2057,7 @@ void draw_quick_menu() {
   text_out(g_f_small, px + sx(28.0f), py + ph - sy(44.0f), pw - sx(56.0f),
            sy(28.0f),
            g_controller_active
-               ? L"D-Pad: Navigate   ·   (A) Select   ·   (B) / View+Menu: Resume Game"
+               ? L"D-Pad: Navigate   ·   (A) Select   ·   (B) Resume   ·   Back+Start: Exit Game"
                : L"Up/Down: Navigate   ·   Enter: Select   ·   Esc: Resume Game",
            g_br_dim);
 }
@@ -1960,41 +2113,45 @@ void draw_toast_overlay() {
   if (fg) fg->Release();
 }
 
-void draw_vector_cursor() {
-  if (!g_cursor_visible || !g_factory || g_ptr_x < 0 || g_ptr_y < 0) return;
-  const float x = (float)g_ptr_x;
-  const float y = (float)g_ptr_y;
-  const float s = sc(1.15f);
-  D2D1_POINT_2F pts[7] = {
-      {x, y},
-      {x, y + 21.0f * s},
-      {x + 5.4f * s, y + 16.2f * s},
-      {x + 9.4f * s, y + 23.5f * s},
-      {x + 12.6f * s, y + 21.8f * s},
-      {x + 8.6f * s, y + 14.5f * s},
-      {x + 15.6f * s, y + 14.5f * s},
-  };
-  ID2D1PathGeometry* pg = nullptr;
-  if (SUCCEEDED(g_factory->CreatePathGeometry(&pg))) {
+bool prepare_vector_cursor() {
+  if (!g_factory || !g_ctx || !g_br_white || !g_br_ink) return false;
+  if (!g_cursor_shape) {
+    if (FAILED(g_factory->CreatePathGeometry(&g_cursor_shape))) return false;
     ID2D1GeometrySink* sink = nullptr;
-    if (SUCCEEDED(pg->Open(&sink))) {
-      sink->BeginFigure(pts[0], D2D1_FIGURE_BEGIN_FILLED);
-      sink->AddLines(pts + 1, 6);
-      sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-      sink->Close();
-      sink->Release();
+    if (FAILED(g_cursor_shape->Open(&sink))) {
+      g_cursor_shape->Release();
+      g_cursor_shape = nullptr;
+      return false;
     }
-    ID2D1SolidColorBrush* fill = nullptr;
-    g_ctx->CreateSolidColorBrush(D2D1::ColorF(0.08f, 0.07f, 0.10f, 0.96f), &fill);
-    if (fill) {
-      g_ctx->FillGeometry(pg, fill);
-      fill->Release();
+    constexpr D2D1_POINT_2F points[] = {
+        {0.f, 0.f}, {0.f, 21.f}, {5.4f, 16.2f}, {9.4f, 23.5f},
+        {12.6f, 21.8f}, {8.6f, 14.5f}, {15.6f, 14.5f},
+    };
+    sink->BeginFigure(points[0], D2D1_FIGURE_BEGIN_FILLED);
+    sink->AddLines(points + 1, static_cast<UINT32>(std::size(points) - 1));
+    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+    const HRESULT result = sink->Close();
+    sink->Release();
+    if (FAILED(result)) {
+      g_cursor_shape->Release();
+      g_cursor_shape = nullptr;
+      return false;
     }
-    g_ctx->DrawGeometry(pg, g_br_white, sc(1.9f));
-    pg->Release();
   }
+  return true;
 }
 
+void draw_vector_cursor() {
+  if (!g_cursor_visible || g_ptr_x < 0 || g_ptr_y < 0 || !prepare_vector_cursor()) return;
+  const float size = sc(1.15f);
+  D2D1_MATRIX_3X2_F previous;
+  g_ctx->GetTransform(&previous);
+  g_ctx->SetTransform(D2D1::Matrix3x2F(size, 0.f, 0.f, size,
+                                      static_cast<float>(g_ptr_x), static_cast<float>(g_ptr_y)));
+  g_ctx->FillGeometry(g_cursor_shape, g_br_white);
+  g_ctx->DrawGeometry(g_cursor_shape, g_br_ink, 1.6f);
+  g_ctx->SetTransform(previous);
+}
 } // namespace
 
 // ============================================================================
@@ -2012,7 +2169,18 @@ void ui_steam_nav_down() {
     ui_sfx_move();
   }
 }
-int ui_steam_selected_index() { return g_steam_selected; }
+unsigned ui_steam_selected_app() {
+  return g_steam_selected >= 0 && g_steam_selected < static_cast<int>(g_steam_items.size())
+             ? g_steam_items[g_steam_selected].app_id : 0;
+}
+
+void ui_steam_cycle_filter(int direction) {
+  const unsigned selected_app = ui_steam_selected_app();
+  g_steam_filter = (g_steam_filter + direction + 3) % 3;
+  g_steam_selected = 0;
+  filter_steam_items(selected_app);
+  ui_sfx_move();
+}
 
 void ui_set_steam_account(bool signed_in, uint64_t steamid64,
                           std::wstring persona, std::wstring status_line) {
@@ -2023,10 +2191,13 @@ void ui_set_steam_account(bool signed_in, uint64_t steamid64,
 }
 
 void ui_set_steam_items(const std::vector<ui_steam_item>& items) {
-  g_steam_items = items;
-  if (g_steam_selected >= (int)g_steam_items.size()) {
-    g_steam_selected = items.empty() ? 0 : (int)items.size() - 1;
-  }
+  const unsigned selected_app = ui_steam_selected_app();
+  g_steam_library = items;
+  g_steam_installed = std::count_if(items.begin(), items.end(),
+      [](const auto& item) { return item.installed; });
+  g_steam_downloading = std::count_if(items.begin(), items.end(),
+      [](const auto& item) { return item.downloading || item.queued; });
+  filter_steam_items(selected_app);
 }
 
 void ui_set_steam_friends(const std::vector<ui_steam_friend>& friends) {
@@ -2062,6 +2233,20 @@ void ui_set_pointer_pos(int x, int y) {
 }
 
 void ui_set_cursor_visible(bool visible) { g_cursor_visible = visible; }
+bool ui_can_draw_cursor() { return prepare_vector_cursor(); }
+
+int ui_settings_step(int direction) {
+  const auto& rows = k_settings_sections[selected_settings_section()].rows;
+  const auto current = std::find(rows.begin(), rows.end(), g_set_selected);
+  const int index = current == rows.end() ? 0 : static_cast<int>(current - rows.begin());
+  return rows[std::clamp(index + direction, 0, static_cast<int>(rows.size()) - 1)];
+}
+
+int ui_settings_next_section() {
+  const int next = (selected_settings_section() + 1) % static_cast<int>(std::size(k_settings_sections));
+  return k_settings_sections[next].rows.front();
+}
+
 
 void ui_toast(std::wstring message, float duration_sec) {
   g_toast_msg = std::move(message);
@@ -2203,6 +2388,7 @@ void ui_shutdown() {
   rel(g_br_xbox_a); rel(g_br_xbox_b); rel(g_br_xbox_x); rel(g_br_xbox_y);
   rel(g_f_hero); rel(g_f_hero_md); rel(g_f_stat); rel(g_f_h2); rel(g_f_nav);
   rel(g_f_body); rel(g_f_small); rel(g_f_mono); rel(g_f_btn);
+  rel(g_cursor_shape);
   rel(g_ctx); rel(g_dw); rel(g_d2d_device); rel(g_swap); rel(g_factory);
 }
 
@@ -2366,6 +2552,10 @@ ui_click ui_hit_test(int x, int y) {
     const float left_w = full_w * 0.25f;
     const float right_x = pad_x + left_w + gap;
     const float right_w = full_w - left_w - gap;
+    if (hits(pad_x + sx(18.0f), top_y + sy(190.0f), left_w - sx(36.0f), sy(40.0f)))
+      return {ui_click_type::tab, UI_TOOLS};
+    if (hits(pad_x + sx(18.0f), top_y + sy(238.0f), left_w - sx(36.0f), sy(40.0f)))
+      return {ui_click_type::tab, UI_STEAM};
     const float insp_h = sy(196.0f);
     const float by = top_y + insp_h - sy(58.0f);
     if (hits(right_x + sx(26.0f), by, sx(152.0f), sy(40.0f))) {
@@ -2403,9 +2593,17 @@ ui_click ui_hit_test(int x, int y) {
     const float left_w = full_w * 0.54f;
     const float right_x = pad_x + left_w + gap;
     const float right_w = full_w - left_w - gap;
-    const float list_y0 = top_y + sy(66.0f);
+    const float filter_w = (left_w - sx(48.0f)) / 3;
+    for (int i = 0; i < 3; ++i) {
+      const float x = pad_x + sx(16.0f) + i * (filter_w + sx(8.0f));
+      if (hits(x, top_y + sy(62.0f), filter_w, sy(36.0f))) {
+        if (i != g_steam_filter) ui_steam_cycle_filter(i - g_steam_filter);
+        return {ui_click_type::select_steam, 0};
+      }
+    }
+    const float list_y0 = top_y + sy(112.0f);
     const float row_h = sy(68.0f);
-    const int max_vis = std::max(1, (int)((full_h - sy(84.0f)) / row_h));
+    const int max_vis = std::max(1, (int)((full_h - sy(128.0f)) / row_h));
     int start = ((int)g_steam_items.size() > max_vis)
                     ? std::clamp(g_steam_selected - max_vis / 2, 0,
                                  (int)g_steam_items.size() - max_vis)
@@ -2420,7 +2618,8 @@ ui_click ui_hit_test(int x, int y) {
     if (hits(right_x + sx(24.0f), top_y + sy(104.0f), right_w - sx(48.0f), sy(48.0f))) {
       return {ui_click_type::steam_action, g_steam_selected};
     }
-    if (hits(right_x + sx(24.0f), top_y + full_h - sy(74.0f), right_w - sx(48.0f), sy(46.0f))) {
+    if (!(g_qr_size > 0 && g_qr_text.find("s.team") != std::string::npos) &&
+        hits(right_x + sx(24.0f), top_y + full_h - sy(74.0f), right_w - sx(48.0f), sy(46.0f))) {
       return {ui_click_type::steam_qr, 0};
     }
   } else if (g_screen == UI_TOOLS) {
@@ -2448,17 +2647,22 @@ ui_click ui_hit_test(int x, int y) {
     const float left_w = full_w * 0.25f;
     const float right_x = pad_x + left_w + gap;
     const float right_w = full_w - left_w - gap;
-    if (hits(pad_x + sx(18.0f), top_y + sy(172.0f), left_w - sx(36.0f), sy(40.0f))) {
+    if (hits(pad_x + sx(18.0f), top_y + full_h - sy(144.0f),
+             left_w - sx(36.0f), sy(40.0f))) {
       return {ui_click_type::reset_settings, 0};
     }
-    const float row_h = sy(52.0f);
-    const int max_vis = std::max(1, (int)((full_h - sy(44.0f)) / row_h));
-    const int count = (int)g_set_rows.size();
-    const int start = count > max_vis
-                          ? std::clamp(g_set_selected - max_vis / 2, 0, count - max_vis)
-                          : 0;
-    for (int i = start; i < count && (i - start) < max_vis; ++i) {
-      const float ry = top_y + sy(22.0f) + (i - start) * row_h;
+    for (int i = 0; i < static_cast<int>(std::size(k_settings_sections)); ++i) {
+      if (hits(pad_x + sx(18.0f), top_y + sy(116.0f + 48.0f * i),
+               left_w - sx(36.0f), sy(40.0f))) {
+        return {ui_click_type::select_settings_section, k_settings_sections[i].rows.front()};
+      }
+    }
+    const float row_h = sy(58.0f);
+    const auto& group = k_settings_sections[selected_settings_section()];
+    int slot = 0;
+    for (int i : group.rows) {
+      if (i >= static_cast<int>(g_set_rows.size())) continue;
+      const float ry = top_y + sy(90.0f) + slot++ * row_h;
       if (hits(right_x + sx(20.0f), ry, right_w - sx(40.0f), row_h - sy(6.0f))) {
         return {ui_click_type::select_setting, i};
       }

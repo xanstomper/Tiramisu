@@ -3969,6 +3969,11 @@ void trt_gl_set_hooks(const trt_gl_hooks* hooks) {
   }
 }
 
+int trt_gl_render_hooks_present(void) {
+  std::lock_guard<std::mutex> lk(g_gl_mu);
+  return g_gl_hooks_set && g_gl_hooks.draw && g_gl_hooks.swap_buffers;
+}
+
 int trt_wgl_swap_buffers(void* hdc) {
   std::lock_guard<std::mutex> lk(g_gl_mu);
   if (wgl_ctx* c = cur_ctx()) {

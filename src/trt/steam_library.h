@@ -10,7 +10,10 @@
 #ifndef TIRAMISU_STEAM_LIBRARY_H
 #define TIRAMISU_STEAM_LIBRARY_H
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // One installed (or partially installed) Steam app.
@@ -51,6 +54,47 @@ int trt_steam_parse_library_paths(const std::string& text,
 // Parse one appmanifest_<id>.acf. Returns 0 on success, -1 when the text has no
 // AppState block or no usable appid.
 int trt_steam_parse_appmanifest(const std::string& text, trt_steam_app* out);
+
+struct trt_steam_depot {
+  uint32_t id = 0;
+  uint32_t source_app = 0; // nonzero for a depot supplied by another app
+  uint64_t manifest = 0;   // zero if looked up in source_app
+  uint64_t size = 0;
+  bool optional_dlc = false;
+};
+
+struct trt_steam_app_content {
+  std::vector<trt_steam_depot> depots; // overlay order, later depots take precedence
+  std::string executable;
+  std::string arguments;
+  std::string working_dir;
+};
+
+// Parse the public Windows content in a Steam PICS response. Selects the
+// default launch entry, neutral and English files, and the applicable PC arch.
+bool trt_steam_parse_app_content(const std::string& text, trt_steam_app_content* out);
+
+// Look up one depot's public manifest in its source app, without applying
+// the source app's platform or language selection to the requesting app.
+bool trt_steam_find_public_depot(const std::string& text, uint32_t depot_id,
+                                trt_steam_depot* out);
+
+// Convert a depot path to a relative Windows path with canonical separators.
+bool trt_steam_normalize_content_path(const std::string& path, std::string* out);
+
+struct trt_steam_depot_path_owner {
+  size_t depot;
+  size_t file;
+  bool directory;
+};
+using trt_steam_depot_layout = std::unordered_map<std::string, trt_steam_depot_path_owner>;
+
+// Layout keys are normalized Windows paths, compared case insensitively for ASCII.
+std::string trt_steam_depot_path_key(std::string path);
+bool trt_steam_add_depot_path(trt_steam_depot_layout& layout, const std::string& path,
+                             trt_steam_depot_path_owner owner);
+bool trt_steam_validate_depot_layout(const trt_steam_depot_layout& layout,
+                                    std::string* conflict);
 
 // Pick the launcher exe inside an install dir: the largest *.exe in the top
 // level of installdir (Steam games keep their launcher there; shipping

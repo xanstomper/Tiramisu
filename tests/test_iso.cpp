@@ -618,6 +618,60 @@ static void test_guest_apis() {
   check(trt_vfs_is_image_utf16(wpath) == 0, "unmounting removes the drive");
 }
 
+// Discovery: a game that keeps its disc in a subfolder, and a .cue sheet whose
+// FILE track is the mountable image, must both be found and mounted - the two
+// layouts where "the game files were not mounted" used to be the whole bug.
+static void test_image_discovery() {
+  printf("STAGE 6 image discovery (.cue, nested folders)\n");
+  const char* root = "/tmp/opencode/tira-discover";
+  const char* nested = "/tmp/opencode/tira-discover/game/disc";
+  char cmd[512];
+  snprintf(cmd, sizeof(cmd), "rm -rf %s && mkdir -p %s", root, nested);
+  if (system(cmd) != 0) check(false, "fixture directories created");
+
+  std::string iso_rel = std::string(nested) + "/payload.iso";
+  write_file(iso_rel.c_str(), build_iso9660());
+
+  char found[1200] = {};
+  check(trt_iso_find_image_in_dir(root, found, sizeof(found)) == 1,
+        "finds an image two directories down");
+  check(strcmp(found, iso_rel.c_str()) == 0, "returns the nested image path");
+
+  // The same image referenced by a .cue sheet: the sheet is not mountable, its
+  // FILE track is.
+  const char* sheet = "/tmp/opencode/tira-discover/game/disc/game.cue";
+  FILE* f = fopen(sheet, "w");
+  if (f) {
+    fprintf(f, "FILE \"payload.iso\" BINARY\n  TRACK 01 MODE1/2048\n");
+    fclose(f);
+  }
+  char track[1200] = {};
+  check(trt_iso_cue_track(sheet, track, sizeof(track)) == 1,
+        "a .cue resolves its FILE track");
+  check(strcmp(track, iso_rel.c_str()) == 0,
+        "the resolved track is the sheet's own directory + FILE name");
+
+  // A folder whose only disc artefact is a .cue naming a track that is not a
+  // real image must report nothing rather than mounting garbage.
+  const char* junk = "/tmp/opencode/tira-discover/junk";
+  snprintf(cmd, sizeof(cmd), "rm -rf %s && mkdir -p %s", junk, junk);
+  if (system(cmd) != 0) check(false, "junk fixture created");
+  FILE* g = fopen((std::string(junk) + "/data.bin").c_str(), "wb");
+  if (g) {
+    const char text[] = "not a filesystem";
+    fwrite(text, 1, sizeof(text) - 1, g);
+    fclose(g);
+  }
+  FILE* h = fopen((std::string(junk) + "/game.cue").c_str(), "w");
+  if (h) {
+    fprintf(h, "FILE \"data.bin\" BINARY\n");
+    fclose(h);
+  }
+  char none[1200] = "untouched";
+  check(trt_iso_find_image_in_dir(junk, none, sizeof(none)) == 0,
+        "a .cue whose track is not an image is not mounted");
+}
+
 int main() {
   printf("== tiramisu disc-image gate ==\n");
   test_iso9660_joliet();
@@ -625,6 +679,7 @@ int main() {
   test_raw_2352();
   test_not_an_image();
   test_guest_apis();
+  test_image_discovery();
   printf("%s (%d pass, %d fail)\n", g_fail ? "RESULT: FAIL" : "RESULT: ALL PASS",
          g_pass, g_fail);
   return g_fail ? 1 : 0;

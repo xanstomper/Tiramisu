@@ -27,8 +27,7 @@ __attribute__((dllimport)) i32 GSTD RegCreateKeyExW(void* key, const u16* sub,
                                                     void** out, u32* disp);
 __attribute__((dllimport)) i32 GSTD RegQueryValueExW(void* key, const u16* name,
                                                       u32* reserved, u32* type,
-                                                      u8* data, u32 cbData,
-                                                      u32* cbDataOut);
+                                                      u8* data, u32* size);
 __attribute__((dllimport)) i32 GSTD RegSetValueExW(void* key, const u16* name,
                                                    u32 reserved, u32 type,
                                                    const u8* data, u32 cbData);
@@ -72,20 +71,23 @@ u32 GSTD reg_boot(u64 a, u64 b, u64 c) {
 
   // 4. read it back
   u8 buf[64];
-  u32 type = 0, size = 0;
+  u32 type = 0, size = sizeof(buf);
   u32 diag_type = 0, diag_size = 0;
-  hr = RegQueryValueExW(key, value, 0, &type, buf, (u32)sizeof(buf), &size);
+  hr = RegQueryValueExW(key, value, 0, &type, buf, &size);
   const int read_ok = (hr == 0 && type == REG_SZ && size == sizeof(payload) &&
                        buf[0] == 's' && buf[2] == 'h');  // UTF-16
-  bits |= read_ok ? 0x8u : 0u;
+  // Windows reports the required capacity through the same in/out pointer.
+  u32 short_size = 1;
+  const i32 short_hr = RegQueryValueExW(key, value, 0, 0, buf, &short_size);
+  bits |= read_ok && short_hr == 234 && short_size == sizeof(payload) ? 0x8u : 0u;
   // diagnostics: the type and size we got back ride in the high bytes
   diag_type = type;
   diag_size = size;
 
   // 5. a value that is not there must FAIL, not come back as a zero
   const u16 missing[] = {'N', 'o', 'p', 'e', 0};
-  u32 msize = 0;
-  hr = RegQueryValueExW(key, missing, 0, &type, buf, (u32)sizeof(buf), &msize);
+  u32 msize = sizeof(buf);
+  hr = RegQueryValueExW(key, missing, 0, &type, buf, &msize);
   bits |= (hr == 2 /*FILE_NOT_FOUND*/) ? 0x10u : 0u;
 
   // 6. a machine-wide key too (games read HKLM for GPU/driver settings)

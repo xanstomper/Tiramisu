@@ -306,11 +306,11 @@ static int jit_decode(x86_context* c, uint32_t va, jit_op* op) {
     if (opcode == 0xFF) {
         uint8_t m = (uint8_t)jit_rd8(c, p);
         int ext = (m >> 3) & 7;
-        if (ext != 2 && ext != 3 && ext != 4 && ext != 5 && ext != 6) return 0;
+        if (ext != 2 && ext != 4 && ext != 6) return 0;
         int n = jit_parse_modrm(c, p, op);
         if (!n) return 0;
         if (ext == 6) op->kind = J_PUSH_RM;
-        else if (ext == 3 || ext == 5) op->kind = J_JMP_R;
+        else if (ext == 4) op->kind = J_JMP_R;
         else op->kind = J_CALL_R;
         return (int)(p + n - va);
     }
@@ -377,30 +377,6 @@ static inline uint8_t* jit_r8(x86_context* c, int i) {
         case 5: return ((uint8_t*)&c->regs.ecx) + 1;
         case 6: return ((uint8_t*)&c->regs.edx) + 1;
         default: return ((uint8_t*)&c->regs.ebx) + 1;
-    }
-}
-
-static inline int jit_cc(x86_context* c, int cc) {
-    uint32_t f = c->regs.eflags;
-    int cf = (f & X86_CF) != 0, pf = (f & X86_PF) != 0, zf = (f & X86_ZF) != 0;
-    int sf = (f & X86_SF) != 0, of = (f & X86_OF) != 0;
-    switch (cc) {
-        case 0:  return of;
-        case 1:  return !of;
-        case 2:  return cf;
-        case 3:  return !cf;
-        case 4:  return zf;
-        case 5:  return !zf;
-        case 6:  return cf || zf;
-        case 7:  return !cf && !zf;
-        case 8:  return sf;
-        case 9:  return !sf;
-        case 10: return pf;
-        case 11: return !pf;
-        case 12: return sf != of;
-        case 13: return sf == of;
-        case 14: return zf || (sf != of);
-        default: return !zf && (sf == of);
     }
 }
 
@@ -708,13 +684,13 @@ int x86_jit_step(x86_context* c) {
         }
 
         case J_SETCC: {
-            uint8_t v = jit_cc(c, op.sub) ? 1 : 0;
+            uint8_t v = x86_condition(c->regs.eflags, op.sub) ? 1 : 0;
             if (op.is_mem) x86_mem_write8(c, ea, v);
             else *jit_r8(c, op.dst) = v;
             break;
         }
         case J_CMOVCC:
-            if (jit_cc(c, op.sub))
+            if (x86_condition(c->regs.eflags, op.sub))
                 *R[op.dst] = op.is_mem ? x86_mem_read32(c, ea) : *R[op.rm];
             break;
 
@@ -722,7 +698,7 @@ int x86_jit_step(x86_context* c) {
             c->regs.eip = op.target;
             return 1;
         case J_JCC:
-            c->regs.eip = jit_cc(c, op.sub) ? op.target : b->end;
+            c->regs.eip = x86_condition(c->regs.eflags, op.sub) ? op.target : b->end;
             return 1;
         case J_JMP_R:
             c->regs.eip = op.is_mem ? x86_mem_read32(c, ea) : *R[op.rm];
@@ -749,7 +725,7 @@ int x86_jit_step(x86_context* c) {
             return 1;
 
         case J_HLT:
-            c->running = 0;
+            x86_halt(c, b->end - 1);
             return 1;
 
         default:
@@ -757,7 +733,7 @@ int x86_jit_step(x86_context* c) {
             // future bug fails loudly instead of silently mis-executing.
             if (c->log) c->log("x86/jit: internal error: unknown op kind");
             c->running = 0;
-            c->last_error = 4;
+            c->execution = X86_EXEC_JIT_FAILURE;
             return -1;
         }
     }

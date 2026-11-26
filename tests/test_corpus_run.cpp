@@ -68,6 +68,7 @@ void* ucrt_wrap_resolve(const char* symbol);
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <sys/syscall.h>
 #include <fcntl.h>
 
 // ---------------------------------------------------------------------------
@@ -97,7 +98,7 @@ static void ring_put(const char* line) {
 // raw-write a whole string (async-signal-safe syscalls only in the handler)
 static void wout(const char* s) {
   size_t n = strlen(s);
-  while (n) { ssize_t w = write(1, s, n); if (w <= 0) break; s += w; n -= (size_t)w; }
+  while (n) { ssize_t w = write(2, s, n); if (w <= 0) break; s += w; n -= (size_t)w; }
 }
 
 // dump the last `howmany` lines of the ring with raw write()
@@ -146,11 +147,74 @@ extern "C" void trt_log_ring(const char* line) {
 // fault handler: the named crash report. Installed BEFORE entry execution.
 // ---------------------------------------------------------------------------
 static void fault_report(int sig, siginfo_t* si, void* uctx_v) {
-  if (trt_dispatch_hw_fault(sig, si, uctx_v)) return;
   ucontext_t* uc = (ucontext_t*)uctx_v;
   unsigned long long rip = 0;
 #if defined(__x86_64__)
   rip = (unsigned long long)uc->uc_mcontext.gregs[REG_RIP];
+#endif
+  {
+    char m[256];
+    snprintf(m, sizeof(m), "FAULT: sig=%d si_code=%d addr=%p rip=0x%llx\n",
+             sig, si ? si->si_code : 0, si ? si->si_addr : nullptr, rip);
+    ssize_t w = ::write(2, m, strlen(m)); (void)w;
+    FILE* mf = fopen("/proc/self/maps", "r");
+    if (mf) {
+      char lbuf[256];
+      while (fgets(lbuf, sizeof(lbuf), mf)) {
+        unsigned long long start = 0, end = 0;
+        if (sscanf(lbuf, "%llx-%llx", &start, &end) == 2) {
+          if (rip >= start && rip < end) {
+            ::write(2, "  RIP-MAP: ", 11);
+            ::write(2, lbuf, strlen(lbuf));
+            break;
+          }
+        }
+      }
+      fclose(mf);
+    }
+    unsigned char* code_bytes = (unsigned char*)(uintptr_t)rip;
+    char dis[256];
+    snprintf(dis, sizeof(dis), "  BYTES at RIP: %02x %02x %02x %02x %02x %02x %02x %02x (tid=%d)\n",
+             code_bytes[0], code_bytes[1], code_bytes[2], code_bytes[3],
+             code_bytes[4], code_bytes[5], code_bytes[6], code_bytes[7],
+             (int)syscall(SYS_gettid));
+    ::write(2, dis, strlen(dis));
+    if (rip > 0x1000) {
+      char dump[512];
+      int n = snprintf(dump, sizeof(dump), "  CODE DUMP [rip-0x20..rip+0x20]:\n   ");
+      const unsigned char* p = (const unsigned char*)(uintptr_t)(rip - 0x20);
+      for (int i = 0; i < 64; ++i) {
+        n += snprintf(dump + n, sizeof(dump) - n, " %02x", p[i]);
+        if (i == 31) n += snprintf(dump + n, sizeof(dump) - n, " [RIP]");
+        if ((i + 1) % 16 == 0 && i < 63) n += snprintf(dump + n, sizeof(dump) - n, "\n   ");
+      }
+      n += snprintf(dump + n, sizeof(dump) - n, "\n");
+      ::write(2, dump, strlen(dump));
+    }
+    ::write(2, "BEFORE trt_dispatch_hw_fault\n", 29);
+    int handled = trt_dispatch_hw_fault(sig, si, uctx_v);
+    ::write(2, "AFTER trt_dispatch_hw_fault\n", 28);
+    if (handled) return;
+  }
+  unsigned long long rsp = 0, rax = 0, rbx = 0, rcx = 0, rdx = 0, rdi = 0, rsi = 0, rbp = 0;
+  unsigned long long r8 = 0, r9 = 0, r10 = 0, r11 = 0, r12 = 0, r13 = 0, r14 = 0, r15 = 0;
+#if defined(__x86_64__)
+  rsp = (unsigned long long)uc->uc_mcontext.gregs[REG_RSP];
+  rax = (unsigned long long)uc->uc_mcontext.gregs[REG_RAX];
+  rbx = (unsigned long long)uc->uc_mcontext.gregs[REG_RBX];
+  rcx = (unsigned long long)uc->uc_mcontext.gregs[REG_RCX];
+  rdx = (unsigned long long)uc->uc_mcontext.gregs[REG_RDX];
+  rdi = (unsigned long long)uc->uc_mcontext.gregs[REG_RDI];
+  rsi = (unsigned long long)uc->uc_mcontext.gregs[REG_RSI];
+  rbp = (unsigned long long)uc->uc_mcontext.gregs[REG_RBP];
+  r8  = (unsigned long long)uc->uc_mcontext.gregs[REG_R8];
+  r9  = (unsigned long long)uc->uc_mcontext.gregs[REG_R9];
+  r10 = (unsigned long long)uc->uc_mcontext.gregs[REG_R10];
+  r11 = (unsigned long long)uc->uc_mcontext.gregs[REG_R11];
+  r12 = (unsigned long long)uc->uc_mcontext.gregs[REG_R12];
+  r13 = (unsigned long long)uc->uc_mcontext.gregs[REG_R13];
+  r14 = (unsigned long long)uc->uc_mcontext.gregs[REG_R14];
+  r15 = (unsigned long long)uc->uc_mcontext.gregs[REG_R15];
 #endif
   const unsigned long long fault = (unsigned long long)(uintptr_t)si->si_addr;
   const char* signame = sig == SIGSEGV ? "SIGSEGV"
@@ -160,7 +224,7 @@ static void fault_report(int sig, siginfo_t* si, void* uctx_v) {
 
   char buf[TRT_RING_LINE];
   wout("\n==== TIRAMISU CRASH REPORT (discovery artifact) ====\n");
-  snprintf(buf, sizeof(buf), "PE: %s\n", g_pe_name);              wout(buf);
+  snprintf(buf, sizeof(buf), "PE: %s (host_tid=%d)\n", g_pe_name, (int)syscall(SYS_gettid)); wout(buf);
   snprintf(buf, sizeof(buf), "signal: %s (code %d)\n", signame, si->si_code); wout(buf);
   snprintf(buf, sizeof(buf), "fault address: 0x%llx", fault);
   wout(buf);
@@ -180,6 +244,31 @@ static void fault_report(int sig, siginfo_t* si, void* uctx_v) {
   } else {
     wout("  (outside the guest image)\n");
   }
+  snprintf(buf, sizeof(buf), "RSP: 0x%llx RAX: 0x%llx RBX: 0x%llx RCX: 0x%llx RDX: 0x%llx\n", rsp, rax, rbx, rcx, rdx); wout(buf);
+  snprintf(buf, sizeof(buf), "RSI: 0x%llx RDI: 0x%llx RBP: 0x%llx R8: 0x%llx R9: 0x%llx\n", rsi, rdi, rbp, r8, r9); wout(buf);
+  snprintf(buf, sizeof(buf), "R10: 0x%llx R11: 0x%llx R12: 0x%llx R13: 0x%llx R14: 0x%llx R15: 0x%llx\n", r10, r11, r12, r13, r14, r15); wout(buf);
+  if (rsp) {
+    wout("stack dump:\n");
+    for (int si_idx = 0; si_idx < 16; ++si_idx) {
+      unsigned long long* sp_ptr = (unsigned long long*)(uintptr_t)(rsp + si_idx * 8);
+      // verify pointer is readable
+      unsigned long long val = 0;
+      if (mincore((void*)((uintptr_t)sp_ptr & ~4095ULL), 4096, (unsigned char*)&val) == 0) {
+        val = *sp_ptr;
+        snprintf(buf, sizeof(buf), "  [RSP+0x%02x] 0x%016llx", si_idx * 8, val);
+        wout(buf);
+        for (int m = 0; m < trt_images_count(); ++m) {
+          trt_image* img = trt_images_nth(m);
+          if (img && val >= (uintptr_t)img->base && val < (uintptr_t)img->base + img->size_of_image) {
+            snprintf(buf, sizeof(buf), "  (in %s + 0x%llx)", trt_images_nth_name(m), (unsigned long long)(val - (uintptr_t)img->base));
+            wout(buf);
+            break;
+          }
+        }
+        wout("\n");
+      }
+    }
+  }
   snprintf(buf, sizeof(buf), "last bridge: %s\n", last_bridge_line()); wout(buf);
   wout("last trt log lines:\n");
   ring_dump_last(40);
@@ -192,7 +281,7 @@ static void install_fault_handlers(void) {
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
   sa.sa_sigaction = fault_report;
-  sa.sa_flags = SA_SIGINFO;  // recursive depth guarded in trt_dispatch_hw_fault
+  sa.sa_flags = SA_SIGINFO | SA_NODEFER;  // recursive depth guarded in trt_dispatch_hw_fault
   sigemptyset(&sa.sa_mask);
   sigaction(SIGSEGV, &sa, nullptr);
   sigaction(SIGILL, &sa, nullptr);
@@ -319,7 +408,7 @@ void* linux_alloc(size_t bytes, u64 preferred_base) {
   }
   void* p = mmap(preferred_base ? (void*)(uintptr_t)preferred_base : nullptr,
                  bytes, PROT_READ | PROT_WRITE,
-                 preferred_base ? (MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS)
+                 preferred_base ? (MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS)
                                 : (MAP_PRIVATE | MAP_ANONYMOUS),
                  -1, 0);
   if (p == MAP_FAILED) return nullptr;
@@ -526,13 +615,18 @@ static void TRT_GUEST_ABI dev_get_ctx(void*, void** out) {
   if (out) *out = &g_ctx;
 }
 
-static u8 g_map_scratch[4 * 1024 * 1024];
+static u8* g_map_scratch = nullptr;
+static const size_t k_map_scratch_sz = 256 * 1024 * 1024;
 struct mapped_sub { void* pData; u32 RowPitch; u32 DepthPitch; };
 static int TRT_GUEST_ABI ctx_map(void*, void*, u32, u32, u32, mapped_sub* m) {
   if (m) {
-    m->pData = g_map_scratch;
-    m->RowPitch = 4096;
-    m->DepthPitch = 4096;
+    if (!g_map_scratch) {
+      g_map_scratch = (u8*)mmap(nullptr, k_map_scratch_sz, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
+    m->pData = g_map_scratch ? g_map_scratch : (void*)0x10000;
+    m->RowPitch = 16384;
+    m->DepthPitch = 16384 * 1024;
   }
   return 0;
 }
@@ -993,8 +1087,12 @@ int child_run(const char* path) {
       }
       if (g_run32 && img32->entry_rva) {
         const int rc32 = run_pe32_image(img32, name);
-        printf("RUN OK %s: PE32 entry executed on the x86 engine (rc=%d)\n",
-               name, rc32);
+        if (rc32 != X86_EXEC_OK) {
+          printf("RUN FAILED %s: x86 execution stopped (rc=%d)\n", name, rc32);
+          fflush(stdout);
+          return 44;
+        }
+        printf("RUN OK %s: PE32 entry finished on the x86 engine\n", name);
         fflush(stdout);
         return 0;
       }
@@ -1105,6 +1203,35 @@ int main(int argc, char** argv) {
       g_image_base = 0;
       g_pe_name[0] = 0;
       printf("\n==== BOOT %s ====\n", name);
+      // Synthesize + preflight in the parent, dry-run so the corpus folder is
+      // not written to. The verdict names the wall before a child boots into
+      // it: this is the measured preflight for a real title, not a claim.
+      {
+        setenv("TRT_SYNTH_DRY_RUN", "1", 1);
+        std::string full = path;
+        const size_t sl = full.find_last_of('/');
+        std::string exe_rel = sl == std::string::npos ? full : full.substr(sl + 1);
+        std::string gdir = sl == std::string::npos ? std::string(".") : full.substr(0, sl);
+        trt_engine_profile p;
+        if (trt_synthesize_engine(gdir.c_str(), exe_rel.c_str(), &p)) {
+          trt_autonomous_provision_runtime(nullptr, &p);
+          trt_host_caps caps{};
+          caps.d3d11_device = g_mock_d3d11 ? 1 : 0;  // the mock COM pair, if asked
+          caps.mono_host = 1;                        // this build links Mono
+          trt_preflight_report rep{};
+          const int nb = trt_engine_launch_preflight(&p, &caps, &rep);
+          printf("PREFLIGHT %s: %u blocker(s) [%s / %s / %s] %zu note(s)\n",
+                 name, (unsigned)nb, trt_engine_type_name(p.engine_type),
+                 trt_graphics_api_name(p.preferred_gfx),
+                 p.payload_complete ? "payload complete" : "payload incomplete",
+                 rep.notes.size());
+          for (const auto& l : rep.lines) printf("    BLOCK %s\n", l.c_str());
+          for (const auto& n : rep.notes) printf("    note  %s\n", n.c_str());
+        } else {
+          printf("PREFLIGHT %s: refused (see the named synthesizer line above)\n", name);
+        }
+        unsetenv("TRT_SYNTH_DRY_RUN");
+      }
       pid_t pid = fork();
       if (pid < 0) { printf("BOOT FAILED %s: fork failed\n", name); ++n_failed; continue; }
       if (pid == 0) _exit(exe_boot::child_boot(path));
@@ -1384,8 +1511,13 @@ static void patch_unitymain2_probe(trt_image* exe, trt_image* up) {
   // 1. the real export address (Win64 ABI callable). be/rs are unused for
   //    non-forwarded exports (pe_exports only consults rs for forwarders).
   void* real_fn = trt_pe_find_export(nullptr, nullptr, up, "UnityMain2", 0);
+  const char* target_name = "UnityMain2";
   if (!real_fn) {
-    trt_core_log("trt: UnityMain2 probe: export not found in UnityPlayer (probe off)");
+    real_fn = trt_pe_find_export(nullptr, nullptr, up, "UnityMain", 0);
+    target_name = "UnityMain";
+  }
+  if (!real_fn) {
+    trt_core_log("trt: UnityMain(2) probe: export not found in UnityPlayer (probe off)");
     return;
   }
   g_unitymain2_real = real_fn;
@@ -1417,11 +1549,13 @@ static void patch_unitymain2_probe(trt_image* exe, trt_image* up) {
         if (!thunk) break;
         if (thunk >> 63) break;  // ordinal import: not our target
         const u32 hint_rva = (u32)(thunk & 0xFFFFFFFF);
-        if (hint_rva && hint_rva + 2 < exe->size_of_image &&
-            strcmp((const char*)(exe->base + hint_rva + 2), "UnityMain2") == 0) {
-          // the WRITABLE slot is the IAT (FirstThunk), not the lookup table
-          slot = (u64)(uintptr_t)(exe->base + first_thunk + (t - (exe->base + thunk_rva)));
-          break;
+        if (hint_rva && hint_rva + 2 < exe->size_of_image) {
+          const char* sym = (const char*)(exe->base + hint_rva + 2);
+          if (strcmp(sym, target_name) == 0 || strcmp(sym, "UnityMain2") == 0 || strcmp(sym, "UnityMain") == 0) {
+            // the WRITABLE slot is the IAT (FirstThunk), not the lookup table
+            slot = (u64)(uintptr_t)(exe->base + first_thunk + (t - (exe->base + thunk_rva)));
+            break;
+          }
         }
       }
     }
@@ -1680,6 +1814,10 @@ int child_boot(const char* path) {
   snprintf(zpath, sizeof(zpath), "Z:\\%s", name);
   trt_bridge_set_exe_path(zpath);
   trt_bridge_set_cwd("Z:\\");
+  // Optional guest argv (offline reproduction of a console launch, e.g.
+  // TRT_CMD_ARGS="hello.py" test_corpus_run --exe python.exe).
+  if (const char* boot_args = getenv("TRT_CMD_ARGS"))
+    trt_bridge_set_cmd_args(boot_args);
 
   // machine gate (same discipline as the DLL phase)
   FILE* f = fopen(path, "rb");
@@ -1707,8 +1845,12 @@ int child_boot(const char* path) {
     }
     if (g_run32 && img32->entry_rva) {
       const int rc32 = run_pe32_image(img32, name);
-      printf("BOOT OK %s: PE32 entry executed on the x86 engine (rc=%d)\n",
-             name, rc32);
+      if (rc32 != X86_EXEC_OK) {
+        printf("BOOT FAILED %s: x86 execution stopped (rc=%d)\n", name, rc32);
+        fflush(stdout);
+        return 44;
+      }
+      printf("BOOT OK %s: PE32 entry finished on the x86 engine\n", name);
       fflush(stdout);
       return 0;
     }

@@ -57,9 +57,15 @@ int trt_iso_extract(const trt_iso* iso, const char* path, const char* host_out);
 int trt_iso_extract_dir(const trt_iso* iso, const char* rel_dir,
                         const char* host_dir);
 
-// Find the first *.iso/*.bin/*.img image directly inside a host directory.
-// out receives the full host path. Returns 1 when found.
+// Find a mountable disc image in a host directory (up to two levels deep): a
+// .iso, a raw .bin/.img dump, or the track a .cue sheet names. Candidates that
+// do not open as an image are skipped. out receives the full host path.
+// Returns 1 when found.
 int trt_iso_find_image_in_dir(const char* host_dir, char* out, size_t out_cap);
+
+// Resolve a .cue sheet's first FILE track (the mountable image). Returns 1 and
+// fills out_path when the sheet names a track.
+int trt_iso_cue_track(const char* cue_path, char* out_path, size_t out_cap);
 
 #if defined(__cplusplus)
 }

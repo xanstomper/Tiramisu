@@ -11,8 +11,8 @@
 //   - forwards everything else (adapter enumeration, window association)
 //     to the console's real DXGI factory.
 //
-// The real COM objects are passed through unchanged, so the guest's calls
-// on them need no shim at all - only the factory needs one.
+// The device and context are passed through. The factory and swapchain
+// translate desktop DXGI calls for the host CoreWindow.
 #ifndef TIRAMISU_BRIDGE_D3D_H
 #define TIRAMISU_BRIDGE_D3D_H
 
@@ -44,13 +44,54 @@ typedef struct trt_gpu_hooks {
                                           void* const* queues, u32 num_queues,
                                           u32 node_mask, void** out_device,
                                           void** out_ctx, u32* out_level);
-  int (TRT_GUEST_ABI *configure_d3d11_swapchain)(u32 format, u32 buffer_count);
+  int (TRT_GUEST_ABI *configure_d3d11_swapchain)(u32 width, u32 height,
+                                                    u32 format, u32 buffer_count,
+                                                    u32 swap_effect);
   int (TRT_GUEST_ABI *get_d3d11_backbuffer)(u32 index, const void* iid, void** out);
   void (TRT_GUEST_ABI *prepare_d3d11_present)(void);
 } trt_gpu_hooks;
 
 void trt_gpu_set_hooks(const trt_gpu_hooks* hooks);
 const trt_gpu_hooks* trt_gpu_hooks_get(void);
+
+// Host capability probes for the launch preflight (0 = absent):
+//   host_device    - an ID3D11Device + ID3D11DeviceContext pair is installed
+//   host_d3d12     - an ID3D12Device is installed (0 = D3D12 is recorded only)
+//   host_swapchain - a window swapchain exists, so frames reach a window
+int trt_gpu_host_device_present(void);
+int trt_gpu_host_d3d12_present(void);
+int trt_gpu_host_swapchain_present(void);
+
+// D3D11 bridge activity for the current guest launch.
+typedef struct trt_gpu_render_stats {
+  u32 d3d11_device_calls;
+  u32 d3d11_swapchains;
+  u32 d3d11_get_buffer_calls;
+  u32 d3d11_present_calls;
+  u32 d3d11_successful_presents;
+  int d3d11_last_present_result;
+  u32 d3d11_swap_effect;
+  u32 d3d11_buffer_count;
+  u32 d3d11_stable_backbuffer;
+  u32 d3d11_width, d3d11_height;
+} trt_gpu_render_stats;
+
+typedef struct trt_gpu_resize_stats {
+  u32 target_calls, target_width, target_height;
+  int target_result;
+  u32 buffer_calls, buffer_requested_width, buffer_requested_height;
+  u32 buffer_client_width, buffer_client_height, buffer_present_count;
+  int buffer_result;
+} trt_gpu_resize_stats;
+
+void trt_gpu_get_resize_stats(trt_gpu_resize_stats* stats);
+
+int trt_gpu_d3d11_uses_stable_backbuffer(u32 buffer_count, u32 swap_effect);
+// Count nonblack RGB/BGR pixels in a CPU readback without counting alpha or padding.
+u32 trt_gpu_count_lit_rgb32(const void* pixels, u32 width, u32 height, u32 row_pitch);
+
+void trt_gpu_reset_render_stats(void);
+void trt_gpu_get_render_stats(trt_gpu_render_stats* stats);
 
 // Register d3d11.dll / dxgi.dll as BUILTIN with the bridge functions.
 int trt_bridge_register_d3d(void);

@@ -5,6 +5,7 @@
 // CoreWindow swapchain is cleanly rebound to that ID3D12CommandQueue and
 // restored to D3D11 when the guest exits back to the launcher.
 #include "swapchain.h"
+#include "console_detect.h"
 #include "host_log.h"
 #include "d3d9_backend.hpp"
 #include "gl_backend.hpp"
@@ -39,14 +40,38 @@ winrt::com_ptr<IDXGISwapChain1> g_swap;
 winrt::com_ptr<IDXGISwapChain3> g_swap3;
 winrt::com_ptr<ID3D11RenderTargetView> g_rtv;
 winrt::com_ptr<ID3D11Texture2D> g_guest_backbuffer;
+winrt::com_ptr<ID3D11Query> g_guest_draw_query;
+bool g_guest_draw_query_active = false;
+bool g_guest_draw_query_pending = false;
+std::atomic<unsigned> g_guest_draw_state{0}, g_guest_draw_samples{0};
+std::atomic<unsigned> g_guest_nonempty_draw_samples{0};
+unsigned g_guest_draw_samples_remaining = 120;
+unsigned g_guest_draw_pause = 0;
+std::atomic<unsigned long long> g_guest_draw_vertices{0}, g_guest_draw_pixels{0};
+std::atomic<int> g_guest_draw_result{0};
+constexpr unsigned kGuestProbeGrid = 4;
+struct surface_sample {
+  winrt::com_ptr<ID3D11Texture2D> texture;
+  DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+  bool pending = false;
+  unsigned lit = 0;
+};
+surface_sample g_guest_surface_probe, g_host_surface_probe, g_other_surface_probe;
+std::atomic<unsigned> g_surface_samples{0}, g_guest_lit_pixels{0}, g_host_lit_pixels{0};
+std::atomic<unsigned> g_surface_guest_rtv{0}, g_surface_other_rtv{0};
+std::atomic<unsigned> g_other_surface_samples{0}, g_other_lit_pixels{0};
+std::atomic<unsigned> g_other_width{0}, g_other_height{0}, g_other_format{0};
+std::atomic<int> g_other_surface_result{0};
+std::atomic<int> g_surface_probe_result{0};
+unsigned g_surface_probe_interval = 0;
 winrt::com_ptr<IDXGIFactory2> g_factory;
 winrt::com_ptr<IDXGIFactory6> g_factory6;
 winrt::com_ptr<ID3D12Device> g_d3d12_device;
 winrt::com_ptr<IDXGISwapChain3> g_d3d12_swap;
 bool g_in_d3d12 = false;
-std::atomic<bool> g_pointer_kbm_active{false};
 std::atomic<bool> g_launcher_cursor_visible{false};
 unsigned g_w = 1280, g_h = 720;
+unsigned g_backbuffer_width = 1280, g_backbuffer_height = 720;
 unsigned g_fl = D3D_FEATURE_LEVEL_11_0;
 
 const char* k_vs = R"(struct VSOut { float4 p : SV_POSITION; float2 uv : UV; };
@@ -229,66 +254,106 @@ DXGI_FORMAT sanitize_flip_fmt(u32 fmt) {
   }
 }
 
+// Release the launcher's reference without touching guest shaders, resources,
+// or render targets. An outstanding view owned by the guest is DXGI's error
+// to report when ResizeBuffers runs.
+void unbind_launcher_target() {
+  if (!g_rtv) return;
+  ID3D11RenderTargetView* views[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+  winrt::com_ptr<ID3D11DepthStencilView> depth;
+  g_ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, views, depth.put());
+  UINT count = 0;
+  bool changed = false;
+  for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
+    if (views[i] == g_rtv.get()) {
+      views[i]->Release();
+      views[i] = nullptr;
+      changed = true;
+    }
+    if (views[i]) count = i + 1;
+  }
+  if (changed) {
+    g_ctx->OMSetRenderTargetsAndUnorderedAccessViews(
+        count, views, depth.get(), 0, D3D11_KEEP_UNORDERED_ACCESS_VIEWS, nullptr, nullptr);
+  }
+  for (auto* view : views)
+    if (view) view->Release();
+}
+
 // A flip-model swapchain takes an UNORM format. D3D11 still permits an
 // sRGB render-target view on that buffer when the guest requests sRGB.
-int TRT_GUEST_ABI set_d3d11_swapchain_format(u32 format) {
+HRESULT resize_d3d11_backbuffers(u32 width, u32 height, u32 format) {
   if (!g_swap || !g_ctx || !g_device) return E_FAIL;
-  if (format == DXGI_FORMAT_UNKNOWN) return S_OK;
-  const auto wanted = sanitize_flip_fmt(format);
   DXGI_SWAP_CHAIN_DESC1 desc{};
   HRESULT hr = g_swap->GetDesc1(&desc);
-  if (FAILED(hr) || desc.Format == wanted) return hr;
+  if (FAILED(hr)) return hr;
+  const auto wanted = format == DXGI_FORMAT_UNKNOWN ? desc.Format : sanitize_flip_fmt(format);
+  const bool reconfigure = desc.Format != wanted || desc.Width != width || desc.Height != height;
+  if (!reconfigure && g_rtv) return S_OK;
 
-  g_ctx->ClearState();
-  g_rtv = nullptr;
-  g_ctx->Flush();
-  hr = g_swap->ResizeBuffers(0, desc.Width, desc.Height, wanted, desc.Flags);
-  winrt::com_ptr<ID3D11Texture2D> back;
-  if (SUCCEEDED(g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), back.put_void()))) {
-    g_device->CreateRenderTargetView(back.get(), nullptr, g_rtv.put());
-    d3d9_rt::g_rt.rtv = g_rtv.get();
-    gl_rt::g_glrt.main_rtv = g_rtv.get();
-    vk_rt::g_vkrt.main_rtv = g_rtv.get();
+  if (reconfigure) {
+    unbind_launcher_target();
+    g_rtv = nullptr;
+    g_ctx->Flush();
+    hr = g_swap->ResizeBuffers(0, width, height, wanted, desc.Flags);
   }
+  if (SUCCEEDED(hr)) {
+    g_backbuffer_width = width;
+    g_backbuffer_height = height;
+  }
+  winrt::com_ptr<ID3D11Texture2D> back;
+  const HRESULT buffer_hr = g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), back.put_void());
+  const HRESULT view_hr = FAILED(buffer_hr) ? buffer_hr :
+      g_device->CreateRenderTargetView(back.get(), nullptr, g_rtv.put());
+  d3d9_rt::g_rt.rtv = g_rtv.get();
+  gl_rt::g_glrt.main_rtv = g_rtv.get();
+  vk_rt::g_vkrt.main_rtv = g_rtv.get();
+  if (SUCCEEDED(hr) && FAILED(view_hr)) hr = view_hr;
   char message[120];
-  snprintf(message, sizeof(message), "d3d: CoreWindow backbuffer format %u -> %u, hr=0x%08lx",
-           static_cast<unsigned>(desc.Format), static_cast<unsigned>(wanted),
+  snprintf(message, sizeof(message), "d3d: CoreWindow buffers %ux%u format %u, hr=0x%08lx",
+           width, height, static_cast<unsigned>(wanted),
            static_cast<unsigned long>(hr));
   log_line(message);
   return hr;
 }
 
-int TRT_GUEST_ABI configure_d3d11_swapchain(u32 format, u32 buffer_count) {
-  if (!g_swap || !g_device) return E_FAIL;
-  const HRESULT hr = set_d3d11_swapchain_format(format);
-  if (FAILED(hr)) return hr;
+void release_guest_backbuffer() {
+  if (g_guest_backbuffer && trt_esram_is_active()) {
+    D3D11_TEXTURE2D_DESC desc{};
+    g_guest_backbuffer->GetDesc(&desc);
+    trt_esram_release_surface(desc.Width, desc.Height, desc.Format);
+  }
+  g_guest_backbuffer = nullptr;
+}
 
-  const bool single_buffer = buffer_count == 1 ||
-                             (buffer_count == 0 && g_guest_backbuffer);
-  if (!single_buffer) {
-    g_guest_backbuffer = nullptr;
-    return S_OK;
+int TRT_GUEST_ABI configure_d3d11_swapchain(u32 width, u32 height, u32 format,
+                                          u32 buffer_count, u32 swap_effect) {
+  if (!g_swap || !g_device || !width || !height) return E_INVALIDARG;
+  if (!trt_gpu_d3d11_uses_stable_backbuffer(buffer_count, swap_effect)) {
+    const HRESULT hr = resize_d3d11_backbuffers(width, height, format);
+    if (SUCCEEDED(hr)) release_guest_backbuffer();
+    return hr;
   }
 
-  // Desktop swap-effects can expose one stable buffer. UWP needs at
-  // least two flip buffers. Keep the desktop render target stable and
-  // copy its pixels into the CoreWindow buffer before each flip.
+  // A desktop DISCARD chain exposes only buffer zero as an accessible
+  // render target, even when BufferCount is two. Keep that texture bound
+  // across presents and copy it into the rotating CoreWindow buffers.
   DXGI_SWAP_CHAIN_DESC1 desc{};
   if (FAILED(g_swap->GetDesc1(&desc))) return E_FAIL;
   const bool srgb = format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
                     format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-  DXGI_FORMAT guest_format = srgb ? static_cast<DXGI_FORMAT>(format) : desc.Format;
+  const auto native_format = format == DXGI_FORMAT_UNKNOWN ? desc.Format : sanitize_flip_fmt(format);
+  DXGI_FORMAT guest_format = srgb ? static_cast<DXGI_FORMAT>(format) : native_format;
   if (g_guest_backbuffer) {
     D3D11_TEXTURE2D_DESC current{};
     g_guest_backbuffer->GetDesc(&current);
     if (format == DXGI_FORMAT_UNKNOWN) guest_format = current.Format;
-    if (current.Width == desc.Width && current.Height == desc.Height &&
-        current.Format == guest_format)
-      return S_OK;
+    if (current.Width == width && current.Height == height && current.Format == guest_format)
+      return resize_d3d11_backbuffers(width, height, format);
   }
   D3D11_TEXTURE2D_DESC texture{};
-  texture.Width = desc.Width;
-  texture.Height = desc.Height;
+  texture.Width = width;
+  texture.Height = height;
   texture.MipLevels = 1;
   texture.ArraySize = 1;
   texture.Format = guest_format;
@@ -297,8 +362,14 @@ int TRT_GUEST_ABI configure_d3d11_swapchain(u32 format, u32 buffer_count) {
   winrt::com_ptr<ID3D11Texture2D> target;
   const HRESULT created = g_device->CreateTexture2D(&texture, nullptr, target.put());
   if (FAILED(created)) return created;
+  const HRESULT resized = resize_d3d11_backbuffers(width, height, format);
+  if (FAILED(resized)) return resized;
+  release_guest_backbuffer();
+  if (trt_esram_is_active()) {
+    trt_esram_qualify_and_alloc(texture.Width, texture.Height, texture.Format, texture.BindFlags, "CoreWindow_backbuffer");
+  }
   g_guest_backbuffer = std::move(target);
-  log_line("d3d: using a single guest backbuffer over the CoreWindow flip chain");
+  log_line("d3d: using a stable guest backbuffer over the CoreWindow flip chain");
   return S_OK;
 }
 
@@ -316,7 +387,11 @@ void draw_pointer_impl(bool launcher) {
   if (launcher && !g_launcher_cursor_visible.load()) return;
   int x, y;
   if (!trt_cursor_snapshot(&x, &y) && !launcher) return;
-  const int scale = g_h >= 900 ? 2 : 1;
+  x = static_cast<int>(static_cast<i64>(x) * g_backbuffer_width / g_w);
+  y = static_cast<int>(static_cast<i64>(y) * g_backbuffer_height / g_h);
+  const int target_width = static_cast<int>(g_backbuffer_width);
+  const int target_height = static_cast<int>(g_backbuffer_height);
+  const int scale = target_height >= 900 ? 2 : 1;
   static constexpr const char* rows[] = {
       "#", "##", "#o#", "#oo#", "#ooo#", "#oooo#", "#ooooo#", "#oooooo#",
       "#ooooooo#", "#oooooooo#", "#ooooooooo#", "#ooooo#####",
@@ -326,7 +401,7 @@ void draw_pointer_impl(bool launcher) {
   unsigned n_dark = 0, n_light = 0;
   for (unsigned row = 0; row < sizeof(rows) / sizeof(rows[0]); ++row) {
     const int top = y + static_cast<int>(row) * scale;
-    if (top < 0 || top >= static_cast<int>(g_h)) continue;
+    if (top < 0 || top >= target_height) continue;
     const char* pixels = rows[row];
     for (int col = 0; pixels[col];) {
       const int first = col;
@@ -334,32 +409,225 @@ void draw_pointer_impl(bool launcher) {
       while (pixels[col] == color) ++col;
       if (color == '.') continue;
       const int left = std::max(0, x + first * scale);
-      const int right = std::min(static_cast<int>(g_w), x + col * scale);
+      const int right = std::min(target_width, x + col * scale);
       if (left >= right) continue;
-      const D3D11_RECT rect{left, top, right, std::min(top + scale, (int)g_h)};
+      const D3D11_RECT rect{left, top, right, std::min(top + scale, target_height)};
       if (color == '#') dark[n_dark++] = rect;
       else light[n_light++] = rect;
     }
   }
   const float black[4] = {0.015f, 0.015f, 0.015f, 1.f};
-  const float fill[4] = {
-      g_pointer_kbm_active.load() ? 0.13f : 1.f,
-      g_pointer_kbm_active.load() ? 0.83f : 1.f,
-      g_pointer_kbm_active.load() ? 0.93f : 1.f,
-      1.f,
-  };
+  const float fill[4] = {0.98f, 0.98f, 0.98f, 1.f};
   if (n_dark) g_ctx->ClearView(g_rtv.get(), black, dark, n_dark);
   if (n_light) g_ctx->ClearView(g_rtv.get(), fill, light, n_light);
 }
 
+void end_guest_draw_sample() {
+  if (g_guest_draw_query_active) {
+    g_ctx->End(g_guest_draw_query.get());
+    g_guest_draw_query_active = false;
+    g_guest_draw_query_pending = true;
+  }
+  if (!g_guest_draw_query_pending) return;
+
+  D3D11_QUERY_DATA_PIPELINE_STATISTICS stats{};
+  const HRESULT hr = g_ctx->GetData(g_guest_draw_query.get(), &stats, sizeof(stats),
+                                   D3D11_ASYNC_GETDATA_DONOTFLUSH);
+  if (hr == S_FALSE) return;
+  g_guest_draw_query_pending = false;
+  if (FAILED(hr)) {
+    g_guest_draw_result.store(hr);
+    g_guest_draw_state.store(3);
+    return;
+  }
+  g_guest_draw_samples.fetch_add(1);
+  --g_guest_draw_samples_remaining;
+  if (stats.IAVertices || stats.PSInvocations) {
+    if (g_guest_nonempty_draw_samples.fetch_add(1) == 0) {
+      g_guest_draw_vertices.store(stats.IAVertices);
+      g_guest_draw_pixels.store(stats.PSInvocations);
+      g_guest_draw_samples_remaining = 31;
+    }
+    g_guest_draw_state.store(2);
+  }
+  if (g_guest_draw_state.load() == 2) g_guest_draw_pause = 120;
+  else if (!g_guest_draw_samples_remaining) g_guest_draw_state.store(4);
+}
+
+void begin_guest_draw_sample() {
+  if (!g_guest_draw_samples_remaining || g_guest_draw_state.load() >= 3 ||
+      g_guest_draw_query_pending) return;
+  if (g_guest_draw_pause) {
+    --g_guest_draw_pause;
+    return;
+  }
+  if (!g_guest_draw_query) {
+    const D3D11_QUERY_DESC desc{D3D11_QUERY_PIPELINE_STATISTICS, 0};
+    const HRESULT hr = g_device->CreateQuery(&desc, g_guest_draw_query.put());
+    if (FAILED(hr)) {
+      g_guest_draw_result.store(hr);
+      g_guest_draw_state.store(3);
+      return;
+    }
+  }
+  // Start after drawing the host cursor. Only guest work between presents
+  // contributes to the next result. Query polling never flushes or waits.
+  g_ctx->Begin(g_guest_draw_query.get());
+  g_guest_draw_query_active = true;
+  if (g_guest_draw_state.load() == 0) g_guest_draw_state.store(1);
+}
+
+HRESULT enqueue_surface_sample(surface_sample& sample, ID3D11Texture2D* source,
+                               DXGI_FORMAT view_format = DXGI_FORMAT_UNKNOWN) {
+  D3D11_TEXTURE2D_DESC desc{};
+  source->GetDesc(&desc);
+  const bool typeless = desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
+                        desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+  const DXGI_FORMAT format = typeless ? view_format : desc.Format;
+  switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+      break;
+    default: return E_NOTIMPL;
+  }
+  if (desc.SampleDesc.Count != 1 || !desc.Width || !desc.Height) return E_NOTIMPL;
+
+  if (!sample.texture || sample.format != format) {
+    D3D11_TEXTURE2D_DESC staging{};
+    staging.Width = staging.Height = kGuestProbeGrid;
+    staging.MipLevels = staging.ArraySize = 1;
+    staging.Format = format;
+    staging.SampleDesc.Count = 1;
+    staging.Usage = D3D11_USAGE_STAGING;
+    staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    winrt::com_ptr<ID3D11Texture2D> texture;
+    const HRESULT hr = g_device->CreateTexture2D(&staging, nullptr, texture.put());
+    if (FAILED(hr)) return hr;
+    sample.texture = std::move(texture);
+    sample.format = format;
+  }
+
+  // Sample across the image. Queue only sixteen one-pixel copies, and never
+  // transfer the image itself to the diagnostics endpoint.
+  for (unsigned y = 0; y < kGuestProbeGrid; ++y) {
+    for (unsigned x = 0; x < kGuestProbeGrid; ++x) {
+      const unsigned px = (2 * x + 1) * desc.Width / (2 * kGuestProbeGrid);
+      const unsigned py = (2 * y + 1) * desc.Height / (2 * kGuestProbeGrid);
+      const D3D11_BOX region{px, py, 0, px + 1, py + 1, 1};
+      g_ctx->CopySubresourceRegion(sample.texture.get(), 0, x, y, 0, source, 0, &region);
+    }
+  }
+  sample.pending = true;
+  return S_OK;
+}
+
+HRESULT poll_surface_sample(surface_sample& sample) {
+  if (!sample.pending) return S_OK;
+  D3D11_MAPPED_SUBRESOURCE map{};
+  const HRESULT hr = g_ctx->Map(sample.texture.get(), 0, D3D11_MAP_READ,
+                                D3D11_MAP_FLAG_DO_NOT_WAIT, &map);
+  if (hr == DXGI_ERROR_WAS_STILL_DRAWING) return S_FALSE;
+  if (FAILED(hr)) return hr;
+  sample.lit = trt_gpu_count_lit_rgb32(map.pData, kGuestProbeGrid,
+                                      kGuestProbeGrid, map.RowPitch);
+  g_ctx->Unmap(sample.texture.get(), 0);
+  sample.pending = false;
+  return S_OK;
+}
+
+void sample_other_render_target(ID3D11RenderTargetView* view, ID3D11Resource* resource) {
+  if (g_other_surface_probe.pending || !resource) return;
+  winrt::com_ptr<ID3D11Texture2D> texture;
+  HRESULT hr = resource->QueryInterface(__uuidof(ID3D11Texture2D), texture.put_void());
+  if (FAILED(hr)) {
+    g_other_surface_result.store(hr);
+    return;
+  }
+  D3D11_TEXTURE2D_DESC desc{};
+  texture->GetDesc(&desc);
+  g_other_width.store(desc.Width);
+  g_other_height.store(desc.Height);
+  g_other_format.store(desc.Format);
+  D3D11_RENDER_TARGET_VIEW_DESC view_desc{};
+  view->GetDesc(&view_desc);
+  hr = E_NOTIMPL;
+  if (view_desc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D &&
+      view_desc.Texture2D.MipSlice == 0) {
+    hr = enqueue_surface_sample(g_other_surface_probe, texture.get(), view_desc.Format);
+  }
+  g_other_surface_result.store(hr);
+}
+
+void measure_surface_pair(ID3D11Texture2D* guest, ID3D11Texture2D* host) {
+  if (g_other_surface_probe.pending) {
+    const HRESULT hr = poll_surface_sample(g_other_surface_probe);
+    if (hr == S_OK) {
+      g_other_lit_pixels.store(std::max(g_other_lit_pixels.load(), g_other_surface_probe.lit));
+      g_other_surface_samples.fetch_add(1);
+    } else if (FAILED(hr)) {
+      g_other_surface_probe.pending = false;
+      g_other_surface_result.store(hr);
+    }
+  }
+  if (g_surface_probe_result.load() < 0 || g_surface_samples.load() >= 32) return;
+  if (g_guest_surface_probe.pending || g_host_surface_probe.pending) {
+    const HRESULT guest_hr = poll_surface_sample(g_guest_surface_probe);
+    const HRESULT host_hr = poll_surface_sample(g_host_surface_probe);
+    if (FAILED(guest_hr) || FAILED(host_hr)) {
+      g_surface_probe_result.store(FAILED(guest_hr) ? guest_hr : host_hr);
+      return;
+    }
+    if (guest_hr == S_FALSE || host_hr == S_FALSE) return;
+    g_guest_lit_pixels.store(std::max(g_guest_lit_pixels.load(), g_guest_surface_probe.lit));
+    g_host_lit_pixels.store(std::max(g_host_lit_pixels.load(), g_host_surface_probe.lit));
+    g_surface_samples.fetch_add(1);
+    g_surface_probe_interval = 120;
+    return;
+  }
+
+  // Sample about once every two seconds at 60 Hz. The copy is observed before
+  // the cursor overlay, so a lit cursor cannot be mistaken for game pixels.
+  if (g_surface_probe_interval) {
+    --g_surface_probe_interval;
+    return;
+  }
+  const HRESULT guest_hr = enqueue_surface_sample(g_guest_surface_probe, guest);
+  const HRESULT host_hr = SUCCEEDED(guest_hr)
+      ? enqueue_surface_sample(g_host_surface_probe, host) : guest_hr;
+  if (FAILED(host_hr)) {
+    g_surface_probe_result.store(host_hr);
+    return;
+  }
+  // Snapshot slot zero at Present without disturbing the guest context. A
+  // completed rendering pass may already have unbound its render target.
+  winrt::com_ptr<ID3D11RenderTargetView> view;
+  g_ctx->OMGetRenderTargets(1, view.put(), nullptr);
+  if (view) {
+    winrt::com_ptr<ID3D11Resource> resource;
+    view->GetResource(resource.put());
+    if (resource.get() == static_cast<ID3D11Resource*>(guest)) {
+      g_surface_guest_rtv.fetch_add(1);
+    } else {
+      g_surface_other_rtv.fetch_add(1);
+      sample_other_render_target(view.get(), resource.get());
+    }
+  }
+}
+
 void TRT_GUEST_ABI prepare_d3d11_present() {
-  if (!g_swap || !g_ctx) return;
+  if (!g_swap || !g_ctx || !g_device) return;
+  end_guest_draw_sample();
   if (g_guest_backbuffer) {
     winrt::com_ptr<ID3D11Texture2D> back;
-    if (SUCCEEDED(g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), back.put_void())))
+    if (SUCCEEDED(g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), back.put_void()))) {
       g_ctx->CopyResource(back.get(), g_guest_backbuffer.get());
+      measure_surface_pair(g_guest_backbuffer.get(), back.get());
+    }
   }
   draw_pointer_impl(false);
+  begin_guest_draw_sample();
 }
 
 // Host GPU submission for replayed D3D12 command lists. This issues real
@@ -450,6 +718,8 @@ HRESULT create_d3d11_corewindow_swapchain() {
   const HRESULT hr = g_factory->CreateSwapChainForCoreWindow(
       g_device.get(), g_window.get(), &sc, nullptr, g_swap.put());
   if (FAILED(hr)) return hr;
+  g_backbuffer_width = sc.Width;
+  g_backbuffer_height = sc.Height;
   g_swap3 = g_swap.try_as<IDXGISwapChain3>();
   winrt::com_ptr<ID3D11Texture2D> back;
   g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), back.put_void());
@@ -458,10 +728,50 @@ HRESULT create_d3d11_corewindow_swapchain() {
 }
 } // namespace
 
-void draw_pointer(bool launcher) { draw_pointer_impl(launcher); }
-void set_pointer_cursor_mode(bool kbm_active) {
-  g_pointer_kbm_active.store(kbm_active);
+void swapchain_reset_guest_draw_probe() {
+  if (g_guest_draw_query_active && g_ctx) g_ctx->End(g_guest_draw_query.get());
+  g_guest_draw_query = nullptr;
+  g_guest_draw_query_active = false;
+  g_guest_draw_query_pending = false;
+  g_guest_draw_samples.store(0);
+  g_guest_nonempty_draw_samples.store(0);
+  g_guest_draw_samples_remaining = 120;
+  g_guest_draw_pause = 0;
+  g_guest_draw_vertices.store(0);
+  g_guest_draw_pixels.store(0);
+  g_guest_draw_result.store(0);
+  g_guest_draw_state.store(0);
+  g_guest_surface_probe = {};
+  g_host_surface_probe = {};
+  g_other_surface_probe = {};
+  g_surface_samples.store(0);
+  g_guest_lit_pixels.store(0);
+  g_host_lit_pixels.store(0);
+  g_surface_probe_result.store(0);
+  g_surface_guest_rtv.store(0);
+  g_surface_other_rtv.store(0);
+  g_other_surface_samples.store(0);
+  g_other_lit_pixels.store(0);
+  g_other_width.store(0);
+  g_other_height.store(0);
+  g_other_format.store(0);
+  g_other_surface_result.store(0);
+  g_surface_probe_interval = 0;
 }
+
+guest_draw_probe swapchain_guest_draw_probe() {
+  return {g_guest_draw_state.load(), g_guest_draw_samples.load(),
+          g_guest_draw_vertices.load(), g_guest_draw_pixels.load(),
+          g_guest_draw_result.load(), g_surface_samples.load(),
+          g_guest_lit_pixels.load(), g_host_lit_pixels.load(), g_surface_probe_result.load(),
+          g_guest_nonempty_draw_samples.load(), g_surface_guest_rtv.load(),
+          g_surface_other_rtv.load(), g_other_surface_samples.load(), g_other_lit_pixels.load(),
+          g_other_width.load(), g_other_height.load(), g_other_format.load(),
+          g_other_surface_result.load()};
+}
+
+
+void draw_pointer(bool launcher) { draw_pointer_impl(launcher); }
 void set_launcher_cursor_visible(bool visible) {
   g_launcher_cursor_visible.store(visible);
 }
@@ -486,16 +796,36 @@ swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w)
   winrt::copy_from_abi(g_window, winrt::get_abi(w));
 
   UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-  D3D_FEATURE_LEVEL levels[] = {
-      D3D_FEATURE_LEVEL_11_1,
-      D3D_FEATURE_LEVEL_11_0,
-  };
+  // Ask for what THIS console can actually give. The One family is GCN 1.1 and
+  // caps at 11_0; requesting 11_1 there only obscures the level the device came
+  // up at (the runtime would silently pick 11_0 while the log said 11_1 was
+  // requested). console_feature_levels is offline-tested.
+  const longan::console_hardware_info cons_info =
+      longan::get_detected_console_info();
+  unsigned level_values[6] = {};
+  const int level_count =
+      longan::console_feature_levels(cons_info.generation, level_values, 6);
+  D3D_FEATURE_LEVEL levels[6] = {};
+  for (int i = 0; i < level_count; ++i)
+    levels[i] = static_cast<D3D_FEATURE_LEVEL>(level_values[i]);
+  {
+    char line[256];
+    snprintf(line, sizeof(line),
+             "[swapchain] console=%s (%s) last_gen=%d avx2=%d esram=%dMB "
+             "budget=%dMB d3d11_levels=%d top=0x%x",
+             cons_info.generation_name, cons_info.family_id,
+             cons_info.is_last_gen ? 1 : 0, cons_info.has_avx2 ? 1 : 0,
+             cons_info.esram_size_mb, cons_info.dev_mode_game_budget_mb,
+             level_count, level_count ? level_values[0] : 0u);
+    trt_core_log(line);
+  }
   D3D_FEATURE_LEVEL achieved{};
   winrt::com_ptr<ID3D11Device> dev;
   winrt::com_ptr<ID3D11DeviceContext> ctx;
   r.device_hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-                                  flags, levels, 2, D3D11_SDK_VERSION,
-                                  dev.put(), &achieved, ctx.put());
+                                  flags, levels, (UINT)level_count,
+                                  D3D11_SDK_VERSION, dev.put(), &achieved,
+                                  ctx.put());
   if (FAILED(r.device_hr)) return r;
   g_fl = (unsigned)achieved;
   r.feature_level = g_fl;
@@ -598,8 +928,9 @@ void swapchain_restore_d3d11() {
 }
 
 void swapchain_restore_launcher_format() {
-  g_guest_backbuffer = nullptr;
-  set_d3d11_swapchain_format(DXGI_FORMAT_B8G8R8A8_UNORM);
+  release_guest_backbuffer();
+  const HRESULT hr = resize_d3d11_backbuffers(g_w, g_h, DXGI_FORMAT_B8G8R8A8_UNORM);
+  if (FAILED(hr)) log_line("d3d: could not restore launcher backbuffers");
 }
 
 void swapchain_render_frame(float t) {

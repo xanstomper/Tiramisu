@@ -289,13 +289,11 @@ u32 GSTD triangle_boot(u64 a, u64 b, u64 c) {
     sd.usage = 0x20u /*RENDER_TARGET_OUTPUT*/;
     sd.buffer_count = 2u;
     sd.swap_effect = 4u /*FLIP_SEQUENTIAL*/;
-    typedef i32 (GSTD* csc_fn)(void*, void*, void*, const sc_desc1*, void*,
-                               const void*, void**);
+    typedef i32 (GSTD* csc_fn)(void*, void*, void*, const sc_desc1*, void*, void**);
     // the "CoreWindow" is a dummy non-null IUnknown* — the offline shim
     // validates pointer-only (a real CoreWindow comes from the XAML island)
     static u32 dummy_window = 0xC0DEBA5Eu;
-    hr = ((csc_fn)fvt[16])(factory, q, &dummy_window, &sd, (void*)0,
-                           (void*)0, &sc);
+    hr = ((csc_fn)fvt[16])(factory, q, &dummy_window, &sd, (void*)0, &sc);
     if (hr == 0 && sc) sum |= 0x800u;
   }
 

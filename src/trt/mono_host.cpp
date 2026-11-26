@@ -64,6 +64,14 @@ u32 rd32(const u8* p) {
 
 extern "C" const char* trt_mono_last_error(void) { return g_last_error; }
 
+extern "C" int trt_mono_host_present(void) {
+#if defined(TRT_NO_MONO_HOST)
+  return 0;  // this build has no managed runtime at all
+#else
+  return 1;
+#endif
+}
+
 extern "C" int trt_pe_is_managed(const u8* file, size_t file_size) {
   // DOS header: MZ + e_lfanew.
   if (!file || file_size < 64) return 0;
@@ -486,7 +494,11 @@ extern "C" int trt_mono_run(const trt_mono_config* cfg,
   // proceed past Steamworks.NET - the decisive discriminator.
   SetEnvironmentVariableW(L"MONO_LOG_MASK", L"gc,thread,dll,asm");
   SetEnvironmentVariableW(L"MONO_LOG_LEVEL", L"debug");
-  SetEnvironmentVariableW(L"MONO_GC_PARAMS", L"nursery-size=64m");
+  // The Xbox trace parked Mono inside drain_gray_stack_concurrent and
+  // never returned from the native WaitOnAddress barrier. Select SGen's
+  // supported serial major collector on UWP; this avoids the concurrent
+  // marker worker barrier while preserving the normal SGen heap/nursery.
+  SetEnvironmentVariableW(L"MONO_GC_PARAMS", L"nursery-size=64m,major=marksweep");
 
   // Interpreter mode is FORCED on UWP: the AppContainer blocks dynamic
   // code generation, so JIT code cannot execute; the interpreter is the

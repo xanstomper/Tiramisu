@@ -22,6 +22,8 @@
 #include <winrt/Windows.Web.Http.h>
 
 #include <algorithm>
+#include <array>
+#include <limits>
 #include <atomic>
 #include <cctype>
 #include <condition_variable>
@@ -46,8 +48,16 @@ steam_account_snapshot g_acct;
 std::string g_refresh_token;
 std::string g_access_token;
 std::vector<steam_library_item> g_items;
-std::atomic<bool> g_auth_busy{false};
-std::atomic<bool> g_dl_busy{false};
+uint64_t g_account_generation = 0;  // guarded by g_mu
+struct steam_download_job {
+  uint32_t app_id;
+  std::function<void()> complete;
+};
+std::deque<steam_download_job> g_download_queue;
+uint32_t g_active_download = 0;  // guarded by g_mu
+bool g_cancel_download = false;
+bool g_install_committed = false;
+constexpr size_t k_max_queued_downloads = 32;
 
 // ---- UTF helpers ----
 std::wstring u8to16(const std::string& s) {
@@ -1115,115 +1125,6 @@ class cm_session : public std::enable_shared_from_this<cm_session> {
   }
 };
 
-// Parse Steam VDF text sections for depot_id, manifest_id, launch executable.
-// The PICS appinfo blob is a binary KeyValue tree: it has a small type/name
-// prefix before the first '"', and "depots" contains many numeric child
-// blocks. Scan the depots block by brace depth instead of doing a global
-// substring search, which picked the first redist manifest for every title.
-void parse_appinfo_vdf(const std::string& vdf, uint32_t* out_depot,
-                       uint64_t* out_manifest, uint64_t* out_size,
-                       std::string* out_exe) {
-  // Find executable in config -> launch -> * -> executable
-  size_t lpos = vdf.find("\"launch\"");
-  if (lpos != std::string::npos) {
-    size_t ep = vdf.find("\"executable\"", lpos);
-    if (ep != std::string::npos) {
-      size_t q1 = vdf.find('"', ep + 12);
-      size_t q2 = (q1 != std::string::npos) ? vdf.find('"', q1 + 1) : std::string::npos;
-      if (q1 != std::string::npos && q2 != std::string::npos)
-        *out_exe = vdf.substr(q1 + 1, q2 - q1 - 1);
-    }
-  }
-
-  size_t dpos = vdf.find("\"depots\"");
-  if (dpos == std::string::npos) dpos = vdf.find("\"Depots\"");
-  if (dpos == std::string::npos) return;
-  size_t brace = vdf.find('{', dpos);
-  if (brace == std::string::npos) return;
-
-  // Matching brace for the depots section.
-  auto matching = [&](size_t open) -> size_t {
-    int depth = 0;
-    for (size_t i = open; i < vdf.size(); ++i) {
-      if (vdf[i] == '{') ++depth;
-      else if (vdf[i] == '}') {
-        if (--depth == 0) return i;
-      }
-    }
-    return std::string::npos;
-  };
-  size_t depots_end = matching(brace);
-  if (depots_end == std::string::npos) return;
-
-  uint32_t best_depot = 0;
-  uint64_t best_manifest = 0;
-  uint64_t best_sz = 0;
-  size_t pos = brace + 1;
-  while (pos < depots_end) {
-    size_t q1 = vdf.find('"', pos);
-    if (q1 == std::string::npos || q1 >= depots_end) break;
-    size_t q2 = vdf.find('"', q1 + 1);
-    if (q2 == std::string::npos || q2 >= depots_end) break;
-    std::string key = vdf.substr(q1 + 1, q2 - q1 - 1);
-    pos = q2 + 1;
-
-    bool all_digits = !key.empty();
-    for (char c : key)
-      if (!std::isdigit((unsigned char)c)) all_digits = false;
-    if (!all_digits) continue;
-
-    // The value block must follow the key (allow whitespace only).
-    size_t b = pos;
-    while (b < depots_end && std::isspace((unsigned char)vdf[b])) ++b;
-    if (b >= depots_end || vdf[b] != '{') continue;
-    size_t e = matching(b);
-    if (e == std::string::npos || e > depots_end) continue;
-    pos = e + 1;
-
-    uint32_t did = (uint32_t)strtoul(key.c_str(), nullptr, 10);
-    if (did < 10 || did == 228980 || did == 228990) continue; // shared redist
-
-    std::string blk = vdf.substr(b, e - b + 1);
-    // oslist is a quoted CSV; accept only blocks that allow Windows.
-    size_t ol = blk.find("\"oslist\"");
-    if (ol != std::string::npos) {
-      size_t value_start = blk.find('"', ol + 8);
-      size_t value_end = (value_start != std::string::npos)
-                             ? blk.find('"', value_start + 1)
-                             : std::string::npos;
-      std::string oslist = (value_start != std::string::npos &&
-                            value_end != std::string::npos)
-                               ? blk.substr(value_start + 1, value_end - value_start - 1)
-                               : "";
-      if (oslist.find("windows") == std::string::npos) continue;
-    }
-    size_t mp = blk.find("\"public\"");
-    if (mp == std::string::npos) continue;
-    size_t gp = blk.find("\"gid\"", mp);
-    if (gp == std::string::npos) continue;
-    size_t gq1 = blk.find('"', gp + 5);
-    size_t gq2 = (gq1 != std::string::npos) ? blk.find('"', gq1 + 1) : std::string::npos;
-    if (gq1 == std::string::npos || gq2 == std::string::npos) continue;
-    uint64_t mid = strtoull(blk.substr(gq1 + 1, gq2 - gq1 - 1).c_str(), nullptr, 10);
-    uint64_t msz = 0;
-    size_t sp = blk.find("\"size\"", mp);
-    if (sp != std::string::npos) {
-      size_t sq1 = blk.find('"', sp + 6);
-      size_t sq2 = (sq1 != std::string::npos) ? blk.find('"', sq1 + 1) : std::string::npos;
-      if (sq1 != std::string::npos && sq2 != std::string::npos)
-        msz = strtoull(blk.substr(sq1 + 1, sq2 - sq1 - 1).c_str(), nullptr, 10);
-    }
-    if (mid != 0 && (best_depot == 0 || msz > best_sz)) {
-      best_depot = did;
-      best_manifest = mid;
-      best_sz = msz;
-    }
-  }
-  *out_depot = best_depot;
-  *out_manifest = best_manifest;
-  *out_size = best_sz;
-}
-
 struct depot_chunk_t {
   uint8_t sha[20];
   uint32_t crc = 0;      // Adler-32 of the decompressed bytes (zero seed)
@@ -1238,6 +1139,29 @@ struct depot_file_t {
   uint32_t flags = 0;
   std::vector<depot_chunk_t> chunks;
 };
+
+constexpr uint32_t kDepotDirectory = 0x40;
+constexpr uint32_t kDepotSymlink = 0x200;
+
+struct depot_download_t {
+  uint32_t id = 0;
+  std::array<uint8_t, 32> key{};
+  std::vector<std::string> tokens;
+  std::vector<depot_file_t> files;
+};
+
+bool depot_file_has_complete_chunks(depot_file_t* file) {
+  std::sort(file->chunks.begin(), file->chunks.end(), [](const auto& a, const auto& b) {
+    return a.offset < b.offset;
+  });
+  uint64_t size = 0;
+  for (const auto& chunk : file->chunks) {
+    if (chunk.offset != size || chunk.cb_orig == 0 || chunk.cb_orig > file->size - size)
+      return false;
+    size += chunk.cb_orig;
+  }
+  return size == file->size && size <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+}
 
 bool parse_manifest_blob(const std::vector<uint8_t>& blob,
                          const uint8_t depot_key[32],
@@ -1345,14 +1269,22 @@ bool parse_manifest_blob(const std::vector<uint8_t>& blob,
       if (filenames_encrypted && !df.filename.empty()) {
         auto enc = b64_decode(df.filename);
         std::vector<uint8_t> dec;
-        if (bcrypt_aes256_decrypt_steam(enc.data(), enc.size(), depot_key, &dec)) {
-          while (!dec.empty() && dec.back() == 0) dec.pop_back();
-          df.filename.assign((const char*)dec.data(), dec.size());
+        if (!bcrypt_aes256_decrypt_steam(enc.data(), enc.size(), depot_key, &dec)) {
+          if (err) *err = "could not decrypt manifest path";
+          return false;
         }
+        while (!dec.empty() && dec.back() == 0) dec.pop_back();
+        df.filename.assign(dec.begin(), dec.end());
       }
-      // Normalize path separators to backslash and strip trailing whitespace
-      for (char& c : df.filename)
-        if (c == '/') c = '\\';
+      if (!trt_steam_normalize_content_path(df.filename, &df.filename)) {
+        if (err) *err = "invalid relative depot path";
+        return false;
+      }
+      const auto key = trt_steam_depot_path_key(df.filename);
+      if (key == ".tiramisu" || key.compare(0, 10, ".tiramisu\\") == 0) {
+        if (err) *err = "depot tries to write Tiramisu's install metadata";
+        return false;
+      }
       files->push_back(std::move(df));
     } else {
       pr.skip(wt);
@@ -1371,6 +1303,8 @@ void scan_installed_into_items(const std::string& games_dir,
       if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
       if (fd.cFileName[0] == '.') continue;
       std::string gdir = games_dir + "\\" + fd.cFileName;
+      if (GetFileAttributesA((gdir + kSteamInstallPending).c_str()) !=
+          INVALID_FILE_ATTRIBUTES) continue;
       std::string appid_path = gdir + "\\steam_appid.txt";
       FILE* f = fopen(appid_path.c_str(), "rb");
       if (f) {
@@ -1419,10 +1353,11 @@ void scan_installed_into_items(const std::string& games_dir,
 
 void fetch_remote_account_data(std::function<void()> on_library_updated) {
   std::string refresh_tok, access_tok, games_dir, state_dir;
-  uint64_t sid = 0;
+  uint64_t sid = 0, generation = 0;
   std::string acct_name;
   {
     std::lock_guard<std::mutex> lk(g_mu);
+    generation = g_account_generation;
     refresh_tok = g_refresh_token;
     access_tok = g_access_token;
     sid = g_acct.steamid64;
@@ -1465,6 +1400,7 @@ void fetch_remote_account_data(std::function<void()> on_library_updated) {
     access_tok = new_acc;
     if (!new_ref.empty()) refresh_tok = new_ref;
     std::lock_guard<std::mutex> lk(g_mu);
+    if (generation != g_account_generation) return false;
     g_access_token = access_tok;
     g_refresh_token = refresh_tok;
     save_credentials(state_dir, sid, acct_name, g_acct.persona, refresh_tok,
@@ -1500,6 +1436,7 @@ void fetch_remote_account_data(std::function<void()> on_library_updated) {
   }
   {
     std::lock_guard<std::mutex> lk(g_mu);
+    if (generation != g_account_generation) return;
     if (!persona.empty()) g_acct.persona = persona;
     g_acct.signed_in = true;
     trt_steam_set_identity(std::to_string(sid).c_str(), g_acct.persona.c_str());
@@ -1620,6 +1557,8 @@ void fetch_remote_account_data(std::function<void()> on_library_updated) {
                         int sb = (b.game_name[0] ? 2 : (b.state > 0 ? 1 : 0));
                         return sa > sb;
                       });
+            std::lock_guard<std::mutex> lock(g_mu);
+            if (generation != g_account_generation) return;
             trt_steam_set_friends(finfos.data(), (int)finfos.size());
           }
         }
@@ -1630,8 +1569,21 @@ void fetch_remote_account_data(std::function<void()> on_library_updated) {
 
   {
     std::lock_guard<std::mutex> lk(g_mu);
+    if (generation != g_account_generation) return;
     scan_installed_into_items(games_dir, &fetched_items);
-    if (!fetched_items.empty()) g_items = std::move(fetched_items);
+    if (!fetched_items.empty()) {
+      if (g_active_download) {
+        const auto active = std::find_if(g_items.begin(), g_items.end(),
+            [](const auto& item) { return item.app_id == g_active_download; });
+        const auto fresh = std::find_if(fetched_items.begin(), fetched_items.end(),
+            [](const auto& item) { return item.app_id == g_active_download; });
+        if (active != g_items.end() && fresh != fetched_items.end()) {
+          fresh->download_pct = active->download_pct;
+          fresh->status_text = active->status_text;
+        }
+      }
+      g_items = std::move(fetched_items);
+    }
     else scan_installed_into_items(games_dir, &g_items);
     g_acct.status_line = "steam: signed in as " +
                          (g_acct.persona.empty() ? g_acct.account_name
@@ -1730,6 +1682,9 @@ void steam_client_init(const std::string& state_dir,
 
 void steam_client_sign_out() {
   std::lock_guard<std::mutex> lk(g_mu);
+  ++g_account_generation;
+  g_download_queue.clear();
+  if (g_active_download && !g_install_committed) g_cancel_download = true;
   DeleteFileA(token_file_path(g_state_dir).c_str());
   trt_steam_auth_sign_out(g_state_dir);
   trt_steam_set_identity(nullptr, nullptr);
@@ -1755,13 +1710,15 @@ void steam_client_refresh_remote(std::function<void()> on_library_updated) {
 }
 
 void steam_client_begin_qr(std::function<void()> on_library_updated) {
-  if (g_auth_busy.exchange(true)) return;
+  uint64_t generation;
   {
     std::lock_guard<std::mutex> lk(g_mu);
+    if (g_acct.busy || g_acct.signed_in) return;
+    generation = ++g_account_generation;
     g_acct.busy = true;
     g_acct.status_line = "steam: requesting QR login challenge…";
   }
-  std::thread([cb = std::move(on_library_updated)]() {
+  std::thread([generation, cb = std::move(on_library_updated)]() {
     try {
       winrt::init_apartment(winrt::apartment_type::multi_threaded);
 
@@ -1782,9 +1739,9 @@ void steam_client_begin_qr(std::function<void()> on_library_updated) {
               req.buf, &resp, &err)) {
         log_line(("steam: BeginAuthSessionViaQR failed: " + err).c_str());
         std::lock_guard<std::mutex> lk(g_mu);
+        if (generation != g_account_generation) return;
         g_acct.status_line = "steam QR request failed: " + err;
         g_acct.busy = false;
-        g_auth_busy = false;
         return;
       }
 
@@ -1815,9 +1772,9 @@ void steam_client_begin_qr(std::function<void()> on_library_updated) {
       if (client_id == 0 || challenge.empty() || request_id.empty()) {
         log_line("steam: BeginAuthSessionViaQR returned incomplete protobuf");
         std::lock_guard<std::mutex> lk(g_mu);
+        if (generation != g_account_generation) return;
         g_acct.status_line = "steam QR decode error — press Y to retry";
         g_acct.busy = false;
-        g_auth_busy = false;
         return;
       }
       {
@@ -1825,6 +1782,7 @@ void steam_client_begin_qr(std::function<void()> on_library_updated) {
         snprintf(msg, sizeof(msg), "steam: QR ready (%s)", challenge.c_str());
         log_line(msg);
         std::lock_guard<std::mutex> lk(g_mu);
+        if (generation != g_account_generation) return;
         g_acct.qr_url = challenge;
         g_acct.status_line = "Scan QR with the Steam Mobile app to sign in";
       }
@@ -1833,6 +1791,10 @@ void steam_client_begin_qr(std::function<void()> on_library_updated) {
           (DWORD)std::clamp((int)(interval_sec * 1000.0f), 3000, 7000);
       for (int i = 0; i < 45; ++i) {
         Sleep(poll_ms);
+        {
+          std::lock_guard<std::mutex> lock(g_mu);
+          if (generation != g_account_generation) return;
+        }
         pb_writer preq;
         preq.write_uint64(1, client_id);
         preq.write_bytes(2, request_id.data(), request_id.size());
@@ -1869,6 +1831,7 @@ void steam_client_begin_qr(std::function<void()> on_library_updated) {
         if (new_cid != 0) client_id = new_cid;
         if (!new_url.empty()) {
           std::lock_guard<std::mutex> lk(g_mu);
+          if (generation != g_account_generation) return;
           g_acct.qr_url = new_url;
         }
         if (!ref.empty()) {
@@ -1881,6 +1844,7 @@ void steam_client_begin_qr(std::function<void()> on_library_updated) {
           log_line(okmsg);
           {
             std::lock_guard<std::mutex> lk(g_mu);
+            if (generation != g_account_generation) return;
             g_refresh_token = ref;
             g_access_token = acc;
             g_acct.steamid64 = sid;
@@ -1893,32 +1857,97 @@ void steam_client_begin_qr(std::function<void()> on_library_updated) {
           }
           fetch_remote_account_data(cb);
           std::lock_guard<std::mutex> lk(g_mu);
+          if (generation != g_account_generation) return;
           g_acct.busy = false;
-          g_auth_busy = false;
           return;
         }
       }
       std::lock_guard<std::mutex> lk(g_mu);
+      if (generation != g_account_generation) return;
       g_acct.qr_url.clear();
       g_acct.status_line = "Steam QR expired — press Y to generate a new code";
     } catch (winrt::hresult_error const& e) {
       std::lock_guard<std::mutex> lk(g_mu);
+      if (generation != g_account_generation) return;
       g_acct.qr_url.clear();
       g_acct.status_line = "steam auth error: " +
                            u16to8(std::wstring(e.message().c_str()));
     } catch (...) {
       std::lock_guard<std::mutex> lk(g_mu);
+      if (generation != g_account_generation) return;
       g_acct.qr_url.clear();
       g_acct.status_line = "steam auth error";
     }
     std::lock_guard<std::mutex> lk(g_mu);
+    if (generation != g_account_generation) return;
     g_acct.busy = false;
-    g_auth_busy = false;
   }).detach();
 }
 
-void steam_client_download_app(uint32_t app_id,
-                               std::function<void()> on_complete) {
+static void start_steam_download(uint32_t app_id, std::function<void()> on_complete);
+
+static void start_next_steam_download() {
+  steam_download_job job{};
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (g_active_download || g_download_queue.empty() || !g_acct.signed_in) return;
+    job = std::move(g_download_queue.front());
+    g_download_queue.pop_front();
+    g_active_download = job.app_id;
+    g_cancel_download = false;
+    g_install_committed = false;
+  }
+  start_steam_download(job.app_id, std::move(job.complete));
+}
+
+static bool steam_download_cancelled() {
+  std::lock_guard<std::mutex> lock(g_mu);
+  return g_cancel_download;
+}
+
+static void finish_steam_download() {
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_active_download = 0;
+    g_cancel_download = false;
+    g_install_committed = false;
+  }
+  start_next_steam_download();
+}
+
+bool steam_client_download_app(uint32_t app_id, std::function<void()> on_complete) {
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!app_id || !g_acct.signed_in || g_refresh_token.empty()) return false;
+    if (app_id == g_active_download || std::any_of(g_download_queue.begin(),
+        g_download_queue.end(), [app_id](const auto& job) { return job.app_id == app_id; }))
+      return true;  // repeat requests are idempotent
+    const auto item = std::find_if(g_items.begin(), g_items.end(),
+        [app_id](const auto& entry) { return entry.app_id == app_id; });
+    if (item == g_items.end() || item->installed ||
+        g_download_queue.size() >= k_max_queued_downloads) return false;
+    g_download_queue.push_back({app_id, std::move(on_complete)});
+  }
+  start_next_steam_download();
+  return true;
+}
+
+bool steam_client_cancel_download(uint32_t app_id) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (app_id && app_id == g_active_download && !g_install_committed) {
+    g_cancel_download = true;
+    return true;
+  }
+  const auto job = std::find_if(g_download_queue.begin(), g_download_queue.end(),
+      [app_id](const auto& entry) { return entry.app_id == app_id; });
+  if (job == g_download_queue.end()) return false;
+  g_download_queue.erase(job);
+  for (auto& item : g_items)
+    if (item.app_id == app_id) item.status_text = "Download cancelled";
+  return true;
+}
+
+static void start_steam_download(uint32_t app_id, std::function<void()> on_complete) {
   auto set_item_state = [app_id](bool downloading, float pct,
                                  const std::string& st, bool installed = false,
                                  const std::string& idir = "") {
@@ -1935,13 +1964,8 @@ void steam_client_download_app(uint32_t app_id,
         break;
       }
     }
-    g_acct.status_line = st;
+    if (g_acct.signed_in) g_acct.status_line = st;
   };
-
-  if (g_dl_busy.exchange(true)) {
-    set_item_state(false, 0.0f, "steam: another download is already active");
-    return;
-  }
 
   std::string ref_tok, acc_tok, acct_name, games_dir, title;
   uint64_t sid = 0;
@@ -1956,20 +1980,21 @@ void steam_client_download_app(uint32_t app_id,
       if (it.app_id == app_id) title = it.title;
     }
   }
-  if (ref_tok.empty() || sid == 0) {
-    g_dl_busy = false;
-    set_item_state(false, 0.0f,
-                   "download blocked: sign in with Steam (Y) first");
+  if (ref_tok.empty() || sid == 0 || steam_download_cancelled()) {
+    set_item_state(false, 0.0f, "Download cancelled or Steam signed out");
+    finish_steam_download();
     return;
   }
   if (title.empty()) title = "SteamApp_" + std::to_string(app_id);
 
   set_item_state(true, 0.02f, "steam: connecting to CM servers…");
-  std::thread([=]() {
+  try {
+    std::thread([=]() {
+    struct download_scope { ~download_scope() { finish_steam_download(); } } done;
     auto fail = [&](const std::string& msg) {
-      log_line(("steam_dl[" + std::to_string(app_id) + "]: FAIL " + msg).c_str());
-      set_item_state(false, 0.0f, msg);
-      g_dl_busy = false;
+      const auto status = steam_download_cancelled() ? std::string("Download cancelled") : msg;
+      log_line(("steam_dl[" + std::to_string(app_id) + "]: " + status).c_str());
+      set_item_state(false, 0.0f, status);
     };
     try {
       winrt::init_apartment(winrt::apartment_type::multi_threaded);
@@ -2054,13 +2079,12 @@ void steam_client_download_app(uint32_t app_id,
         }
       }
 
-      set_item_state(true, 0.06f, "steam: fetching appinfo & Windows depot…");
+      set_item_state(true, 0.06f, "steam: fetching Windows depot list…");
 
-      // 4) ClientPICSProductInfoRequest
-      std::string appinfo_vdf;
-      {
+      auto fetch_appinfo = [&](uint32_t info_app) -> std::string {
+        std::string appinfo_vdf;
         pb_writer app_msg;
-        app_msg.write_uint32(1, app_id);
+        app_msg.write_uint32(1, info_app);
         pb_writer req;
         // ClientPICSProductInfoRequest: field 2 is `apps` (field 1 is
         // `packages` per SteamKit's CMsgClientPICSProductInfoRequest).
@@ -2071,7 +2095,7 @@ void steam_client_download_app(uint32_t app_id,
 
         std::vector<uint8_t> resp;
         if (!cm->recv_emsg(8904 /* ClientPICSProductInfoResponse */, &resp)) {
-          return fail("appinfo query timeout");
+          return {};
         }
         {
           std::string hex;
@@ -2080,21 +2104,21 @@ void steam_client_download_app(uint32_t app_id,
             snprintf(b, sizeof(b), "%02x", resp[i]);
             hex += b;
           }
-          log_line(("steam_dl[" + std::to_string(app_id) +
+          log_line(("steam_dl[" + std::to_string(info_app) +
                     "]: PICS resp bytes=" + std::to_string(resp.size()) +
                     " head=" + hex).c_str());
         }
         pb_reader rr{resp.data(), resp.size()};
         uint32_t f, wt;
         while (rr.next(&f, &wt)) {
-          log_line(("steam_dl[" + std::to_string(app_id) +
+          log_line(("steam_dl[" + std::to_string(info_app) +
                     "]: PICS field=" + std::to_string(f) +
                     " wt=" + std::to_string(wt)).c_str());
           if (f == 1 && wt == 2) {
             const uint8_t* ap = nullptr;
             size_t al = 0;
             rr.read_bytes(&ap, &al);
-            log_line(("steam_dl[" + std::to_string(app_id) +
+            log_line(("steam_dl[" + std::to_string(info_app) +
                       "]: PICS app msg bytes=" + std::to_string(al)).c_str());
             pb_reader ar{ap, al};
             uint32_t af, awt;
@@ -2107,7 +2131,7 @@ void steam_client_download_app(uint32_t app_id,
                 ar.read_bytes(&bv, &bl);
                 appinfo_vdf.assign((const char*)bv, bl);
               } else {
-                log_line(("steam_dl[" + std::to_string(app_id) +
+                log_line(("steam_dl[" + std::to_string(info_app) +
                           "]: PICS app field=" + std::to_string(af) +
                           " wt=" + std::to_string(awt)).c_str());
                 ar.skip(awt);
@@ -2117,65 +2141,18 @@ void steam_client_download_app(uint32_t app_id,
             rr.skip(wt);
           }
         }
-      }
+        return appinfo_vdf;
+      };
 
-      uint32_t depot_id = 0;
-      uint64_t manifest_id = 0;
-      uint64_t depot_sz = 0;
-      std::string main_exe_rel;
-      log_line(("steam_dl[" + std::to_string(app_id) + "]: appinfo bytes=" +
-                std::to_string(appinfo_vdf.size()) +
-                " depots=" + (appinfo_vdf.find("\"depots\"") != std::string::npos ? "yes" : "no"))
-                   .c_str());
-      parse_appinfo_vdf(appinfo_vdf, &depot_id, &manifest_id, &depot_sz,
-                        &main_exe_rel);
-      if (depot_id == 0 || manifest_id == 0) {
-        return fail("no Windows depot found in appinfo for " +
-                    std::to_string(app_id));
-      }
+      std::unordered_map<uint32_t, std::string> appinfo;
+      appinfo.emplace(app_id, fetch_appinfo(app_id));
+      trt_steam_app_content content;
+      if (!trt_steam_parse_app_content(appinfo.at(app_id), &content))
+        return fail("no supported public Windows depots found in Steam appinfo");
+      const auto& main_exe_rel = content.executable;
 
-      // 5) Depot decryption key (proves ownership!)
-      set_item_state(true, 0.10f, "steam: requesting depot license key…");
-      uint8_t depot_key[32] = {};
-      {
-        pb_writer kreq;
-        kreq.write_uint32(1, depot_id);
-        kreq.write_uint32(2, app_id);
-        cm->send_proto(5438 /* ClientGetDepotDecryptionKey */, {}, kreq);
-
-        std::vector<uint8_t> resp;
-        if (!cm->recv_emsg(5439 /* ClientGetDepotDecryptionKeyResponse */,
-                          &resp)) {
-          return fail("depot decryption key timeout");
-        }
-        uint32_t eresult = 0;
-        bool got_key = false;
-        pb_reader kr{resp.data(), resp.size()};
-        uint32_t f, wt;
-        while (kr.next(&f, &wt)) {
-          if (f == 1 && wt == 0) {
-            uint64_t v = 0;
-            kr.read_varint(&v);
-            eresult = (uint32_t)v;
-          } else if (f == 3 && wt == 2) {
-            const uint8_t* kp = nullptr;
-            size_t kl = 0;
-            kr.read_bytes(&kp, &kl);
-            if (kl == 32) {
-              std::memcpy(depot_key, kp, 32);
-              got_key = true;
-            }
-          } else {
-            kr.skip(wt);
-          }
-        }
-        if (eresult != 1 || !got_key) {
-          return fail("Steam denied depot key (eresult=" +
-                      std::to_string(eresult) + " — verify license)");
-        }
-      }
-
-      // 6) CDN hosts, manifest request code, and per-host auth tokens
+      // CDN hosts are shared. License keys, request codes and tokens are
+      // resolved for each depot before committing the combined install.
       std::vector<std::string> cdn_hosts;
       std::vector<std::string> cdn_vhosts;
       {
@@ -2211,237 +2188,407 @@ void steam_client_download_app(uint32_t app_id,
         cdn_vhosts.push_back(cdn_hosts.back());
       }
 
-      // The manifest request code is granted by the CM against the logged-on
-      // session. The old WebAPI GET returned an empty code, which is why the
-      // CDN answered 401.
-      uint64_t manifest_code = 0;
-      {
-        pb_writer mreq;
-        mreq.write_uint32(1, app_id);
-        mreq.write_uint32(2, depot_id);
-        mreq.write_uint64(3, manifest_id);
-        // Public branch is represented by omitting app_branch; SteamKit
-        // explicitly clears "public" because the CM expects it absent.
-        std::vector<uint8_t> mresp;
-        std::string merr;
-        if (cm->unified_call(
-                "ContentServerDirectory.GetManifestRequestCode#1", mreq,
-                &mresp, &merr)) {
-          pb_reader mr{mresp.data(), mresp.size()};
-          uint32_t f = 0, wt = 0;
-          while (mr.next(&f, &wt)) {
+      std::vector<depot_download_t> downloads;
+      for (auto depot : content.depots) {
+        const uint32_t depot_id = depot.id;
+        auto fail_depot = [&](const std::string& msg) {
+          fail("depot " + std::to_string(depot_id) + ": " + msg);
+        };
+        depot_download_t download;
+        download.id = depot_id;
+        // 5) Depot decryption key (proves ownership!)
+        set_item_state(true, 0.10f, "steam: requesting depot license key…");
+        {
+          pb_writer kreq;
+          kreq.write_uint32(1, depot_id);
+          kreq.write_uint32(2, app_id);
+          cm->send_proto(5438 /* ClientGetDepotDecryptionKey */, {}, kreq);
+
+          std::vector<uint8_t> resp;
+          if (!cm->recv_emsg(5439 /* ClientGetDepotDecryptionKeyResponse */,
+                            &resp)) {
+            return fail_depot("depot decryption key timeout");
+          }
+          uint32_t eresult = 0;
+          uint32_t reply_depot = 0;
+          bool got_key = false;
+          pb_reader kr{resp.data(), resp.size()};
+          uint32_t f, wt;
+          while (kr.next(&f, &wt)) {
             if (f == 1 && wt == 0) {
               uint64_t v = 0;
-              mr.read_varint(&v);
-              manifest_code = v;
+              kr.read_varint(&v);
+              eresult = (uint32_t)v;
+            } else if (f == 2 && wt == 0) {
+              uint64_t v = 0;
+              kr.read_varint(&v);
+              reply_depot = static_cast<uint32_t>(v);
+            } else if (f == 3 && wt == 2) {
+              const uint8_t* kp = nullptr;
+              size_t kl = 0;
+              kr.read_bytes(&kp, &kl);
+              if (kl == 32) {
+                std::memcpy(download.key.data(), kp, download.key.size());
+                got_key = true;
+              }
             } else {
-              mr.skip(wt);
+              kr.skip(wt);
             }
           }
-        } else {
-          log_line(("steam_dl[" + std::to_string(app_id) +
-                    "]: manifest request code failed: " + merr)
+          if (reply_depot && reply_depot != depot_id)
+            return fail_depot("Steam returned a key for a different depot");
+          if (eresult != 1 || !got_key) {
+            if (depot.optional_dlc && (eresult == 15 || eresult == 24)) {
+              log_line(("steam_dl: skipping unlicensed optional depot " +
+                        std::to_string(depot_id)).c_str());
+              continue;
+            }
+            return fail_depot("Steam denied depot key (eresult=" +
+                              std::to_string(eresult) + ")");
+          }
+        }
+
+        uint32_t manifest_app = app_id;
+        std::vector<uint32_t> visited{app_id};
+        while (depot.source_app) {
+          const uint32_t source = depot.source_app;
+          if (visited.size() >= 16 ||
+              std::find(visited.begin(), visited.end(), source) != visited.end())
+            return fail_depot("invalid shared depot reference chain");
+          visited.push_back(source);
+          manifest_app = source;
+          if (depot.manifest) break;
+          auto cached = appinfo.find(source);
+          if (cached == appinfo.end())
+            cached = appinfo.emplace(source, fetch_appinfo(source)).first;
+          trt_steam_depot resolved;
+          if (!trt_steam_find_public_depot(cached->second, depot_id, &resolved))
+            return fail_depot("shared depot public manifest not found");
+          depot.manifest = resolved.manifest;
+          depot.size = resolved.size;
+          depot.source_app = depot.manifest ? 0 : resolved.source_app;
+        }
+        const uint64_t manifest_id = depot.manifest;
+        if (!manifest_id) return fail_depot("missing public manifest");
+        // The manifest request code is granted by the CM against the logged-on
+        // session. The old WebAPI GET returned an empty code, which is why the
+        // CDN answered 401.
+        uint64_t manifest_code = 0;
+        {
+          pb_writer mreq;
+          mreq.write_uint32(1, manifest_app);
+          mreq.write_uint32(2, depot_id);
+          mreq.write_uint64(3, manifest_id);
+          // Public branch is represented by omitting app_branch; SteamKit
+          // explicitly clears "public" because the CM expects it absent.
+          std::vector<uint8_t> mresp;
+          std::string merr;
+          if (cm->unified_call(
+                  "ContentServerDirectory.GetManifestRequestCode#1", mreq,
+                  &mresp, &merr)) {
+            pb_reader mr{mresp.data(), mresp.size()};
+            uint32_t f = 0, wt = 0;
+            while (mr.next(&f, &wt)) {
+              if (f == 1 && wt == 0) {
+                uint64_t v = 0;
+                mr.read_varint(&v);
+                manifest_code = v;
+              } else {
+                mr.skip(wt);
+              }
+            }
+          } else {
+            log_line(("steam_dl[" + std::to_string(app_id) +
+                      "]: manifest request code failed: " + merr)
+                         .c_str());
+          }
+        }
+
+        // Tokens are per depot and per CDN host. They are often empty, but
+        // requesting one also tells the cache this session is authorized.
+        auto& cdn_tokens = download.tokens;
+        for (size_t i = 0; i < cdn_hosts.size(); ++i) {
+          std::string token, terr;
+          pb_writer treq;
+          treq.write_uint32(1, depot_id);
+          treq.write_string(2, cdn_vhosts[i]);
+          treq.write_uint32(3, app_id);
+          std::vector<uint8_t> tresp;
+          if (cm->unified_call("ContentServerDirectory.GetCDNAuthToken#1",
+                               treq, &tresp, &terr)) {
+            pb_reader tr{tresp.data(), tresp.size()};
+            uint32_t f = 0, wt = 0;
+            while (tr.next(&f, &wt)) {
+              if (f == 1 && wt == 2) {
+                const uint8_t* p = nullptr;
+                size_t n = 0;
+                if (tr.read_bytes(&p, &n)) token.assign((const char*)p, n);
+              } else {
+                tr.skip(wt);
+              }
+            }
+          }
+          cdn_tokens.push_back(token);
+          std::string tstat = token.empty() ? "none" : "ok";
+          if (token.empty() && !terr.empty()) tstat += " (" + terr + ")";
+          log_line(("steam_dl[" + std::to_string(app_id) + "]: cdn token " +
+                    cdn_vhosts[i] + " -> " + tstat)
                        .c_str());
         }
-      }
 
-      // Tokens are per depot and per CDN host. They are often empty, but
-      // requesting one also tells the cache this session is authorized.
-      std::vector<std::string> cdn_tokens;
-      for (size_t i = 0; i < cdn_hosts.size(); ++i) {
-        std::string token, terr;
-        pb_writer treq;
-        treq.write_uint32(1, depot_id);
-        treq.write_string(2, cdn_vhosts[i]);
-        treq.write_uint32(3, app_id);
-        std::vector<uint8_t> tresp;
-        if (cm->unified_call("ContentServerDirectory.GetCDNAuthToken#1",
-                             treq, &tresp, &terr)) {
-          pb_reader tr{tresp.data(), tresp.size()};
-          uint32_t f = 0, wt = 0;
-          while (tr.next(&f, &wt)) {
-            if (f == 1 && wt == 2) {
-              const uint8_t* p = nullptr;
-              size_t n = 0;
-              if (tr.read_bytes(&p, &n)) token.assign((const char*)p, n);
-            } else {
-              tr.skip(wt);
-            }
+        log_line(("steam_dl[" + std::to_string(app_id) +
+                  "]: manifest_code=" + std::to_string(manifest_code) +
+                  " cdn=" + (cdn_hosts.empty() ? "none" : cdn_hosts[0])).c_str());
+
+        log_line(("steam_dl[" + std::to_string(app_id) +
+                  "]: depot=" + std::to_string(depot_id) +
+                  " manifest=" + std::to_string(manifest_id) +
+                  " size=" + std::to_string(depot.size) +
+                  " main=" + main_exe_rel).c_str());
+        // 7) Download + parse depot manifest
+        set_item_state(true, 0.14f, "steam: downloading manifest for depot " + std::to_string(depot_id));
+        std::vector<uint8_t> manifest_blob;
+        std::string dl_err;
+        for (size_t hi = 0; hi < cdn_hosts.size(); ++hi) {
+          std::string url = "https://" + cdn_vhosts[hi] + "/depot/" +
+                            std::to_string(depot_id) + "/manifest/" +
+                            std::to_string(manifest_id) + "/5";
+          if (manifest_code != 0) url += "/" + std::to_string(manifest_code);
+          if (hi < cdn_tokens.size() && !cdn_tokens[hi].empty()) {
+            url += "?token=" +
+                   u16to8(uri_escape(u8to16(cdn_tokens[hi])));
           }
-        }
-        cdn_tokens.push_back(token);
-        std::string tstat = token.empty() ? "none" : "ok";
-        if (token.empty() && !terr.empty()) tstat += " (" + terr + ")";
-        log_line(("steam_dl[" + std::to_string(app_id) + "]: cdn token " +
-                  cdn_vhosts[i] + " -> " + tstat)
-                     .c_str());
-      }
-
-      log_line(("steam_dl[" + std::to_string(app_id) +
-                "]: manifest_code=" + std::to_string(manifest_code) +
-                " cdn=" + (cdn_hosts.empty() ? "none" : cdn_hosts[0])).c_str());
-
-      log_line(("steam_dl[" + std::to_string(app_id) +
-                "]: depot=" + std::to_string(depot_id) +
-                " manifest=" + std::to_string(manifest_id) +
-                " size=" + std::to_string(depot_sz) +
-                " main=" + main_exe_rel).c_str());
-      // 7) Download + parse depot manifest
-      set_item_state(true, 0.14f, "steam: downloading depot manifest…");
-      std::vector<uint8_t> manifest_blob;
-      std::string dl_err;
-      for (size_t hi = 0; hi < cdn_hosts.size(); ++hi) {
-        std::string url = "https://" + cdn_vhosts[hi] + "/depot/" +
-                          std::to_string(depot_id) + "/manifest/" +
-                          std::to_string(manifest_id) + "/5";
-        if (manifest_code != 0) url += "/" + std::to_string(manifest_code);
-        if (hi < cdn_tokens.size() && !cdn_tokens[hi].empty()) {
-          url += "?token=" +
-                 u16to8(uri_escape(u8to16(cdn_tokens[hi])));
-        }
-        if (http_get_bytes(url, &manifest_blob, &dl_err)) break;
+          if (http_get_bytes(url, &manifest_blob, &dl_err)) break;
           log_line(("steam_dl[" + std::to_string(app_id) + "]: manifest CDN try " +
-                  cdn_hosts[hi] + " " + url + " -> " + dl_err).c_str());
-      }
-      if (manifest_blob.empty()) return fail("manifest CDN failed: " + dl_err);
+                    cdn_hosts[hi] + " -> " + dl_err).c_str());
+        }
+        if (manifest_blob.empty()) return fail_depot("manifest CDN failed: " + dl_err);
 
-      std::vector<depot_file_t> files;
-      std::string perr;
-      if (!parse_manifest_blob(manifest_blob, depot_key, &files, &perr)) {
-        return fail("manifest parse failed: " + perr);
+        std::string perr;
+        if (!parse_manifest_blob(manifest_blob, download.key.data(), &download.files, &perr)) {
+          return fail_depot("manifest parse failed: " + perr);
+        }
+
+        downloads.push_back(std::move(download));
       }
+      if (downloads.empty()) return fail("Steam did not grant a usable game depot");
+
+      // Index Windows paths once across all manifests. Only the winning
+      // version of an overlapping path is downloaded and written.
+      trt_steam_depot_layout owners;
+      for (size_t d = 0; d < downloads.size(); ++d) {
+        for (size_t f = 0; f < downloads[d].files.size(); ++f) {
+          const auto& entry = downloads[d].files[f];
+          if (!trt_steam_add_depot_path(owners, entry.filename,
+                                       {d, f, (entry.flags & kDepotDirectory) != 0}))
+            return fail("depot file/directory conflict: " + entry.filename);
+        }
+      }
+      std::string conflict;
+      if (!trt_steam_validate_depot_layout(owners, &conflict))
+        return fail("depot file blocks a directory: " + conflict);
 
       uint64_t total_bytes = 0;
-      for (const auto& f : files) total_bytes += f.size;
-      if (total_bytes == 0) total_bytes = 1;
+      for (const auto& entry : owners) {
+        const auto& location = entry.second;
+        auto& file = downloads[location.depot].files[location.file];
+        if (file.flags & kDepotDirectory) continue;
+        if (file.flags & kDepotSymlink)
+          return fail("Windows depot contains an unsupported symbolic link: " + file.filename);
+        if (!depot_file_has_complete_chunks(&file))
+          return fail("incomplete manifest chunk list: " + file.filename);
+        if (file.size > std::numeric_limits<uint64_t>::max() - total_bytes)
+          return fail("combined depot sizes exceed the supported range");
+        total_bytes += file.size;
+      }
+      if (!total_bytes) return fail("the combined depots contain no game files");
 
+      if (steam_download_cancelled()) return fail("Download cancelled");
       std::string install_dir = games_dir + "\\" + sanitize_dirname(title);
-      ensure_dir_recursive(install_dir);
+      auto can_install_at = [app_id](const std::string& dir) {
+        if (GetFileAttributesA(dir.c_str()) == INVALID_FILE_ATTRIBUTES) return true;
+        uint32_t existing_id = 0;
+        std::ifstream pending(dir + kSteamInstallPending);
+        if (pending >> existing_id) return existing_id == app_id;
+        std::ifstream existing(dir + "\\steam_appid.txt");
+        return (existing >> existing_id) && existing_id == app_id;
+      };
+      if (!can_install_at(install_dir)) {
+        install_dir += " [" + std::to_string(app_id) + "]";
+        if (!can_install_at(install_dir)) return fail("Steam install directory already in use");
+      }
+      ensure_dir_recursive(install_dir + "\\.tiramisu");
+      const std::string pending_path = install_dir + kSteamInstallPending;
+      std::ofstream pending_file(pending_path, std::ios::trunc);
+      pending_file << app_id << '\n';
+      pending_file.close();
+      if (!pending_file) return fail("could not mark Steam install in progress");
 
-      // 8) Stream every chunk, AES-decrypt, decompress, Adler-32 verify, write
       uint64_t done_bytes = 0;
-      for (const auto& f : files) {
-        if (f.flags & 0x40 /* directory flag */) {
-          ensure_dir_recursive(install_dir + "\\" + f.filename);
-          continue;
-        }
-        std::string fpath = install_dir + "\\" + f.filename;
-        size_t sl = fpath.rfind('\\');
-        if (sl != std::string::npos) ensure_dir_recursive(fpath.substr(0, sl));
+      for (size_t depot_idx = 0; depot_idx < downloads.size(); ++depot_idx) {
+        const auto& download = downloads[depot_idx];
+        const uint32_t depot_id = download.id;
+        const auto& cdn_tokens = download.tokens;
+        auto fail_depot = [&](const std::string& msg) {
+          fail("depot " + std::to_string(depot_id) + ": " + msg);
+        };
+        for (size_t file_idx = 0; file_idx < download.files.size(); ++file_idx) {
+          if (steam_download_cancelled()) return fail("Download cancelled");
+          const auto& f = download.files[file_idx];
+          const auto& owner = owners.at(trt_steam_depot_path_key(f.filename));
+          if (owner.depot != depot_idx || owner.file != file_idx) continue;
+          if (f.flags & kDepotDirectory) {
+            ensure_dir_recursive(install_dir + "\\" + f.filename);
+            continue;
+          }
+          std::string fpath = install_dir + "\\" + f.filename;
+          size_t sl = fpath.rfind('\\');
+          if (sl != std::string::npos) ensure_dir_recursive(fpath.substr(0, sl));
 
-        FILE* fp = fopen(fpath.c_str(), "wb");
-        if (!fp) return fail("cannot create file: " + f.filename);
+          std::unique_ptr<FILE, decltype(&fclose)> file(fopen(fpath.c_str(), "wb"), fclose);
+          if (!file) return fail_depot("cannot create file: " + f.filename);
+          FILE* fp = file.get();
 
-        for (const auto& ck : f.chunks) {
-          char hex_sha[41];
-          for (int i = 0; i < 20; ++i)
-            snprintf(hex_sha + i * 2, 3, "%02x", ck.sha[i]);
+          for (const auto& ck : f.chunks) {
+            if (steam_download_cancelled()) return fail("Download cancelled");
+            char hex_sha[41];
+            for (int i = 0; i < 20; ++i)
+              snprintf(hex_sha + i * 2, 3, "%02x", ck.sha[i]);
 
-          std::vector<uint8_t> enc_chunk;
-          std::string cerr;
-          bool got = false;
-          for (size_t hi = 0; hi < cdn_hosts.size(); ++hi) {
-            std::string url = "https://" + cdn_vhosts[hi] + "/depot/" +
-                              std::to_string(depot_id) + "/chunk/" + hex_sha;
-            if (hi < cdn_tokens.size() && !cdn_tokens[hi].empty()) {
-              url += "?token=" +
-                     u16to8(uri_escape(u8to16(cdn_tokens[hi])));
+            std::vector<uint8_t> enc_chunk;
+            std::string cerr;
+            bool got = false;
+            for (size_t hi = 0; hi < cdn_hosts.size(); ++hi) {
+              std::string url = "https://" + cdn_vhosts[hi] + "/depot/" +
+                                std::to_string(depot_id) + "/chunk/" + hex_sha;
+              if (hi < cdn_tokens.size() && !cdn_tokens[hi].empty()) {
+                url += "?token=" +
+                       u16to8(uri_escape(u8to16(cdn_tokens[hi])));
+              }
+              if (http_get_bytes(url, &enc_chunk, &cerr)) {
+                got = true;
+                break;
+              }
             }
-            if (http_get_bytes(url, &enc_chunk, &cerr)) {
-              got = true;
-              break;
+            if (!got) {
+              return fail_depot("chunk CDN failed (" + std::string(hex_sha) + "): " +
+                          cerr);
             }
-          }
-          if (!got) {
-            fclose(fp);
-            return fail("chunk CDN failed (" + std::string(hex_sha) + "): " +
-                        cerr);
-          }
 
-          if (ck.cb_comp > 0 && enc_chunk.size() != ck.cb_comp) {
-            fclose(fp);
-            return fail("chunk size mismatch (" + std::string(hex_sha) +
-                        "): got " + std::to_string(enc_chunk.size()) +
-                        ", manifest says " + std::to_string(ck.cb_comp));
-          }
+            if (ck.cb_comp > 0 && enc_chunk.size() != ck.cb_comp) {
+              return fail_depot("chunk size mismatch (" + std::string(hex_sha) +
+                          "): got " + std::to_string(enc_chunk.size()) +
+                          ", manifest says " + std::to_string(ck.cb_comp));
+            }
 
-          std::vector<uint8_t> comp_chunk;
-          if (!bcrypt_aes256_decrypt_steam(enc_chunk.data(), enc_chunk.size(),
-                                           depot_key, &comp_chunk)) {
-            fclose(fp);
-            return fail("chunk AES-256 decrypt failed");
-          }
+            std::vector<uint8_t> comp_chunk;
+            if (!bcrypt_aes256_decrypt_steam(enc_chunk.data(), enc_chunk.size(),
+                                             download.key.data(), &comp_chunk)) {
+              return fail_depot("chunk AES-256 decrypt failed");
+            }
 
-          std::vector<uint8_t> plain_chunk;
-          std::string derr;
-          if (!decompress_steam_payload(comp_chunk.data(), comp_chunk.size(),
-                                        ck.cb_orig, &plain_chunk, &derr)) {
-            fclose(fp);
-            return fail("chunk decompress failed: " + derr);
-          }
+            std::vector<uint8_t> plain_chunk;
+            std::string derr;
+            if (!decompress_steam_payload(comp_chunk.data(), comp_chunk.size(),
+                                          ck.cb_orig, &plain_chunk, &derr)) {
+              return fail_depot("chunk decompress failed: " + derr);
+            }
 
-          // The manifest's `sha` is the CDN chunk ID, not a hash of the
-          // plaintext. Steam's integrity contract is an Adler-32 of the
-          // decompressed bytes plus the uncompressed length (DepotChunk).
-          if (ck.cb_orig > 0 && plain_chunk.size() != ck.cb_orig) {
-            fclose(fp);
-            return fail("chunk decompressed to " +
-                        std::to_string(plain_chunk.size()) +
-                        " bytes, manifest says " +
-                        std::to_string(ck.cb_orig));
-          }
-          if (ck.crc != 0 &&
-              adler32_steam(plain_chunk.data(), plain_chunk.size()) != ck.crc) {
-            fclose(fp);
-            return fail("chunk Adler-32 mismatch (" + std::string(hex_sha) +
-                        "): corrupt data or wrong depot key");
-          }
+            // The manifest's `sha` is the CDN chunk ID, not a hash of the
+            // plaintext. Steam's integrity contract is an Adler-32 of the
+            // decompressed bytes plus the uncompressed length (DepotChunk).
+            if (ck.cb_orig > 0 && plain_chunk.size() != ck.cb_orig) {
+              return fail_depot("chunk decompressed to " +
+                          std::to_string(plain_chunk.size()) +
+                          " bytes, manifest says " +
+                          std::to_string(ck.cb_orig));
+            }
+            if (ck.crc != 0 &&
+                adler32_steam(plain_chunk.data(), plain_chunk.size()) != ck.crc) {
+              return fail_depot("chunk Adler-32 mismatch (" + std::string(hex_sha) +
+                          "): corrupt data or wrong depot key");
+            }
 
-          if (!plain_chunk.empty()) {
-            _fseeki64(fp, (long long)ck.offset, SEEK_SET);
-            fwrite(plain_chunk.data(), 1, plain_chunk.size(), fp);
-            done_bytes += plain_chunk.size();
+            if (!plain_chunk.empty()) {
+              if (ck.offset > f.size || plain_chunk.size() > f.size - ck.offset ||
+                  _fseeki64(fp, static_cast<long long>(ck.offset), SEEK_SET) != 0 ||
+                  fwrite(plain_chunk.data(), 1, plain_chunk.size(), fp) != plain_chunk.size()) {
+                return fail_depot("could not write depot file: " + f.filename);
+              }
+              done_bytes += plain_chunk.size();
+            }
+            float pct = 0.15f + 0.82f * ((float)done_bytes / (float)total_bytes);
+            if (pct > 0.97f) pct = 0.97f;
+            set_item_state(true, pct,
+                           "downloading " + title + ": " +
+                               format_bytes(done_bytes) + " / " +
+                               format_bytes(total_bytes));
           }
-          float pct = 0.15f + 0.82f * ((float)done_bytes / (float)total_bytes);
-          if (pct > 0.97f) pct = 0.97f;
-          set_item_state(true, pct,
-                         "downloading " + title + ": " +
-                             format_bytes(done_bytes) + " / " +
-                             format_bytes(total_bytes));
+          if (fclose(file.release()) != 0) return fail_depot("could not finish depot file: " + f.filename);
         }
-        fclose(fp);
       }
 
-      // 9) Write steam_appid.txt & run Engine Synthesizer + PC->Xbox translation
-      {
-        FILE* af = fopen((install_dir + "\\steam_appid.txt").c_str(), "wb");
-        if (af) {
-          fprintf(af, "%u\n", app_id);
-          fclose(af);
-        }
-      }
+      if (steam_download_cancelled()) return fail("Download cancelled");
+      // Synthesize before publishing the Steam install to the library.
       set_item_state(true, 0.98f,
                      "synthesizing Xbox engine profile for " + title + "…");
+      std::ofstream appid_file(install_dir + "\\steam_appid.txt", std::ios::trunc);
+      appid_file << app_id << '\n';
+      appid_file.close();
+      if (!appid_file) return fail("could not save steam_appid.txt");
+
       trt_engine_profile prof;
       const char* hint_exe =
           main_exe_rel.empty() ? nullptr : main_exe_rel.c_str();
-      if (trt_synthesize_engine(install_dir.c_str(), hint_exe, &prof)) {
-        std::string tdir = install_dir + "\\.tiramisu";
-        CreateDirectoryA(tdir.c_str(), nullptr);
-        if (!prof.main_exe_abs.empty()) {
-          trt_pc2xb_translate_file(prof.main_exe_abs.c_str(),
-                                   (tdir + "\\xb").c_str());
-        }
+      if (!trt_synthesize_engine(install_dir.c_str(), hint_exe, &prof)) {
+        return fail("download contains no supported Windows game executable");
       }
+      const auto installed_exe = owners.find(trt_steam_depot_path_key(prof.main_exe_rel));
+      if (installed_exe == owners.end() || installed_exe->second.directory)
+        return fail("selected executable is missing from the combined Steam depots");
+      const std::string tdir = install_dir + "\\.tiramisu";
+      CreateDirectoryA(tdir.c_str(), nullptr);
+      std::ofstream launch_file(install_dir + kSteamLaunchExe, std::ios::trunc);
+      launch_file << prof.main_exe_rel << '\n';
+      std::string steam_exe;
+      if (trt_steam_normalize_content_path(main_exe_rel, &steam_exe) &&
+          trt_steam_depot_path_key(steam_exe) == trt_steam_depot_path_key(prof.main_exe_rel)) {
+        std::string working_dir;
+        if (content.working_dir == "." ||
+            trt_steam_normalize_content_path(content.working_dir, &working_dir)) {
+          launch_file << (working_dir.empty() ? "." : working_dir);
+        }
+        launch_file << '\n';
+        for (char c : content.arguments)
+          launch_file.put(c == '\r' || c == '\n' || c == '\0' ? ' ' : c);
+        launch_file << '\n';
+      }
+      launch_file.close();
+      if (!launch_file) {
+        return fail("could not save the Steam launch executable");
+      }
+      trt_pc2xb_translate_file(prof.main_exe_abs.c_str(), (tdir + "\\xb").c_str());
+      bool committed;
+      {
+        std::lock_guard<std::mutex> lock(g_mu);
+        committed = !g_cancel_download && DeleteFileA(pending_path.c_str()) != 0;
+        g_install_committed = committed;
+      }
+      if (!committed) return fail("could not finalize the Steam install");
       set_item_state(false, 1.0f, "Ready to Play", true, install_dir);
-      g_dl_busy = false;
-      if (on_complete) on_complete();
+      if (on_complete) {
+        try { on_complete(); } catch (...) { log_line("steam: library refresh callback failed"); }
+      }
     } catch (winrt::hresult_error const& e) {
       fail(u16to8(std::wstring(e.message().c_str())));
     } catch (...) {
       fail("unexpected error during Steam depot download");
     }
-  }).detach();
+    }).detach();
+  } catch (...) {
+    set_item_state(false, 0.0f, "Could not start Steam download");
+    finish_steam_download();
+  }
 }
 
 steam_account_snapshot steam_client_account() {
@@ -2450,8 +2597,23 @@ steam_account_snapshot steam_client_account() {
 }
 
 std::vector<steam_library_item> steam_client_items() {
-  std::lock_guard<std::mutex> lk(g_mu);
-  return g_items;
+  std::lock_guard<std::mutex> lock(g_mu);
+  auto items = g_items;
+  for (auto& item : items) {
+    if (item.app_id == g_active_download && !g_install_committed) {
+      item.downloading = true;
+      if (g_cancel_download) item.status_text = "Cancelling download";
+    }
+  }
+  for (const auto& job : g_download_queue) {
+    auto item = std::find_if(items.begin(), items.end(),
+        [&job](const auto& entry) { return entry.app_id == job.app_id; });
+    if (item != items.end()) {
+      item->queued = true;
+      item->status_text = "Queued";
+    }
+  }
+  return items;
 }
 
 } // namespace longan

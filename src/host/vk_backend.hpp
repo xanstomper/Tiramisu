@@ -11,6 +11,8 @@
 #include "../trt/bridge_vulkan.h"
 #include "../trt/spirv_hlsl.h"
 #include "../trt/thunk.h"
+#include "../trt/bridge_esram.h"
+#include "shader_cache_util.h"
 
 #include <algorithm>
 #include <atomic>
@@ -88,6 +90,10 @@ struct buf_rec {
 
 struct img_rec {
   trt_vk_image_desc desc{};
+  // DXGI format of the created texture, recorded so free_img_rec() can
+  // release the matching ESRAM surface. desc.vk_format is a Vulkan format,
+  // not the DXGI format trt_esram_release_surface expects.
+  uint32_t tex2d_fmt = 0;
   ID3D11Texture2D* tex2d = nullptr;
   ID3D11Texture3D* tex3d = nullptr;
   ID3D11ShaderResourceView* srv = nullptr;
@@ -603,6 +609,9 @@ inline void free_img_rec(img_rec& im) {
         ? g_d3d_tex_live_bytes - im.d3d_bytes : 0;
     im.d3d_bytes = 0;
   }
+  if (trt_esram_is_active() && (im.rtv || im.dsv)) {
+    trt_esram_release_surface(im.desc.w, im.desc.h, (uint32_t)im.tex2d_fmt);
+  }
   if (im.srv) im.srv->Release();
   if (im.rtv) im.rtv->Release();
   if (im.dsv) im.dsv->Release();
@@ -621,6 +630,12 @@ inline bool compile_hlsl_blob(const char* src, uint32_t len, const char* profile
                               std::vector<uint8_t>& out_blob) {
   if (!src || !len) return false;
   ID3DBlob* code = nullptr;
+  if (longan::d3d_compile_cached(src, len, profile, "main", &code) && code) {
+    const uint8_t* p = static_cast<const uint8_t*>(code->GetBufferPointer());
+    out_blob.assign(p, p + code->GetBufferSize());
+    code->Release();
+    return true;
+  }
   ID3DBlob* errs = nullptr;
   HRESULT hr = D3DCompile(src, len, nullptr, nullptr, nullptr, "main", profile,
                           D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &errs);
@@ -1209,9 +1224,13 @@ inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* 
         }
       }
       if (SUCCEEDED(hr) && im.tex2d) {
+        im.tex2d_fmt = (uint32_t)td.Format;
         // .221 DIAG: D3D11 creation-size ledger.
         im.d3d_bytes = d3d_tex_note_created(desc->vk_format, td.Width,
                                             td.Height, 1u, mips, layers);
+        if (trt_esram_is_active() && (bind_flags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL))) {
+          trt_esram_qualify_and_alloc(td.Width, td.Height, (uint32_t)td.Format, bind_flags, "vk_tex2d");
+        }
         if (bind_flags & D3D11_BIND_SHADER_RESOURCE) {
           D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
           sd.Format = depth ? depth_srv_fmt(desc->vk_format) : tex_fmt;

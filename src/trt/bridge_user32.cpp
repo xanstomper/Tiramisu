@@ -3,6 +3,8 @@
 // window records, and a WORKING message pump. Semantics follow Wine's
 // user32 spec; windows are records, the surface is the host swapchain.
 // MSG layout (x64): hwnd(8) message(4+) pad(4) wParam(8) lParam(8) time(4) point(8) = 48
+#include "bridge_user32.h"
+#include "bridge_gdi.h"
 #include "trt.h"
 #include "images.h"
 #include "thunk.h"
@@ -16,6 +18,8 @@
 #include <string.h>
 #include <time.h>
 
+#include <algorithm>
+#include <atomic>
 #include <deque>
 #include <mutex>
 #include <vector>
@@ -29,16 +33,41 @@ namespace {
 
 void (*g_pump)() = nullptr;
 
+// Win32 encodes a resource id as MAKEINTRESOURCE: a pointer-shaped value whose
+// high 16 bits are zero. Formatting one with %s dereferences e.g. 0xc8 and
+// faults the host (measured: Putty's LoadImageA(MAKEINTRESOURCE(200)) crashed
+// in host strlen before this). Every API taking a string-or-atom goes through
+// this so an atom is logged as "#200", never read as a string.
+static void name_or_id(const void* p, char* out, size_t cap) {
+  const uintptr_t v = (uintptr_t)p;
+  if (!v) {
+    snprintf(out, cap, "(null)");
+    return;
+  }
+  if ((v >> 16) == 0) {
+    snprintf(out, cap, "#%u", (unsigned)(v & 0xFFFFu));
+    return;
+  }
+  size_t i = 0;
+  const char* s = (const char*)p;
+  for (; i + 1 < cap && s[i]; ++i) out[i] = s[i];
+  out[i] = 0;
+}
+
 struct guest_window {
   u64 handle;
   u64 class_atom;
   i64 proc;             // guest WNDPROC
+  i32 x, y;             // guest window origin
+  i32 cx, cy;           // current client surface size
+  i32 upd_l, upd_t, upd_r, upd_b;  // owed repaint (empty when l >= r)
   wchar_t title[64];
 };
 std::mutex g_win_mu;
 std::vector<guest_window> g_wins;
-int g_win_count = 0;
 u64 g_next_hwnd = 0x00010001;
+
+extern "C" void trt_user32_invalidate(void* hwnd, const i32* rect);
 
 struct createstruct_w {
   void* lpCreateParams;
@@ -103,13 +132,6 @@ guest_window* find_win_locked(u64 hwnd) {
   return nullptr;
 }
 
-// extern-C accessors for the gap bridge (bridge_user32_gap.cpp): the window
-// record table. The gap bridge mirrors the struct with a static_assert.
-extern "C" void* trt_u32_windows(void) {
-  if (g_wins.capacity() < 256) g_wins.reserve(256);
-  return g_wins.empty() ? nullptr : (void*)g_wins.data();
-}
-extern "C" int* trt_u32_win_count(void) { return &g_win_count; }
 extern "C" i64 TRT_STDCALL trt_SetWindowLongPtrW(u64 hwnd, int idx, i64 value);
 extern "C" i64 TRT_STDCALL trt_GetWindowLongPtrW(u64 hwnd, int idx);
 
@@ -134,6 +156,16 @@ static bool g_quit_posted = false;
 static bool g_quit_pending = false;
 static void* g_focus_window = nullptr;
 static void* g_capture_window = nullptr;
+void* TRT_STDCALL trt_GetFocus(void);
+void* TRT_STDCALL trt_SetFocus(void* hwnd);
+
+// Child windows and nonactivating utility windows do not become the
+// foreground keyboard target merely because they were created or shown.
+static bool window_can_activate(u32 style, u32 exstyle) {
+  constexpr u32 disabled_or_child = 0x08000000u | 0x40000000u;
+  constexpr u32 no_activate = 0x08000000u;
+  return !(style & disabled_or_child) && !(exstyle & no_activate);
+}
 
 // ---- class/window records ----
 u16 TRT_STDCALL trt_RegisterClassExW(const void* wcx) {
@@ -158,7 +190,6 @@ u16 TRT_STDCALL trt_RegisterClassExW(const void* wcx) {
   w.class_atom = atom;
   w.proc = (i64)(uintptr_t)c->proc;
   g_wins.push_back(w);
-  g_win_count = (int)g_wins.size();
   return atom;
 }
 
@@ -190,6 +221,8 @@ void* TRT_STDCALL trt_CreateWindowExW(u32 exstyle, const wchar_t* cls,
   createstruct_w* cs_ptr = nullptr;
   const wchar_t* title_ptr = title;
   bool sync_create = false;
+  const bool initially_visible = (style & 0x10000000u /*WS_VISIBLE*/) != 0;
+  const bool activate = initially_visible && window_can_activate(style, exstyle);
   {
     std::lock_guard<std::mutex> lk(g_win_mu);
     if (g_wins.capacity() < 256) g_wins.reserve(256);
@@ -224,13 +257,18 @@ void* TRT_STDCALL trt_CreateWindowExW(u32 exstyle, const wchar_t* cls,
     rec.handle = hwnd;
     rec.class_atom = found_atom;
     rec.proc = found_proc;
+    rec.x = x == (-2147483647 - 1) ? 0 : x;  // CW_USEDEFAULT
+    rec.y = y == (-2147483647 - 1) ? 0 : y;
+    rec.cx = w > 0 ? w : 1920;
+    rec.cy = h > 0 ? h : 1080;
+    rec.upd_l = rec.upd_t = 0;
+    rec.upd_r = rec.upd_b = 0;
     if (title) {
       size_t i = 0;
       for (; title[i] && i < 63; ++i) rec.title[i] = title[i];
       rec.title[i] = 0;
     }
     g_wins.push_back(rec);
-    g_win_count = (int)g_wins.size();
     title_ptr = g_wins.back().title;
 
     g_win_cs.emplace_back();
@@ -248,7 +286,7 @@ void* TRT_STDCALL trt_CreateWindowExW(u32 exstyle, const wchar_t* cls,
     cs_ptr->lpszName = title_ptr;
     cs_ptr->lpszClass = cls;
     cs_ptr->dwExStyle = exstyle;
-    g_focus_window = (void*)(uintptr_t)hwnd;
+    if (activate) g_focus_window = (void*)(uintptr_t)hwnd;
     sync_create = (exact_class && found_proc != 0 && param != nullptr);
   }
 
@@ -267,14 +305,34 @@ void* TRT_STDCALL trt_CreateWindowExW(u32 exstyle, const wchar_t* cls,
   }
   trt_msg_post(0x0018, 1, 0);                        // WM_SHOWWINDOW
   if (style != 0 && !parent && !(style & 0x40000000u /*WS_CHILD*/)) {
+    // The paint cycle every desktop window receives after being shown:
+    // WM_MOVE, WM_SIZE, WM_NCPAINT, WM_ERASEBKGND, WM_PAINT. Without these a
+    // desktop app never runs its own WM_PAINT handler, so it draws nothing
+    // even though the GDI surface exists.
+    const i32 cw = w > 0 ? w : 1920;
+    const i32 ch = h > 0 ? h : 1080;
+    const i64 pos = (i64)((u32)(u16)x | ((u32)(u16)y << 16));
+    const i64 size = (i64)((u32)(u16)cw | ((u32)(u16)ch << 16));
+    trt_msg_post(0x0003u /*WM_MOVE*/, 0, pos);
+    trt_msg_post(0x0005u /*WM_SIZE*/, 0 /*SIZE_RESTORED*/, size);
+    trt_msg_post(0x0085u /*WM_NCPAINT*/, 1, 0);
+    trt_msg_post(0x0014u /*WM_ERASEBKGND*/, 0, (i64)(uintptr_t)hwnd);
+    trt_user32_invalidate((void*)(uintptr_t)hwnd,
+                          nullptr);  // WM_PAINT owes the whole client
+    trt_msg_post(0x000Fu /*WM_PAINT*/, 0, 0);
     // The console view already owns input focus. Deliver the activation
     // messages a desktop game receives for its foreground top-level window.
-    trt_msg_post(0x001Cu /*WM_ACTIVATEAPP*/, 1, 0);
-    trt_msg_post(0x0006u /*WM_ACTIVATE*/, 1 /*WA_ACTIVE*/, 0);
-    trt_msg_post(0x0007u /*WM_SETFOCUS*/, 0, 0);
+    if (activate) {
+      trt_msg_post(0x001Cu /*WM_ACTIVATEAPP*/, 1, 0);
+      trt_msg_post(0x0006u /*WM_ACTIVATE*/, 1 /*WA_ACTIVE*/, 0);
+      trt_msg_post(0x0007u /*WM_SETFOCUS*/, 0, 0);
+    }
   }
   return (void*)(uintptr_t)hwnd;
 }
+
+// Defined with the DC records below; a destroyed window frees its surface.
+void drop_window_dc(u64 hwnd);
 
 int TRT_STDCALL trt_DestroyWindow(void* hwnd) {
   const u64 hv = (u64)(uintptr_t)hwnd;
@@ -292,6 +350,7 @@ int TRT_STDCALL trt_DestroyWindow(void* hwnd) {
     }
   }
   trt_msg_post(0x0002, 0, (i64)(uintptr_t)hwnd);  // WM_DESTROY
+  drop_window_dc(hv);  // frees (and dumps) the window's raster surface
   return 1;
 }
 
@@ -305,9 +364,20 @@ int TRT_STDCALL trt_ShowWindow(void* hwnd, int cmd) {
                             ? ((u32)old_style & ~0x10000000u)
                             : ((u32)old_style | 0x10000000u);
   trt_SetWindowLongPtrW(hv, -16 /*GWL_STYLE*/, (i64)(i32)new_style);
+  if (cmd == 0 /*SW_HIDE*/) {
+    if (trt_GetFocus() == hwnd) trt_SetFocus(nullptr);
+  } else if (cmd != 4 /*SW_SHOWNOACTIVATE*/ && cmd != 7 /*SW_SHOWMINNOACTIVE*/ &&
+             cmd != 8 /*SW_SHOWNA*/ &&
+             window_can_activate(new_style, (u32)trt_GetWindowLongPtrW(hv, -20 /*GWL_EXSTYLE*/))) {
+    trt_SetFocus(hwnd);
+  }
   return was_visible;
 }
-int TRT_STDCALL trt_UpdateWindow(void*) { return 1; }
+int TRT_STDCALL trt_UpdateWindow(void* hwnd) {
+  // Real UpdateWindow sends WM_PAINT synchronously when the window is dirty.
+  if (hwnd) dispatch((u64)(uintptr_t)hwnd, 0x000Fu /*WM_PAINT*/, 0, 0);
+  return 1;
+}
 
 i64 TRT_STDCALL trt_DefWindowProcW(void* hwnd, u32 msg, u64 wp, i64 lp) {
   (void)hwnd; (void)wp; (void)lp;
@@ -368,6 +438,19 @@ static bool fill_msg(guest_msg* m, void* filter_hwnd, u32 min, u32 max,
   }
   trt_msg t;
   const bool want_peek = trt_msg_peek_range(&t, min, max, remove);
+  if (want_peek && remove &&
+      (t.message == 0x0100u || t.message == 0x0101u ||
+       t.message == 0x0102u || t.message == 0x00FFu)) {
+    static std::atomic<unsigned> delivered{0};
+    if (delivered.fetch_add(1, std::memory_order_relaxed) < 40) {
+      char line[128];
+      snprintf(line, sizeof(line),
+               "input: dequeued msg=%04x wp=%llx lp=%llx",
+               t.message, (unsigned long long)t.wparam,
+               (unsigned long long)(u64)t.lparam);
+      log_line(line);
+    }
+  }
   if (want_peek) {
     if (remove && t.message == 0x0012u) {
       g_quit_pending = false;
@@ -376,9 +459,13 @@ static bool fill_msg(guest_msg* m, void* filter_hwnd, u32 min, u32 max,
     if (m) {
       int px = 0, py = 0;
       trt_mouse_pos(&px, &py);
-      m->hwnd = (t.message == 0x0012u)
-                    ? 0
-                    : (u64)(uintptr_t)trt_GetActiveWindow();
+      const u64 raw_target = t.message == 0x00FFu /*WM_INPUT*/
+                                 ? trt_raw_target_window(static_cast<u64>(t.lparam))
+                                 : 0;
+      m->hwnd = raw_target ? raw_target
+                          : t.message == 0x0012u /*WM_QUIT*/
+                                ? 0
+                                : (u64)(uintptr_t)trt_GetActiveWindow();
       m->message = t.message;
       m->_pad = 0;
       m->wParam = t.wparam;
@@ -438,7 +525,10 @@ void trt_bridge_post_quit(int code) {
 
 bool trt_bridge_quit_posted(void) { return g_quit_posted; }
 
-void trt_bridge_set_focus(void* hwnd) { g_focus_window = hwnd; }
+void trt_bridge_set_focus(void* hwnd) {
+  std::lock_guard<std::mutex> lock(g_win_mu);
+  g_focus_window = hwnd;
+}
 
 int TRT_STDCALL trt_PeekMessageW(guest_msg* out, void* hwnd, u32 min, u32 max,
                                  u32 remove) {
@@ -483,15 +573,42 @@ i64 TRT_STDCALL trt_DispatchMessageW(const guest_msg* m) {
 }
 
 // ---- input getters ----
-i16 TRT_STDCALL trt_GetAsyncKeyState(int vk) { return trt_key_async((u16)vk); }
-i16 TRT_STDCALL trt_GetKeyState(int vk) { return trt_key_sync((u16)vk); }
+static void log_key_poll(const char* api, int vk, i16 state) {
+  if (vk != 13 && vk != 32 && vk != 90) return;
+  static std::atomic<unsigned> polls{0};
+  const unsigned n = polls.fetch_add(1, std::memory_order_relaxed);
+  if (n >= 48) return;
+  char line[144];
+  snprintf(line, sizeof(line), "input: %s vk=%d state=%04x",
+           api, vk, (unsigned)(u16)state);
+  log_line(line);
+}
+i16 TRT_STDCALL trt_GetAsyncKeyState(int vk) {
+  const i16 state = trt_key_async((u16)vk);
+  log_key_poll("GetAsyncKeyState", vk, state);
+  return state;
+}
+i16 TRT_STDCALL trt_GetKeyState(int vk) {
+  const i16 state = trt_key_sync((u16)vk);
+  log_key_poll("GetKeyState", vk, state);
+  return state;
+}
 
 int TRT_STDCALL trt_GetKeyboardState(u8* state) {
+  static std::atomic<unsigned> reads{0};
+  const unsigned read_no = reads.fetch_add(1, std::memory_order_relaxed);
   if (!state) return 0;
   memset(state, 0, TRT_MAX_VK);
   for (int i = 0; i < TRT_MAX_VK; ++i) {
     const i16 ks = trt_key_sync((u16)i);
     state[i] = (u8)(((ks < 0) ? 0x80 : 0) | (ks & 0x01));
+  }
+  if (read_no < 16) {
+    char line[128];
+    snprintf(line, sizeof(line),
+             "input: GetKeyboardState #%u enter=%02x space=%02x z=%02x",
+             read_no + 1, state[13], state[32], state[90]);
+    log_line(line);
   }
   return 1;
 }
@@ -558,11 +675,33 @@ void* TRT_STDCALL trt_LoadIconW(void* inst, const wchar_t* name) {
 int TRT_STDCALL trt_RegisterRawInputDevices(const void* devices, u32 count,
                                             u32 size) {
   if (size != 16) return 0;  // sizeof(RAWINPUTDEVICE) on x64
-  return trt_raw_register(devices, count) ? 1 : 0;
+  const int ok = trt_raw_register(devices, count) ? 1 : 0;
+  static std::atomic<unsigned> registrations{0};
+  if (registrations.fetch_add(1, std::memory_order_relaxed) < 12) {
+    struct rid_log { u16 page; u16 usage; u32 flags; u64 hwnd; };
+    const auto* d = static_cast<const rid_log*>(devices);
+    for (u32 i = 0; i < count; ++i) {
+      char line[192];
+      snprintf(line, sizeof(line),
+               "input: RegisterRawInputDevices count=%u item=%u page=%u usage=%u flags=%08x hwnd=%p result=%d",
+               count, i, d[i].page, d[i].usage, d[i].flags,
+               (void*)(uintptr_t)d[i].hwnd, ok);
+      log_line(line);
+    }
+  }
+  return ok;
 }
 
 u32 TRT_STDCALL trt_GetRawInputData(void* hraw, u32 cmd, void* out,
                                     u32* out_size, u32 header_size) {
+  static std::atomic<unsigned> raw_reads{0};
+  const unsigned read_no = raw_reads.fetch_add(1, std::memory_order_relaxed);
+  if (read_no < 24) {
+    char line[128];
+    snprintf(line, sizeof(line), "input: GetRawInputData #%u cmd=%08x out=%u",
+             read_no + 1, cmd, out ? 1u : 0u);
+    log_line(line);
+  }
   extern void TRT_STDCALL trt_SetLastError(u32);
   if (!out_size || header_size != 24 ||
       (cmd != 0x10000003u /*RID_INPUT*/ && cmd != 0x10000005u /*RID_HEADER*/)) {
@@ -584,6 +723,24 @@ u32 TRT_STDCALL trt_GetRawInputData(void* hraw, u32 cmd, void* out,
     return (u32)-1;
   }
   memcpy(out, blob, blob_size);
+  if (read_no < 24) {
+    char line[128];
+    u32 type = 0;
+    if (blob_size >= 4) memcpy(&type, blob, 4);
+    if (type == 1 && blob_size >= 40) {
+      u16 flags = 0, vk = 0;
+      memcpy(&flags, blob + 26, 2);
+      memcpy(&vk, blob + 30, 2);
+      snprintf(line, sizeof(line),
+               "input: raw keyboard vk=%u flags=%04x bytes=%u",
+               vk, flags, blob_size);
+    } else {
+      snprintf(line, sizeof(line),
+               "input: GetRawInputData result=%u bytes=%u",
+               blob_size, blob_size);
+    }
+    log_line(line);
+  }
   return blob_size;
 }
 
@@ -818,36 +975,123 @@ void TRT_STDCALL trt_PostQuitMessage(i32 code) {
   trt_bridge_post_quit(code);
 }
 
-// SetFocus(hwnd) / GetFocus(): the guest's input focus
-void* TRT_STDCALL trt_SetFocus(void* hwnd) {
-  void* prev = g_focus_window;
-  g_focus_window = hwnd;
-  if (hwnd) {
-    trt_msg_post(0x0007 /*WM_SETFOCUS*/, 0, (i64)(uintptr_t)hwnd);
-  } else {
-    trt_msg_post(0x0008 /*WM_KILLFOCUS*/, 0, 0);
-  }
-  return prev;
+// Focus notifications go directly to the old and new window procedures.
+void* TRT_STDCALL trt_GetFocus(void) {
+  std::lock_guard<std::mutex> lock(g_win_mu);
+  return g_focus_window;
 }
 
-void* TRT_STDCALL trt_GetFocus(void) { return g_focus_window; }
-
-// SetWindowPos(hwnd, after, x, y, cx, cy, flags)
-int TRT_STDCALL trt_SetWindowPos(void* hwnd, void* after, i32 x, i32 y,
-                                  i32 cx, i32 cy, u32 flags) {
-  (void)after; (void)x; (void)y; (void)cx; (void)cy;
-  if (hwnd && (flags & (0x0040u /*SWP_SHOWWINDOW*/ | 0x0080u /*SWP_HIDEWINDOW*/))) {
-    const u64 hv = (u64)(uintptr_t)hwnd;
-    u32 st = (u32)trt_GetWindowLongPtrW(hv, -16 /*GWL_STYLE*/);
-    if (flags & 0x0040u) st |= 0x10000000u /*WS_VISIBLE*/;
-    if (flags & 0x0080u) st &= ~0x10000000u /*WS_VISIBLE*/;
-    trt_SetWindowLongPtrW(hv, -16 /*GWL_STYLE*/, (i64)(i32)st);
+void* TRT_STDCALL trt_SetFocus(void* hwnd) {
+  extern void TRT_STDCALL trt_SetLastError(u32);
+  const u64 target = reinterpret_cast<u64>(hwnd);
+  void* previous = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_win_mu);
+    if (hwnd && !find_win_locked(target)) {
+      trt_SetLastError(1400);  // ERROR_INVALID_WINDOW_HANDLE
+      return nullptr;
+    }
+    previous = g_focus_window;
+    if (previous == hwnd) return previous;
+    g_focus_window = hwnd;
   }
+
+  const u64 old_target = reinterpret_cast<u64>(previous);
+  if (previous) dispatch(old_target, 0x0008u /*WM_KILLFOCUS*/, target, 0);
+  // The old window can redirect focus from its callback.
+  if (hwnd && trt_GetFocus() == hwnd)
+    dispatch(target, 0x0007u /*WM_SETFOCUS*/, old_target, 0);
+  return previous;
+}
+
+// Virtual window geometry. Release the registry lock before calling a
+// guest window procedure: it may query or change the same window again.
+int TRT_STDCALL trt_SetWindowPos(void* hwnd, void* after, i32 x, i32 y,
+                               i32 cx, i32 cy, u32 flags) {
+  (void)after;  // Virtual windows don't have a native z-order.
+  if (!hwnd) return 0;
+  constexpr u32 no_size = 0x0001u, no_move = 0x0002u, no_redraw = 0x0008u;
+  constexpr u32 show = 0x0040u, hide = 0x0080u;
+  const u64 id = reinterpret_cast<uintptr_t>(hwnd);
+  bool moved = false, resized = false;
+  {
+    std::lock_guard<std::mutex> lock(g_win_mu);
+    auto* match = find_win_locked(id);
+    if (!match) return 0;
+    if (!(flags & no_move)) {
+      moved = match->x != x || match->y != y;
+      match->x = x;
+      match->y = y;
+    }
+    if (!(flags & no_size)) {
+      cx = cx < 0 ? 0 : cx;
+      cy = cy < 0 ? 0 : cy;
+      resized = match->cx != cx || match->cy != cy;
+      match->cx = cx;
+      match->cy = cy;
+      if (resized && !(flags & no_redraw)) {
+        match->upd_l = match->upd_t = 0;
+        match->upd_r = cx;
+        match->upd_b = cy;
+      }
+    }
+  }
+  if (flags & (show | hide)) {
+    u32 style = static_cast<u32>(trt_GetWindowLongPtrW(id, -16));
+    if (flags & show) style |= 0x10000000u;
+    if (flags & hide) style &= ~0x10000000u;
+    trt_SetWindowLongPtrW(id, -16, static_cast<i32>(style));
+  }
+  auto pack_dims = [](i32 low, i32 high) {
+    return static_cast<i64>(static_cast<u32>(static_cast<u16>(low)) |
+                            (static_cast<u32>(static_cast<u16>(high)) << 16));
+  };
+  if (moved) dispatch(id, 0x0003u /*WM_MOVE*/, 0, pack_dims(x, y));
+  if (resized) dispatch(id, 0x0005u /*WM_SIZE*/, 0, pack_dims(cx, cy));
+  return 1;
+}
+
+extern "C" int trt_user32_window_rect(void* hwnd, i32* rect) {
+  if (!hwnd || !rect) return 0;
+  const u64 id = reinterpret_cast<uintptr_t>(hwnd);
+  std::lock_guard<std::mutex> lock(g_win_mu);
+  const auto* match = find_win_locked(id);
+  if (!match) return 0;
+  auto edge = [](i32 origin, i32 extent) {
+    const i64 sum = static_cast<i64>(origin) + extent;
+    return static_cast<i32>(sum > 2147483647 ? 2147483647 : sum);
+  };
+  rect[0] = match->x;
+  rect[1] = match->y;
+  rect[2] = edge(match->x, match->cx);
+  rect[3] = edge(match->y, match->cy);
   return 1;
 }
 
 // IsWindow / IsWindowVisible: the guest asks whether its window is alive
 int TRT_STDCALL trt_IsWindow(void* hwnd) { return hwnd ? 1 : 0; }
+
+i64 trt_user32_window_proc(u64 hwnd, const i64* replacement) {
+  std::lock_guard<std::mutex> lock(g_win_mu);
+  auto* window = find_win_locked(hwnd);
+  if (!window) return 0;
+  const auto previous = window->proc;
+  if (replacement) window->proc = *replacement;
+  return previous;
+}
+
+int trt_user32_window_title(u64 hwnd, u16* text, int capacity) {
+  std::lock_guard<std::mutex> lock(g_win_mu);
+  const auto* window = find_win_locked(hwnd);
+  int length = 0;
+  if (window)
+    while (length < 63 && window->title[length]) ++length;
+  if (!text || capacity <= 0) return length;
+  const int copied = std::min(length, capacity - 1);
+  for (int i = 0; i < copied; ++i) text[i] = static_cast<u16>(window->title[i]);
+  text[copied] = 0;
+  return copied;
+}
 
 int TRT_STDCALL trt_IsWindowVisible(void* hwnd) {
   if (!hwnd) return 0;
@@ -856,12 +1100,102 @@ int TRT_STDCALL trt_IsWindowVisible(void* hwnd) {
 }
 
 // GetClientRect / GetWindowRect: the guest asks how big it is
+// Client size of a window created by CreateWindowExW. Falls back to the
+// display size for window-less/unknown handles (the old behaviour).
+namespace {
+bool window_client_size(u64 hwnd, i32* w, i32* h) {
+  std::lock_guard<std::mutex> lk(g_win_mu);
+  for (size_t i = g_wins.size(); i > 0; --i) {
+    if (g_wins[i - 1].handle == hwnd) {
+      *w = g_wins[i - 1].cx;
+      *h = g_wins[i - 1].cy;
+      return true;
+    }
+  }
+  return false;
+}
+}  // namespace
+
+namespace {
+guest_window* window_find_locked(u64 hwnd) {
+  for (size_t i = g_wins.size(); i > 0; --i)
+    if (g_wins[i - 1].handle == hwnd) return &g_wins[i - 1];
+  return nullptr;
+}
+}  // namespace
+
+extern "C" void trt_user32_invalidate(void* hwnd, const i32* rect) {
+  if (!hwnd) return;
+  std::lock_guard<std::mutex> lk(g_win_mu);
+  guest_window* w = window_find_locked((u64)(uintptr_t)hwnd);
+  if (!w) return;
+  i32 l = 0, t = 0, r = w->cx, b = w->cy;
+  if (rect) {
+    l = rect[0];
+    t = rect[1];
+    r = rect[2];
+    b = rect[3];
+    if (l < 0) l = 0;
+    if (t < 0) t = 0;
+    if (r > w->cx) r = w->cx;
+    if (b > w->cy) b = w->cy;
+  }
+  if (r <= l || b <= t) return;
+  if (w->upd_r <= w->upd_l || w->upd_b <= w->upd_t) {
+    w->upd_l = l;
+    w->upd_t = t;
+    w->upd_r = r;
+    w->upd_b = b;
+  } else {
+    if (l < w->upd_l) w->upd_l = l;
+    if (t < w->upd_t) w->upd_t = t;
+    if (r > w->upd_r) w->upd_r = r;
+    if (b > w->upd_b) w->upd_b = b;
+  }
+}
+
+extern "C" int trt_user32_update_rect(void* hwnd, i32* rect) {
+  if (!hwnd || !rect) return 0;
+  std::lock_guard<std::mutex> lk(g_win_mu);
+  guest_window* w = window_find_locked((u64)(uintptr_t)hwnd);
+  if (!w) return 0;
+  if (w->upd_r <= w->upd_l || w->upd_b <= w->upd_t) return 0;
+  rect[0] = w->upd_l;
+  rect[1] = w->upd_t;
+  rect[2] = w->upd_r;
+  rect[3] = w->upd_b;
+  return 1;
+}
+
+extern "C" void trt_user32_validate(void* hwnd, const i32* rect) {
+  if (!hwnd) return;
+  std::lock_guard<std::mutex> lk(g_win_mu);
+  guest_window* w = window_find_locked((u64)(uintptr_t)hwnd);
+  if (!w) return;
+  if (!rect) {
+    w->upd_l = w->upd_t = w->upd_r = w->upd_b = 0;
+    return;
+  }
+  // Validating a sub-rectangle only clears it when it covers the owed rect;
+  // otherwise keep the remainder (a window still owes the rest).
+  const i32 l = rect[0], t = rect[1], r = rect[2], b = rect[3];
+  if (l <= w->upd_l && t <= w->upd_t && r >= w->upd_r && b >= w->upd_b) {
+    w->upd_l = w->upd_t = w->upd_r = w->upd_b = 0;
+  }
+}
+
+int trt_user32_client_size(void* hwnd, i32* w, i32* h) {
+  if (hwnd && window_client_size((u64)(uintptr_t)hwnd, w, h)) return 1;
+  trt_display_size(w, h);
+  return 1;
+}
+
 int TRT_STDCALL trt_GetClientRect(void* hwnd, void* rect) {
-  (void)hwnd;
   if (!rect) return 0;
   auto* r = static_cast<int*>(rect);
   r[0] = 0;
   r[1] = 0;
+  if (hwnd && window_client_size((u64)(uintptr_t)hwnd, &r[2], &r[3])) return 1;
   trt_display_size(&r[2], &r[3]);
   return 1;
 }
@@ -909,6 +1243,10 @@ int TRT_STDCALL trt_KillTimer(void* hwnd, u64 id) {
 namespace {
 struct user32_dc {
   void* selected;  // currently selected HGDIOBJ (bridge_gdi records here)
+  i32 bk_mode;     // GDI defaults: OPAQUE background
+  u32 text_color;  // black
+  u32 bk_color;    // white
+  u32 text_align;  // TA_LEFT | TA_TOP
   bool used;
 };
 constexpr u32 USER32_DC_TAG = 0x55430000u;  // 'uC' = user32 DC
@@ -922,10 +1260,14 @@ void* trt_user32_dc_alloc(void) {
     if (!g_dcs[i].used) {
       g_dcs[i].used = true;
       g_dcs[i].selected = nullptr;
+      g_dcs[i].bk_mode = 2;  // OPAQUE
+      g_dcs[i].text_color = 0x00000000;
+      g_dcs[i].bk_color = 0x00FFFFFF;
+      g_dcs[i].text_align = 0;  // TA_LEFT | TA_TOP
       return (void*)(uintptr_t)(USER32_DC_TAG | (u32)(i + 1));
     }
   }
-  g_dcs.push_back({nullptr, true});
+  g_dcs.push_back({nullptr, 2, 0x00000000, 0x00FFFFFF, 0, true});
   return (void*)(uintptr_t)(USER32_DC_TAG | (u32)g_dcs.size());
 }
 
@@ -937,6 +1279,10 @@ int trt_user32_dc_release(void* hdc) {
   if (idx == 0 || idx > (u32)g_dcs.size() || !g_dcs[idx - 1].used) return 0;
   g_dcs[idx - 1].used = false;
   g_dcs[idx - 1].selected = nullptr;
+  // Drop the GDI selection, saved states and raster surface for this DC.
+  // gdi32 keys all of them on the DC handle, so a released (and later
+  // reused) handle must not inherit the previous window's pixels.
+  trt_gdi_forget_dc(hdc);
   return 1;
 }
 
@@ -966,16 +1312,107 @@ void trt_user32_dc_set_selected(void* hdc, void* hobj) {
   g_dcs[idx - 1].selected = hobj;
 }
 
+// ---- per-window DC (a window's surface outlives one paint) ----------------
+// Desktop apps paint with BeginPaint/GetDC, EndPaint/ReleaseDC on every
+// WM_PAINT. Handing out a brand-new DC each time would throw the painted
+// pixels away between frames (and re-allocate a 1920x1080 surface per paint),
+// so a window gets one stable DC whose raster surface persists until the
+// window is destroyed. Window-less GetDC(NULL) keeps the old fresh-DC
+// behaviour.
+namespace {
+struct win_dc_rec {
+  u64 hwnd;
+  void* hdc;
+};
+std::mutex g_windc_mu;
+std::vector<win_dc_rec> g_windcs;
+
+void* window_dc_locked(u64 hwnd) {
+  for (const win_dc_rec& e : g_windcs)
+    if (e.hwnd == hwnd) return e.hdc;
+  void* hdc = trt_user32_dc_alloc();
+  if (hdc) g_windcs.push_back({hwnd, hdc});
+  return hdc;
+}
+
+void drop_window_dc(u64 hwnd) {
+  std::lock_guard<std::mutex> lk(g_windc_mu);
+  for (size_t i = 0; i < g_windcs.size(); ++i) {
+    if (g_windcs[i].hwnd != hwnd) continue;
+    trt_user32_dc_release(g_windcs[i].hdc);  // dumps the surface, frees it
+    g_windcs.erase(g_windcs.begin() + (long)i);
+    return;
+  }
+}
+}  // namespace
+
+int trt_user32_dc_get_text_state(void* hdc, trt_dc_text_state* out) {
+  if (!out) return 0;
+  const u32 h = (u32)(uintptr_t)hdc;
+  if ((h & 0xFFFF0000u) != USER32_DC_TAG) return 0;
+  const u32 idx = h & 0xFFFFu;
+  std::lock_guard<std::mutex> lk(g_dc_mu);
+  if (idx == 0 || idx > (u32)g_dcs.size() || !g_dcs[idx - 1].used) return 0;
+  const user32_dc& d = g_dcs[idx - 1];
+  out->bk_mode = d.bk_mode;
+  out->text_color = d.text_color;
+  out->bk_color = d.bk_color;
+  out->text_align = d.text_align;
+  return 1;
+}
+
+int trt_user32_dc_set_text_state(void* hdc, const trt_dc_text_state* in) {
+  if (!in) return 0;
+  const u32 h = (u32)(uintptr_t)hdc;
+  if ((h & 0xFFFF0000u) != USER32_DC_TAG) return 0;
+  const u32 idx = h & 0xFFFFu;
+  std::lock_guard<std::mutex> lk(g_dc_mu);
+  if (idx == 0 || idx > (u32)g_dcs.size() || !g_dcs[idx - 1].used) return 0;
+  user32_dc& d = g_dcs[idx - 1];
+  d.bk_mode = in->bk_mode;
+  d.text_color = in->text_color;
+  d.bk_color = in->bk_color;
+  d.text_align = in->text_align;
+  return 1;
+}
+
 // ---- user32 GetDC/ReleaseDC on the record space ----
 void* TRT_STDCALL trt_GetDC(void* hwnd) {
-  (void)hwnd;
+  if (hwnd) {
+    void* win_hdc = nullptr;
+    {
+      std::lock_guard<std::mutex> lk(g_windc_mu);
+      win_hdc = window_dc_locked((u64)(uintptr_t)hwnd);
+    }
+    if (win_hdc) {
+      // Size the surface to the window's client area, not the whole display:
+      // a 640x400 window must not allocate a 1920x1080 surface.
+      i32 cw = 0, ch = 0;
+      if (window_client_size((u64)(uintptr_t)hwnd, &cw, &ch) && cw > 0 &&
+          ch > 0)
+        trt_gdi_surface_hint(win_hdc, cw, ch);
+      return win_hdc;
+    }
+    log_line("user32: GetDC window DC table full -> NULL");
+    return nullptr;
+  }
   void* hdc = trt_user32_dc_alloc();
   if (!hdc) log_line("user32: GetDC DC table full -> NULL");
   return hdc;  // a real DC record (window-less DCs are fine for records)
 }
 
 int TRT_STDCALL trt_ReleaseDC(void* hwnd, void* hdc) {
-  (void)hwnd;
+  if (hwnd) {
+    std::lock_guard<std::mutex> lk(g_windc_mu);
+    for (const win_dc_rec& e : g_windcs) {
+      if (e.hwnd == (u64)(uintptr_t)hwnd && e.hdc == hdc) {
+        // The window still owns this surface: release the drawing state, not
+        // the pixels. DestroyWindow frees it.
+        trt_gdi_forget_draw_state(hdc);
+        return 1;
+      }
+    }
+  }
   return trt_user32_dc_release(hdc);
 }
 
@@ -1058,11 +1495,13 @@ void* TRT_STDCALL trt_SendDlgItemMessageA(void* dlg, int id, u32 msg, u64 wp,
 
 void* TRT_STDCALL trt_DialogBoxParamA(void* inst, const char* tmpl, void* parent,
                                       void* proc, i64 init) {
+  char nm[96];
+  name_or_id(tmpl, nm, sizeof(nm));
   char line[160];
   snprintf(line, sizeof(line),
            "user32: DialogBoxParamA(tmpl=%s) -> -1 (no dialog host; the "
            "crash handler UI is a named gap)",
-           tmpl ? tmpl : "(ord)");
+           nm);
   log_line(line);
   (void)inst; (void)parent; (void)proc; (void)init;
   return (void*)(uintptr_t)-1;  // -1 = dialog creation failed (IDCANCEL won't do)
@@ -1078,13 +1517,13 @@ void* TRT_STDCALL trt_GetWindowLongA(void* hwnd, int idx) {
 }
 
 i64 TRT_STDCALL trt_SetWindowTextW(void* hwnd, const u16* text) {
-  char utf8[128];
-  if (text) trt_utf16_to_utf8(text, utf8, sizeof(utf8));
-  else snprintf(utf8, sizeof(utf8), "(null)");
-  char line[192];
-  snprintf(line, sizeof(line), "user32: SetWindowTextW(%p,'%s') -> TRUE", hwnd,
-           utf8);
-  log_line(line);
+  std::lock_guard<std::mutex> lock(g_win_mu);
+  auto* window = find_win_locked(reinterpret_cast<uintptr_t>(hwnd));
+  if (!window) return 0;
+  int i = 0;
+  if (text)
+    for (; i < 63 && text[i]; ++i) window->title[i] = text[i];
+  window->title[i] = 0;
   return 1;
 }
 
@@ -1171,12 +1610,25 @@ void* TRT_STDCALL trt_CreateIconFromResourceEx(const u8* bits, u32 len, int icon
 
 void* TRT_STDCALL trt_LoadImageA(void* inst, const char* name, u32 type, int cx,
                                  int cy, u32 flags) {
-  char line[160];
+  char nm[96];
+  name_or_id(name, nm, sizeof(nm));
+  // Same recorded semantics as LoadImageW: there is no image decode offline,
+  // but icon/cursor callers get a valid synthetic handle and keep running.
+  void* ret = nullptr;
+  const char* what = "NULL (no image decode offline)";
+  if (type == 1) {  // IMAGE_ICON
+    ret = (void*)(uintptr_t)0x00030001ULL;
+    what = "stock icon handle";
+  } else if (type == 2) {  // IMAGE_CURSOR
+    ret = (void*)(uintptr_t)0x00020001ULL;
+    what = "stock cursor handle";
+  }
+  char line[200];
   snprintf(line, sizeof(line),
-           "user32: LoadImageA(inst=%p name=%s type=%u %dx%d) -> NULL (no "
-           "image decode offline)", inst, name ? name : "(null)", type, cx, cy);
+           "user32: LoadImageA(inst=%p name=%s type=%u %dx%d flags=0x%x) -> %s",
+           inst, nm, type, cx, cy, flags, what);
   log_line(line);
-  return nullptr;
+  return ret;
 }
 
 void* TRT_STDCALL trt_SetForegroundWindow(void* hwnd) {

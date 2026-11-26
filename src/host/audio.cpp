@@ -175,6 +175,27 @@ int sink_submit_voice(u64 voice_id, const void* pcm, u32 bytes, u32 rate,
                       u32 channels, u32 bps, u32 is_float, float vol,
                       void* user) {
   (void)user;
+  static std::atomic<unsigned> submits{0};
+  const unsigned submit_no = submits.fetch_add(1, std::memory_order_relaxed);
+  if (submit_no < 16) {
+    const uint8_t* data = static_cast<const uint8_t*>(pcm);
+    const u32 count = bytes / bps;
+    double sum_sq = 0.0;
+    float peak = 0.0f;
+    for (u32 i = 0; i < count; ++i) {
+      const float sample = read_sample(data + (size_t)i * bps, bps, is_float);
+      const float magnitude = fabsf(sample);
+      if (magnitude > peak) peak = magnitude;
+      sum_sq += (double)sample * (double)sample;
+    }
+    const float rms = count ? (float)sqrt(sum_sq / count) : 0.0f;
+    char line[192];
+    snprintf(line, sizeof(line),
+             "audio: input voice=%llu bytes=%u rate=%u ch=%u bps=%u vol=%.3f rms=%.5f peak=%.5f",
+             (unsigned long long)voice_id, bytes, rate, channels, bps,
+             vol, rms, peak);
+    log_line(line);
+  }
   push_voice_pcm(voice_id, pcm, bytes, rate, channels, bps, is_float, vol);
   return 0;
 }
@@ -265,6 +286,24 @@ void mixer_tick() {
     s.buf.pAudioData = s.pcm.data();
     s.buf.Flags = 0;
     const HRESULT hr = g_src->SubmitSourceBuffer(&s.buf);
+    static std::atomic<unsigned> output_logs{0};
+    const unsigned output_no = output_logs.fetch_add(1, std::memory_order_relaxed);
+    if (output_no < 8) {
+      double sum_sq = 0.0;
+      int peak = 0;
+      for (u32 i = 0; i < k_chunk_frames * k_mix_channels; ++i) {
+        const int v = dst[i];
+        const int magnitude = v < 0 ? -v : v;
+        if (magnitude > peak) peak = magnitude;
+        sum_sq += (double)v * (double)v;
+      }
+      const double rms = sqrt(sum_sq / (k_chunk_frames * k_mix_channels));
+      char line[128];
+      snprintf(line, sizeof(line),
+               "audio: output submit=%u hr=0x%08lx rms=%.1f peak=%d queued=%u",
+               output_no + 1, (unsigned long)hr, rms, peak, st.BuffersQueued);
+      log_line(line);
+    }
     if (FAILED(hr)) {
       ++g_dropped;
       return;

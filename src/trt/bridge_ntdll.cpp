@@ -1028,6 +1028,72 @@ u32 TRT_GUEST_ABI nt_NtQueryVirtualMemory(void* proc, const void* addr, u32 cls,
   return 0xC0000002u;
 }
 
+// --- Bun / WebKit startup primitives ---------------------------------------
+// opcode-level runtimes (Bun, V8) park on futexes through the Rtl* names and
+// seed their PRNG through ProcessPrng.  Without these the loader synthesises
+// a return-0 thunk and the runtime corrupts itself during startup.
+extern "C" int TRT_STDCALL trt_WaitOnAddress(volatile void*, void*, u32, u32);
+extern "C" void TRT_STDCALL trt_WakeByAddressSingle(volatile void*);
+extern "C" void TRT_STDCALL trt_WakeByAddressAll(volatile void*);
+
+static int TRT_STDCALL nt_RtlWaitOnAddress(volatile void* addr, void* cmp,
+                                           u64 size,
+                                           const long long* timeout) {
+  u32 ms = 0xFFFFFFFFu;
+  if (timeout) {
+    long long t = *timeout;  // relative, 100 ns units, negative
+    if (t < 0) {
+      t = -t;
+      ms = (u32)(t / 10000);
+      if (ms == 0 && t != 0) ms = 1;
+    } else {
+      ms = 0;
+    }
+  }
+  return trt_WaitOnAddress(addr, cmp, (u32)size, ms);
+}
+
+static void TRT_STDCALL nt_RtlWakeAddressSingle(void* addr) {
+  trt_WakeByAddressSingle((volatile void*)addr);
+}
+
+static void TRT_STDCALL nt_RtlWakeAddressAll(void* addr) {
+  trt_WakeByAddressAll((volatile void*)addr);
+}
+
+// Growable function tables are a JIT unwinding detail; recording nothing is
+// safe (unwinds fall back to the frame pointer), returning failure is not.
+static u32 TRT_STDCALL nt_RtlAddGrowableFunctionTable(void** table,
+                                                      void* fn_table,
+                                                      u32 entry_count,
+                                                      u32 max_count,
+                                                      u64 range_base,
+                                                      u64 range_end) {
+  (void)fn_table; (void)entry_count; (void)max_count;
+  (void)range_base; (void)range_end;
+  if (table) *table = nullptr;
+  return 0;
+}
+
+static void TRT_STDCALL nt_RtlDeleteGrowableFunctionTable(void* table) {
+  (void)table;
+}
+
+static void TRT_STDCALL nt_RtlGrowFunctionTable(void* table, u32 new_count) {
+  (void)table; (void)new_count;
+}
+
+static u16 TRT_STDCALL nt_RtlCaptureStackBackTrace(u32 frames, u32 skip,
+                                                   void** out, u32* hash) {
+#if defined(_WIN32)
+  return (u16)::CaptureStackBackTrace(skip, frames, out, (DWORD*)hash);
+#else
+  (void)frames; (void)skip; (void)out;
+  if (hash) *hash = 0;
+  return 0;
+#endif
+}
+
 } // namespace
 
 // .242 DIAG: NTALLOC accessors for VIDEO-SAMPLE (vk_backend.hpp).
@@ -1045,6 +1111,13 @@ int trt_bridge_register_ntdll(void) {
       {"RtlVirtualUnwind", (void*)&trt_RtlVirtualUnwind},
       {"RtlPcToFileHeader", (void*)&trt_RtlPcToFileHeader},
       {"RtlAddFunctionTable", (void*)&trt_RtlAddFunctionTable},
+      {"RtlAddGrowableFunctionTable", (void*)&nt_RtlAddGrowableFunctionTable},
+      {"RtlDeleteGrowableFunctionTable", (void*)&nt_RtlDeleteGrowableFunctionTable},
+      {"RtlGrowFunctionTable", (void*)&nt_RtlGrowFunctionTable},
+      {"RtlWaitOnAddress", (void*)&nt_RtlWaitOnAddress},
+      {"RtlWakeAddressSingle", (void*)&nt_RtlWakeAddressSingle},
+      {"RtlWakeAddressAll", (void*)&nt_RtlWakeAddressAll},
+      {"RtlCaptureStackBackTrace", (void*)&nt_RtlCaptureStackBackTrace},
       {"RtlDeleteFunctionTable", (void*)&trt_RtlDeleteFunctionTable},
       {"RtlUnwind", (void*)&trt_RtlUnwind},
       {"RtlUnwindEx", (void*)&trt_RtlUnwindEx},

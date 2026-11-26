@@ -250,6 +250,8 @@ void trt_set_system_loader(trt_system_load fn);
 // implementation; exposed for the boot audit)
 void* trt_resolve_module(void* user, const char* module, const char* symbol,
                          u16 ordinal);
+// Optional runtime lookup. Only an actual registered/native export is returned.
+void* trt_resolve_export(const char* module, const char* symbol, u16 ordinal);
 extern void trt_stub_thunk(void);
 
 // Register the module coverage a real PC game imports (SYSTEM/STUB routes).
@@ -303,6 +305,7 @@ int trt_bridge_register_psapi(void);
 int trt_bridge_register_iphlpapi(void);
 int trt_bridge_register_imm32(void);
 int trt_bridge_register_crypt32(void);
+int trt_bridge_register_prng(void);
 int trt_bridge_register_dbghelp(void);
 // UTF-16 -> UTF-8 helper (paths, strings)
 int trt_utf16_to_utf8(const u16* in, char* out, size_t out_cap);
@@ -413,6 +416,18 @@ int trt_steam_load_account(const char* state_dir);
 //     ntdll/kernel32 wait functions (armed lazily when the gap goes
 //     quiet for 2s of wall time; guest callers only, host callers
 //     restore the byte and re-arm on the next watchdog tick).
+typedef struct trt_launch_api_entry {
+  const char* name;  // static runtime API name
+  u32 repeats;
+} trt_launch_api_entry;
+void gap_trace_begin_launch(void);
+typedef struct trt_sync_launch_stats {
+  u32 wait_completed, wait_timed_out, wait_failed;
+  u32 event_signaled, event_failed;
+} trt_sync_launch_stats;
+void trt_sync_reset_launch_stats(void);
+void trt_sync_get_launch_stats(trt_sync_launch_stats* stats);
+u32 gap_trace_launch_tail(trt_launch_api_entry* entries, u32 capacity, u64* calls);
 void gap_trace_record(const char* name);
 void gap_trace_dump_if_changed(void);
 void gap_trace_note_frame1(u32 tid);
@@ -423,6 +438,34 @@ u64 gap_trace_note_tex_fail(void);
 u64 gap_trace_tex_fails(void);
 u64 gap_trace_main_cv_waits(void);
 void trt_syscall_trap_install(void);
+
+// Memory budget governor surface (bridge_membudget.cpp)
+u64 trt_mem_budget_bytes(void);
+void trt_mem_budget_set_mb(u32 mb);
+u32 trt_mem_budget_get_mb(void);
+u64 trt_mem_budget_committed(void);
+u64 trt_mem_budget_mapped(void);
+u64 trt_mem_budget_peak(void);
+u64 trt_mem_budget_refusals(void);
+u64 trt_mem_budget_va_bytes(void);
+u64 trt_mem_budget_reserved(void);
+u64 trt_mem_budget_va_peak(void);
+u64 trt_mem_budget_va_refusals(void);
+int trt_mem_budget_charge_commit(u64 bytes);
+void trt_mem_budget_discharge_commit(u64 bytes);
+int trt_mem_budget_charge_map(u64 bytes);
+void trt_mem_budget_discharge_map(u64 bytes);
+void trt_mem_budget_report(char* line, unsigned cap);
+void trt_mem_budget_reset(void);
+
+// ESRAM budget-ledger surface (bridge_esram.cpp; accounting only)
+void trt_esram_init(u32 size_mb);
+int trt_esram_is_active(void);
+int trt_esram_should_place(u32 bind_flags, u64 byte_size);
+int trt_esram_alloc(u64 bytes, const char* debug_name);
+void trt_esram_free(u64 bytes);
+int trt_esram_get_stats(u64* out_used_bytes, u64* out_total_bytes, u64* out_alloc_count);
+void trt_esram_reset(void);
 
 #ifdef __cplusplus
 }

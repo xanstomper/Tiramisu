@@ -38,7 +38,7 @@ __attribute__((dllimport)) u32 GSTD dd_Release(void* self);
 // guest-ABI feed wrappers (the dinput8 bridge exports them)
 __attribute__((dllimport)) void GSTD trt_di_feed_move(i32 dx, i32 dy);
 __attribute__((dllimport)) void GSTD trt_di_feed_button(int btn, u32 down);
-__attribute__((dllimport)) void GSTD trt_di_feed_key(u16 vk, u32 down);
+__attribute__((dllimport)) void GSTD trt_di_feed_key(u16 dik, u32 down);
 
 // the guest's COM calls go through the object pointers DirectInput8Create
 // returned: the vtable is read from memory, like real COM.

@@ -18,6 +18,11 @@ extern "C" {
 // Returns an adaptive machine-code thunk. Never returns nullptr if backend is initialized.
 void* trt_dynamic_synthesize_api(const char* module, const char* symbol, uint16_t ordinal);
 
+// Universal COM stub object: an IUnknown-shaped object whose 256-slot vtable
+// answers S_OK, so an uncataloged interface pointer can be probed instead of
+// dereferencing a fake handle.
+void* trt_dynamic_universal_com_object(void);
+
 // Deduces expected return value (pseudo-handle, TRUE, S_OK, version) from API naming.
 uint64_t trt_dynamic_deduce_return_val(const char* module, const char* symbol);
 

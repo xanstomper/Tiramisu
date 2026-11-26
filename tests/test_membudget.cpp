@@ -20,6 +20,8 @@
 #include <unistd.h>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <thread>
 
 extern "C" {
 int trt_bridge_register_kernel32(void);
@@ -39,6 +41,9 @@ int trt_mem_budget_charge_commit(u64 bytes);
 void trt_mem_budget_discharge_commit(u64 bytes);
 int trt_mem_budget_charge_map(u64 bytes);
 void trt_mem_budget_discharge_map(u64 bytes);
+int trt_mem_budget_charge_file_view(u64 bytes);
+void trt_mem_budget_discharge_file_view(u64 bytes);
+u64 trt_mem_budget_file_mapped(void);
 void trt_mem_budget_report(char* line, unsigned cap);
 
 // kernel32 surfaces under test
@@ -353,6 +358,45 @@ int main(int argc, char** argv) {
   waitpid(pid, &wstatus, 0);
   const int rc = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : 1;
   CHECK(rc == 0, "small-budget integration probe passes (fresh process)");
+
+  // Reserve all the bytes before releasing them on separate threads. Each
+  // release owns a distinct reservation, so a balance left over is lost
+  // accounting rather than a missing allocation or a guest double-free.
+  constexpr unsigned workers = 6;
+  constexpr unsigned releases = 16000;
+  constexpr u64 page = 4096;
+  constexpr u64 total = workers * static_cast<u64>(releases) * page;
+  const u64 baseline_va = trt_mem_budget_reserved();
+  const bool maps_charged = trt_mem_budget_charge_map(total) == 0;
+  const bool files_charged = trt_mem_budget_charge_file_view(total) == 0;
+  CHECK(maps_charged && files_charged,
+        "reserve mapped commit and file-backed VA for concurrent release");
+  if (maps_charged && files_charged) {
+    std::atomic<unsigned> ready{0};
+    std::atomic<bool> release{false};
+    std::vector<std::thread> threads;
+    for (unsigned i = 0; i < workers; ++i) {
+      threads.emplace_back([&] {
+        ready.fetch_add(1);
+        while (!release.load()) std::this_thread::yield();
+        for (unsigned n = 0; n < releases; ++n) {
+          trt_mem_budget_discharge_map(page);
+          trt_mem_budget_discharge_file_view(page);
+        }
+      });
+    }
+    while (ready.load() != workers) std::this_thread::yield();
+    release.store(true);
+    for (auto& thread : threads) thread.join();
+    CHECK(trt_mem_budget_committed() == 0, "concurrent frees release every committed byte");
+    CHECK(trt_mem_budget_mapped() == 0, "concurrent unmaps release every mapped byte");
+    CHECK(trt_mem_budget_file_mapped() == 0 && trt_mem_budget_reserved() == baseline_va,
+          "concurrent unmaps release every file-backed reservation");
+  }
+
+  trt_mem_budget_set_mb(1024);
+  trt_mem_budget_report(rep, sizeof(rep));
+  CHECK(strstr(rep, "/1024 MB") != nullptr, "report uses the active console memory limit");
 
   printf("RESULT: %s (%d failures)\n", failures ? "FAILURES" : "ALL PASS",
          failures);

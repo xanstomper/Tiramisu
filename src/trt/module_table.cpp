@@ -16,6 +16,7 @@
 #include "dynamic_api.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -115,13 +116,23 @@ static void load_shims_if_needed() {
   while (fgets(line, sizeof(line), f)) {
     size_t n = strlen(line);
     while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
-    if (!n || line[0] == '#') continue;
-    if (find_module(line) >= 0) continue;  // never override a real bridge
-    trt_module_register(line, TRT_ROUTE_STUB, nullptr, 0);
+    char* name = line;
+    while (*name == ' ' || *name == '\t') ++name;
+    if (!*name || *name == '#') continue;
+    // shims.txt is written as "module:bridge". The module table is keyed by
+    // module name, so use the part before the colon; a bare module name is
+    // accepted too. Without this, "d3d9.dll:bridge_d3d9" was registered as a
+    // DLL literally named that, and the real module stayed unprotected.
+    char* end = name;
+    while (*end && *end != ':' && *end != ' ' && *end != '\t') ++end;
+    *end = 0;
+    if (!*name) continue;
+    if (find_module(name) >= 0) continue;  // never override a real bridge
+    trt_module_register(name, TRT_ROUTE_STUB, nullptr, 0);
     char msg[256];
     snprintf(msg, sizeof(msg),
              "trt: title shim registered %s (generated STUB, fail-visible)",
-             line);
+             name);
     trt_core_log(msg);
   }
   fclose(f);
@@ -147,7 +158,32 @@ const char* dll_alias_lookup(const char* name) {
 // Only API modules are overridable; core system modules (kernel32, ntdll,
 // user32, ...) are NEVER shadowed because a fake would break the loader's
 // own assumptions.
+// Opt-in native C runtime: a title that ships a real ucrtbase.dll /
+// vcruntime140*.dll (e.g. the Wine/Microsoft UCRT beside embedded CPython) gets
+// it loaded instead of the synthesized fail-visible CRT thunks, but only when
+// <game>/.tiramisu/native-crt exists or TRT_NATIVE_CRT=1. Default behaviour for
+// every other title is unchanged.
+static bool native_crt_enabled() {
+  const char* e = getenv("TRT_NATIVE_CRT");
+  if (e && e[0] == '1') return true;
+  const char* dir = trt_runtime_search_dir();
+  if (!dir || !dir[0]) return false;
+  char path[700];
+  snprintf(path, sizeof(path), "%s/.tiramisu/native-crt", dir);
+  FILE* f = fopen(path, "rb");
+  if (!f) return false;
+  fclose(f);
+  return true;
+}
+
+static bool is_crt_module(const char* name) {
+  return name_eq(name, "ucrtbase.dll") || name_eq(name, "vcruntime140.dll") ||
+         name_eq(name, "vcruntime140_1.dll") ||
+         strncmp(name, "api-ms-win-crt-", 15) == 0;
+}
+
 bool is_overridable_module(const char* name) {
+  if (is_crt_module(name)) return native_crt_enabled();
   static const char* kNoOverride[] = {
       "kernel32.dll", "ntdll.dll", "user32.dll", "gdi32.dll",
       "advapi32.dll", "ole32.dll", "oleaut32.dll", "comctl32.dll",
@@ -168,18 +204,29 @@ bool is_overridable_module(const char* name) {
 void* try_native_override(const char* module, const char* symbol,
                           u16 ordinal) {
   if (!module || !is_overridable_module(module)) return nullptr;
-  const char* dir = trt_runtime_search_dir();
-  if (!dir || !dir[0]) return nullptr;
+  // CRT API-set contracts resolve to the shipped ucrtbase.dll.
+  if (strncmp(module, "api-ms-win-crt-", 15) == 0) module = "ucrtbase.dll";
   char host[1024];
-  snprintf(host, sizeof(host), "%s/%s", dir, module);
-  struct stat st{};
-#ifdef _WIN32
-  // The UWP (WINAPI_FAMILY_APP) UCRT hides the POSIX S_IS* macros; the CRT
-  // file-mode bit is the same value.
-  if (stat(host, &st) != 0 || !(st.st_mode & _S_IFREG)) return nullptr;
-#else
-  if (stat(host, &st) != 0 || !S_ISREG(st.st_mode)) return nullptr;
-#endif
+  if (trt_runtime_find_dll(module, host, sizeof(host)) != 0) {
+    const char* dir = trt_runtime_search_dir();
+    if (!dir || !dir[0]) return nullptr;
+    size_t dl = strlen(dir);
+    while (dl > 0 && (dir[dl - 1] == '/' || dir[dl - 1] == '\\')) --dl;
+    if (dl == 0) return nullptr;
+    snprintf(host, sizeof(host), "%.*s/%s", (int)dl, dir, module);
+    FILE* f = fopen(host, "rb");
+    if (!f) {
+      char with_ext[1030];
+      if (snprintf(with_ext, sizeof(with_ext), "%s.dll", host) < (int)sizeof(with_ext)) {
+        f = fopen(with_ext, "rb");
+        if (f) {
+          memcpy(host, with_ext, strlen(with_ext) + 1);
+        }
+      }
+    }
+    if (!f) return nullptr;
+    fclose(f);
+  }
 
   // already loaded? reuse the registry handle
   trt_image* img = trt_images_find(module);
@@ -192,10 +239,9 @@ void* try_native_override(const char* module, const char* symbol,
                             img, symbol, ordinal);
 }
 
-// resolve() adapter the loader consumes
-void* resolve_through_table(void* user, const char* module,
-                            const char* symbol, u16 ordinal) {
-  (void)user;
+void* resolve_module_export(const char* module, const char* symbol,
+                            u16 ordinal, bool allow_placeholder) {
+  if (!module || (!symbol && !ordinal)) return nullptr;
   load_shims_if_needed();
 
   // ---- native DLL override -------------------------------------------
@@ -228,7 +274,9 @@ void* resolve_through_table(void* user, const char* module,
   }
 
   const int mi = find_module(target);
-  if (mi < 0) {
+  if (mi < 0 || (!allow_placeholder && g_modules[mi].route == TRT_ROUTE_STUB)) {
+    // A dynamic export probe can still find a native system implementation
+    // even when the static binder registered a generated fallback.
     // unknown module: not a hard fail — try the console's real DLL by the
     // same name (dwrite, d2d1, xmcore, secs... exist as system components),
     // then known aliases. Failure stays NAMED in the log (not silent).
@@ -312,6 +360,10 @@ void* resolve_through_table(void* user, const char* module,
   }
 }
 
+void* resolve_through_table(void*, const char* module, const char* symbol, u16 ordinal) {
+  return resolve_module_export(module, symbol, ordinal, true);
+}
+
 } // namespace
 
 // ---- implementation-class classification --------------------------------
@@ -338,6 +390,17 @@ const impl_override k_impl_classes[] = {
     {"d3d12.dll", "D3D12SerializeVersionedRootSignature", TRT_IMPL_REAL},
     {"d3d12.dll", "D3D12CreateRootSignatureDeserializer", TRT_IMPL_REAL},
     {"d3d12.dll", "D3D12CreateVersionedRootSignatureDeserializer", TRT_IMPL_REAL},
+    // Wwise, Bink, and Miles are fallback stubs, not real decoders. A
+    // game-shipped native DLL is preferred by try_native_override(); these
+    // entries describe the built-in bridge when that DLL is absent. Without
+    // them the coverage report counted every stub symbol as REAL.
+    {"AK::SoundEngine.dll", nullptr, TRT_IMPL_NAMED_SILENT},
+    {"AkSoundEngine.dll", nullptr, TRT_IMPL_NAMED_SILENT},
+    {"bink2w64.dll", nullptr, TRT_IMPL_NAMED_SILENT},
+    {"binkw64.dll", nullptr, TRT_IMPL_NAMED_SILENT},
+    {"bink2w32.dll", nullptr, TRT_IMPL_NAMED_SILENT},
+    {"mss32.dll", nullptr, TRT_IMPL_NAMED_SILENT},
+    {"miles.dll", nullptr, TRT_IMPL_NAMED_SILENT},
     // Media Foundation hands out metadata + a clean EOS; no frames decode.
     {"mfplat.dll", nullptr, TRT_IMPL_NAMED_SILENT},
     {"mfreadwrite.dll", nullptr, TRT_IMPL_NAMED_SILENT},
@@ -616,6 +679,10 @@ void trt_resolver_default(trt_resolver* out) {
 void* trt_resolve_module(void* user, const char* module, const char* symbol,
                          u16 ordinal) {
   return resolve_through_table(user, module, symbol, ordinal);
+}
+
+void* trt_resolve_export(const char* module, const char* symbol, u16 ordinal) {
+  return resolve_module_export(module, symbol, ordinal, false);
 }
 
 // stub entry point: one shared address; host-side logging wraps real call

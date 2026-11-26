@@ -143,5 +143,13 @@ extern "C" int trt_bridge_register_wwise(void) {
                         (int)(sizeof(k_fns) / sizeof(k_fns[0])));
     trt_module_register("AkSoundEngine.dll", TRT_ROUTE_BUILTIN, k_fns,
                         (int)(sizeof(k_fns) / sizeof(k_fns[0])));
+    trt_module_register("AkSoundEngineP.dll", TRT_ROUTE_BUILTIN, k_fns,
+                        (int)(sizeof(k_fns) / sizeof(k_fns[0])));
+    trt_module_register("AkMusicEngine.dll", TRT_ROUTE_BUILTIN, k_fns,
+                        (int)(sizeof(k_fns) / sizeof(k_fns[0])));
+    trt_module_register("AkStreamMgr.dll", TRT_ROUTE_BUILTIN, k_fns,
+                        (int)(sizeof(k_fns) / sizeof(k_fns[0])));
+    trt_module_register("AkMemoryMgr.dll", TRT_ROUTE_BUILTIN, k_fns,
+                        (int)(sizeof(k_fns) / sizeof(k_fns[0])));
     return 0;
 }

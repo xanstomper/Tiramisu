@@ -25,6 +25,7 @@
 #endif
 
 #include <errno.h>
+#include <atomic>
 
 namespace {
 
@@ -97,6 +98,12 @@ int utf8_decode(const char* s, int avail, u32* cp_out) {
 } // namespace
 
 extern "C" {
+
+void TRT_STDCALL trt_SetLastError(u32 error);
+u32 TRT_STDCALL trt_GetLastError();
+u32 TRT_STDCALL trt_GetFileAttributesW(const u16* path);
+void* TRT_STDCALL trt_CreateFileW(const u16*, u32, u32, void*, u32, u32, void*);
+int TRT_STDCALL trt_CloseHandle(void*);
 int trt_vfs_resolve_utf16(const u16* guest_path, char* out, size_t out_cap);
 
 // ---- system information ----
@@ -367,23 +374,72 @@ u32 TRT_STDCALL trt_GetTempPathW(u32 size, u16* buf) {
   { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetTempPathW -> buf=%p size=%u value=\"%.128s\"", (void*)buf, size, t); trt_core_log(st_line); }
   if (buf && size >= need) {
     for (u32 i = 0; i < need; ++i) buf[i] = (u16)(u8)t[i];
-    return need;
+    return need - 1;
   }
   return need;
 }
 
 u32 TRT_STDCALL trt_GetTempFileNameW(const u16* dir, const u16* prefix,
                                        u32 unique, u16* buf) {
-  char d[256], p[64];
-  utf16_to_utf8(dir, d, sizeof(d));
-  utf16_to_utf8(prefix, p, sizeof(p));
-  char out[512];
-  snprintf(out, sizeof(out), "%s%s%u.tmp", d, p, unique);
-  const u32 need = (u32)strlen(out) + 1;
-  if (buf) {
-    for (u32 i = 0; i < need; ++i) buf[i] = (u16)(u8)out[i];
+  if (!dir || !*dir || !prefix || !buf) {
+    trt_SetLastError(87);  // ERROR_INVALID_PARAMETER
+    return 0;
   }
-  return need;
+
+  // Match the Win32 MAX_PATH buffer contract and keep the generated file
+  // beneath the requested directory. The VFS enforces the host mount policy.
+  constexpr size_t capacity = 260;
+  size_t length = 0;
+  while (length < capacity && dir[length]) ++length;
+  if (length > capacity - 13) {
+    trt_SetLastError(206);  // ERROR_FILENAME_EXCED_RANGE
+    return 0;
+  }
+  const u32 attributes = trt_GetFileAttributesW(dir);
+  if (attributes == 0xffffffffu || !(attributes & 0x10u)) {
+    trt_SetLastError(3);  // ERROR_PATH_NOT_FOUND
+    return 0;
+  }
+  u16 name[capacity]{};
+  memcpy(name, dir, length * sizeof(u16));
+  if (name[length - 1] != '\\' && name[length - 1] != '/')
+    name[length++] = '\\';
+  for (size_t i = 0; i < 3 && prefix[i]; ++i) {
+    const u16 c = prefix[i];
+    if (c < 32 || c == '\\' || c == '/' || c == ':') {
+      trt_SetLastError(123);  // ERROR_INVALID_NAME
+      return 0;
+    }
+    name[length++] = c;
+  }
+
+  // A caller-supplied number reserves no file. An automatically selected
+  // number must create an empty file exclusively, retrying occupied names.
+  static std::atomic<u32> counter{0};
+  constexpr char hex[] = "0123456789ABCDEF";
+  for (unsigned attempt = 0; attempt < 0xffffu; ++attempt) {
+    const u32 id = unique ? unique : 1 + (counter.fetch_add(1) % 0xffffu);
+    for (unsigned i = 0; i < 4; ++i)
+      name[length + i] = static_cast<u16>(hex[(id >> ((3 - i) * 4)) & 15u]);
+    name[length + 4] = '.';
+    name[length + 5] = 't';
+    name[length + 6] = 'm';
+    name[length + 7] = 'p';
+
+    if (!unique) {
+      void* file = trt_CreateFileW(name, 0x40000000u, 0, nullptr, 1, 0x80u, nullptr);
+      if (file == reinterpret_cast<void*>(static_cast<uintptr_t>(-1))) {
+        const u32 error = trt_GetLastError();
+        if (error == 80 || error == 183) continue;
+        return 0;
+      }
+      if (!trt_CloseHandle(file)) return 0;
+    }
+    memcpy(buf, name, (length + 9) * sizeof(u16));
+    return id;
+  }
+  trt_SetLastError(80);  // ERROR_FILE_EXISTS
+  return 0;
 }
 
 u32 TRT_STDCALL trt_GetWindowsDirectoryW(u16* buf, u32 size) {

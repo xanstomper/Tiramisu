@@ -45,6 +45,36 @@ int main() {
   CHECK(longan::crash_report_write("", longan::crash_report_input{}).empty(),
         "write refuses an empty LocalState");
 
+  using longan::launch_checkpoint;
+  using longan::launch_outcome;
+  using longan::launch_phase;
+  launch_checkpoint checkpoint{};
+  CHECK(!longan::launch_checkpoint_read(local_state, &checkpoint),
+        "no checkpoint is reported before Play");
+  CHECK(longan::launch_checkpoint_write(local_state,
+        {launch_phase::native_tls, launch_outcome::running, 0}),
+        "persist the native TLS checkpoint");
+  CHECK(longan::launch_checkpoint_read(local_state, &checkpoint) &&
+            checkpoint.phase == launch_phase::native_tls &&
+            checkpoint.outcome == launch_outcome::running && checkpoint.code == 0,
+        "recover the last phase if the process terminates without a handler");
+  CHECK(longan::launch_checkpoint_write(local_state,
+        {launch_phase::native_entry, launch_outcome::host_fault, 0xc0000005u}),
+        "replace the running checkpoint with the fault outcome");
+  CHECK(longan::launch_checkpoint_read(local_state, &checkpoint) &&
+            checkpoint.phase == launch_phase::native_entry &&
+            checkpoint.outcome == launch_outcome::host_fault &&
+            checkpoint.code == 0xc0000005u,
+        "recover the fault code and stage without reading the private bundle");
+  const std::string checkpoint_path = local_state + "/launch-checkpoint.bin";
+  CHECK(slurp(checkpoint_path).size() == 16, "launch checkpoint stays bounded");
+  if (FILE* corrupt = fopen(checkpoint_path.c_str(), "wb")) {
+    fputc(0, corrupt);
+    fclose(corrupt);
+  }
+  CHECK(!longan::launch_checkpoint_read(local_state, &checkpoint),
+        "reject a truncated launch checkpoint");
+
   longan::crash_report_input in;
   in.reason = "guest fault: 0xc0000005 at titanfall.exe+0x1a2b3, read address 0x8";
   in.detail = "rip=00007ff6 rip0 rsp=12ff00";

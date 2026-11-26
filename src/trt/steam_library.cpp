@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -215,7 +216,8 @@ struct vdf_node {
 };
 
 bool vdf_parse_block(const std::vector<vdf_tok>& toks, size_t* i,
-                     std::vector<vdf_node>* out) {
+                     std::vector<vdf_node>* out, unsigned depth = 0) {
+  if (depth > 64) return false;
   while (*i < toks.size()) {
     const vdf_tok& t = toks[*i];
     if (t.brace_close) {
@@ -231,7 +233,7 @@ bool vdf_parse_block(const std::vector<vdf_tok>& toks, size_t* i,
     ++*i;
     if (*i < toks.size() && toks[*i].brace_open) {
       ++*i;
-      if (!vdf_parse_block(toks, i, &node.kids)) return false;
+      if (!vdf_parse_block(toks, i, &node.kids, depth + 1)) return false;
       node.has_value = false;
     } else if (*i < toks.size() && !toks[*i].brace_close) {
       node.value = toks[*i].text;
@@ -270,6 +272,53 @@ const vdf_node* find_root(const std::vector<vdf_node>& nodes, const char* key) {
   return nullptr;
 }
 
+const vdf_node* child(const vdf_node* parent, const char* key) {
+  return parent ? find_child(parent->kids, key) : nullptr;
+}
+
+std::string value(const vdf_node* node) {
+  return node && node->has_value ? node->value : std::string();
+}
+
+template <class Number>
+Number decimal(const std::string& text) {
+  Number number = 0;
+  const char* end = text.data() + text.size();
+  const auto result = std::from_chars(text.data(), end, number);
+  return result.ec == std::errc{} && result.ptr == end ? number : 0;
+}
+
+bool app_nodes(const std::string& text, std::vector<vdf_node>* roots) {
+  // Some CM responses prefix the quoted KeyValues text with binary metadata.
+  const size_t begin = text.find('"');
+  if (begin == std::string::npos) return false;
+  const size_t end = text.find_last_not_of('\0');
+  return vdf_parse_document(text.substr(begin, end - begin + 1), roots);
+}
+
+bool config_allows(std::string list, const char* desired) {
+  if (list.empty()) return true;
+  list = lower(std::move(list));
+  list.erase(std::remove_if(list.begin(), list.end(), [](unsigned char c) {
+    return std::isspace(c);
+  }), list.end());
+  return ("," + list + ",").find(std::string(",") + desired + ",") != std::string::npos;
+}
+
+trt_steam_depot public_depot(const vdf_node& node) {
+  trt_steam_depot depot{};
+  depot.id = decimal<uint32_t>(node.key);
+  depot.source_app = decimal<uint32_t>(value(child(&node, "depotfromapp")));
+  const vdf_node* config = child(&node, "config");
+  depot.optional_dlc = decimal<uint32_t>(value(child(&node, "dlcappid"))) != 0 ||
+                       decimal<uint32_t>(value(child(config, "dlcappid"))) != 0;
+  const vdf_node* pub = child(child(&node, "manifests"), "public");
+  depot.manifest = decimal<uint64_t>(value(pub));
+  if (depot.manifest == 0) depot.manifest = decimal<uint64_t>(value(child(pub, "gid")));
+  depot.size = decimal<uint64_t>(value(child(pub, "size")));
+  return depot;
+}
+
 // A path is a library path when it is non-empty and not Steam's bookkeeping
 // (contentstatsid, time*). The modern manifest also carries "totalsize".
 bool looks_like_path(const std::string& s) {
@@ -283,6 +332,150 @@ bool looks_like_path(const std::string& s) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
+
+bool trt_steam_parse_app_content(const std::string& text, trt_steam_app_content* out) {
+  if (!out) return false;
+  *out = {};
+  std::vector<vdf_node> roots;
+  if (!app_nodes(text, &roots)) return false;
+  const vdf_node* depots = find_root(roots, "depots");
+  if (!depots) return false;
+  const vdf_node* launch = child(find_root(roots, "config"), "launch");
+
+  struct choice {
+    trt_steam_depot depot;
+    std::string arch;
+    bool windows_specific;
+    bool english_specific;
+  };
+  std::vector<choice> candidates;
+  bool has_32 = false;
+  bool has_64 = false;
+  for (const auto& node : depots->kids) {
+    const auto depot = public_depot(node);
+    if (depot.id < 10 || depot.id == 228980 || depot.id == 228990 ||
+        (!depot.manifest && !depot.source_app)) continue;
+    const auto* config = child(&node, "config");
+    const auto os = value(child(config, "oslist"));
+    const auto language = value(child(config, "language"));
+    if (!config_allows(os, "windows") || !config_allows(language, "english")) continue;
+    const auto arch = value(child(config, "osarch"));
+    if (!arch.empty() && !depot.optional_dlc) {
+      has_32 |= config_allows(arch, "32");
+      has_64 |= config_allows(arch, "64");
+    }
+    candidates.push_back({depot, arch, !os.empty(), !language.empty()});
+  }
+
+  const vdf_node* selected_launch = nullptr;
+  std::string launch_arch;
+  if (launch) {
+    for (const auto& entry : launch->kids) {
+      const auto* config = child(&entry, "config");
+      const auto executable = lower(value(child(&entry, "executable")));
+      if (executable.size() < 4 || executable.compare(executable.size() - 4, 4, ".exe") != 0 ||
+          !config_allows(value(child(config, "oslist")), "windows")) continue;
+      const auto arch = value(child(config, "osarch"));
+      if (!config_allows(arch, "64") && !config_allows(arch, "32")) continue;
+      if ((has_32 || has_64) && !arch.empty() &&
+          !(has_32 && config_allows(arch, "32")) &&
+          !(has_64 && config_allows(arch, "64"))) continue;
+      const auto type = lower(value(child(&entry, "type")));
+      if (selected_launch && !type.empty() && type != "default") continue;
+      selected_launch = &entry;
+      launch_arch = arch;
+      if (type.empty() || type == "default") break;
+    }
+  }
+
+  const char* arch = (!config_allows(launch_arch, "64") ||
+                      (launch_arch.empty() && has_32 && !has_64)) ? "32" : "64";
+  std::stable_sort(candidates.begin(), candidates.end(), [](const choice& a, const choice& b) {
+    // A platform or language overlay takes precedence over the shared files.
+    const int a_rank = a.windows_specific + 2 * a.english_specific + 4 * a.depot.optional_dlc;
+    const int b_rank = b.windows_specific + 2 * b.english_specific + 4 * b.depot.optional_dlc;
+    return a_rank < b_rank;
+  });
+  for (const auto& candidate : candidates) {
+    if (config_allows(candidate.arch, arch)) out->depots.push_back(candidate.depot);
+  }
+  if (selected_launch) {
+    out->executable = value(child(selected_launch, "executable"));
+    out->arguments = value(child(selected_launch, "arguments"));
+    out->working_dir = value(child(selected_launch, "workingdir"));
+  }
+  return !out->depots.empty();
+}
+
+bool trt_steam_find_public_depot(const std::string& text, uint32_t depot_id,
+                                trt_steam_depot* out) {
+  if (!out) return false;
+  std::vector<vdf_node> roots;
+  if (!app_nodes(text, &roots)) return false;
+  const auto* node = child(find_root(roots, "depots"), std::to_string(depot_id).c_str());
+  if (!node) return false;
+  *out = public_depot(*node);
+  return out->manifest || out->source_app;
+}
+
+bool trt_steam_normalize_content_path(const std::string& path, std::string* out) {
+  if (!out || path.empty() || path.front() == '/' || path.front() == '\\') return false;
+  std::string normalized;
+  for (size_t start = 0; start < path.size();) {
+    const size_t end = path.find_first_of("/\\", start);
+    const std::string part = path.substr(start, end - start);
+    if (!part.empty() && part != ".") {
+      if (part.back() == '.' || part.back() == ' ' ||
+          part.find_first_of(":*?\"<>|") != std::string::npos ||
+          std::any_of(part.begin(), part.end(), [](unsigned char c) { return c < 32; }))
+        return false;
+      std::string stem = lower(part.substr(0, part.find('.')));
+      while (!stem.empty() && stem.back() == ' ') stem.pop_back();
+      if (stem == "con" || stem == "prn" || stem == "aux" || stem == "nul" ||
+          (stem.size() == 4 && (stem.compare(0, 3, "com") == 0 ||
+                                stem.compare(0, 3, "lpt") == 0) &&
+           stem[3] >= '0' && stem[3] <= '9')) return false;
+      if (!normalized.empty()) normalized += '\\';
+      normalized += part;
+    }
+    if (end == std::string::npos) break;
+    start = end + 1;
+  }
+  if (normalized.empty()) return false;
+  *out = std::move(normalized);
+  return true;
+}
+
+std::string trt_steam_depot_path_key(std::string path) {
+  for (char& c : path)
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+  return path;
+}
+
+bool trt_steam_add_depot_path(trt_steam_depot_layout& layout, const std::string& path,
+                             trt_steam_depot_path_owner owner) {
+  auto key = trt_steam_depot_path_key(path);
+  const auto old = layout.find(key);
+  if (old != layout.end() && old->second.directory != owner.directory) return false;
+  layout.insert_or_assign(std::move(key), owner);
+  return true;
+}
+
+bool trt_steam_validate_depot_layout(const trt_steam_depot_layout& layout,
+                                    std::string* conflict) {
+  for (const auto& entry : layout) {
+    const auto& key = entry.first;
+    for (auto slash = key.find('\\'); slash != std::string::npos;
+         slash = key.find('\\', slash + 1)) {
+      const auto parent = layout.find(key.substr(0, slash));
+      if (parent != layout.end() && !parent->second.directory) {
+        if (conflict) *conflict = parent->first;
+        return false;
+      }
+    }
+  }
+  return true;
+}
 
 std::vector<std::string> trt_steam_default_roots() {
   std::vector<std::string> out;

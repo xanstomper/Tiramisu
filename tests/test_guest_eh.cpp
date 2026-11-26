@@ -18,13 +18,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <ucontext.h>
 
 #include <sys/mman.h>
 #include <unistd.h>
 
 #include <vector>
 
+extern "C" int trt_dispatch_hw_fault(int, void*, void*);
+extern "C" void* TRT_STDCALL trt_AddVectoredExceptionHandler(u32, void*);
+extern "C" u32 TRT_STDCALL trt_RemoveVectoredExceptionHandler(void*);
+
 namespace {
+
+i32 TRT_STDCALL retry_unchanged_fault(void*) { return -1; }
 
 int failures = 0;
 #define CHECK(cond, msg)                                     \
@@ -57,7 +65,7 @@ void* linux_alloc(size_t bytes, u64 preferred_base) {
 #endif
     if (preferred_base)
       p = mmap((void*)(uintptr_t)preferred_base, bytes, PROT_READ | PROT_WRITE,
-               MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+               MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   }
   if (!p || p == MAP_FAILED)
     p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
@@ -234,6 +242,33 @@ int main(int argc, char** argv) {
            (unsigned long long)r);
     CHECK(r == 0, "escaped rethrow -> boundary reports synthetic 0 return");
   }
+
+#if defined(__x86_64__)
+  void* retry_handler =
+      trt_AddVectoredExceptionHandler(1, reinterpret_cast<void*>(&retry_unchanged_fault));
+  CHECK(retry_handler != nullptr, "register a continuing vectored exception handler");
+  if (retry_handler) {
+    siginfo_t fault{};
+    fault.si_addr = reinterpret_cast<void*>(1);
+    ucontext_t original{};
+    original.uc_mcontext.gregs[REG_RIP] = static_cast<greg_t>(entry_va);
+    original.uc_mcontext.gregs[REG_RSP] = reinterpret_cast<greg_t>(&original);
+    ucontext_t context = original;
+    CHECK(trt_dispatch_hw_fault(SIGSEGV, &fault, &context) == 1,
+          "allow a handler to repair memory and retry the instruction");
+    int last_result = 1;
+    for (int i = 0; i < 8; ++i) {
+      context = original;
+      last_result = trt_dispatch_hw_fault(SIGSEGV, &fault, &context);
+    }
+    CHECK(last_result == 0, "stop retries when the same guest memory fault keeps recurring");
+    context = original;
+    fault.si_addr = reinterpret_cast<void*>(2);
+    CHECK(trt_dispatch_hw_fault(SIGSEGV, &fault, &context) == 1,
+          "a different fault has its own retry budget");
+    trt_RemoveVectoredExceptionHandler(retry_handler);
+  }
+#endif
 
   free(file);
   printf("%s (%d failed)\n", failures ? "RESULT: FAIL" : "RESULT: ALL PASS",
