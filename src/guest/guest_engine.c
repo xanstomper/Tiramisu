@@ -51,6 +51,10 @@ __attribute__((dllimport)) u32 GSTD GetTempPathW(u32 size, u16* buf);
 __attribute__((dllimport)) u32 GSTD GetTickCount64(void);
 // user32
 __attribute__((dllimport)) void GSTD PostQuitMessage(i32 code);
+__attribute__((dllimport)) void* GSTD CreateWindowExW(
+    u32 exstyle, const u16* class_name, const u16* title, u32 style,
+    i32 x, i32 y, i32 width, i32 height, void* parent, void* menu,
+    void* instance, void* param);
 __attribute__((dllimport)) void* GSTD SetFocus(void* hwnd);
 __attribute__((dllimport)) void* GSTD GetFocus(void);
 __attribute__((dllimport)) int GSTD GetClientRect(void* hwnd, void* rect);
@@ -153,15 +157,18 @@ u32 GSTD engine_boot(u64 a, u64 b, u64 c) {
   }
 
   // 6. quit + focus lifecycle
-  SetFocus((void*)0x1234);
-  bits |= (GetFocus() == (void*)0x1234) ? 0x200u : 0u;
+  const u16 window_class[] = {'S','T','A','T','I','C',0};
+  void* window = CreateWindowExW(0, window_class, 0, 0, 0, 0, 640, 480, 0, 0, 0, 0);
+  SetFocus(0);
+  SetFocus(window);
+  bits |= (window && GetFocus() == window) ? 0x200u : 0u;
   PostQuitMessage(0);
   bits |= 0x400u;
 
   // 7. the frame timer moves
   const u32 t0 = GetTickCount64();
   u32 r[4];
-  GetClientRect((void*)0x1234, r);
+  GetClientRect(window, r);
   bits |= (r[2] > 0 && r[3] > 0) ? 0x800u : 0u;
   bits |= (GetTickCount64() >= t0) ? 0x1000u : 0u;
 

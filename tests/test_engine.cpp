@@ -51,6 +51,8 @@ u32 TRT_STDCALL trt_GetFileAttributesW(const u16*);
 int TRT_STDCALL trt_CreateDirectoryW(const u16*, void*);
 u64 TRT_STDCALL trt_GetTickCount64(void);
 void TRT_STDCALL trt_PostQuitMessage(i32);
+void* TRT_STDCALL trt_CreateWindowExW(u32, const wchar_t*, const wchar_t*, u32,
+                                     int, int, int, int, void*, void*, void*, void*);
 void* TRT_STDCALL trt_SetFocus(void*);
 void* TRT_STDCALL trt_GetFocus(void);
 int TRT_STDCALL trt_GetClientRect(void*, void*);
@@ -254,6 +256,7 @@ int main(int argc, char** argv) {
     };
     static const trt_named_fn k_u32[] = {
         {"PostQuitMessage", (void*)&trt_PostQuitMessage},
+        {"CreateWindowExW", (void*)&trt_CreateWindowExW},
         {"SetFocus", (void*)&trt_SetFocus},
         {"GetFocus", (void*)&trt_GetFocus},
         {"GetClientRect", (void*)&trt_GetClientRect},
@@ -282,6 +285,27 @@ int main(int argc, char** argv) {
   }
   CHECK(trt_seal_image(&be, img) == TRT_OK, "image sealed (W^X)");
 
+  static constexpr char first_api[] = "CreateEventW";
+  static constexpr char second_api[] = "SetEvent";
+  gap_trace_record(first_api);
+  gap_trace_begin_launch();
+  trt_launch_api_entry api_entries[2]{};
+  u64 api_calls = 0;
+  CHECK(gap_trace_launch_tail(api_entries, 2, &api_calls) == 0 && api_calls == 0,
+        "launch diagnostics exclude calls from the previous launch");
+  gap_trace_record(first_api);
+  gap_trace_record(first_api);
+  gap_trace_record(second_api);
+  CHECK(gap_trace_launch_tail(api_entries, 2, &api_calls) == 2 && api_calls == 3 &&
+            api_entries[0].name == second_api && api_entries[0].repeats == 1 &&
+            api_entries[1].name == first_api && api_entries[1].repeats == 2,
+        "launch diagnostics report recent API names newest-first and keep repeat counts");
+  for (unsigned i = 0; i < 40; ++i)
+    gap_trace_record(i % 2 == 0 ? first_api : second_api);
+  CHECK(gap_trace_launch_tail(api_entries, 1, &api_calls) == 1 && api_calls == 43 &&
+            api_entries[0].name == second_api && api_entries[0].repeats == 1,
+        "launch diagnostics remain ordered after wrap and respect caller capacity");
+
   const u64 ret = win64_call(img->base + img->entry_rva, 0, 0, 0);
   printf("  guest returned 0x%llx (want 0x3f1fff)\n", (unsigned long long)ret);
 
@@ -294,6 +318,31 @@ int main(int argc, char** argv) {
   CHECK(ret & 0x40u, "CreateThread started a real worker thread");
   CHECK(ret & 0x80u, "the worker ran and WaitForSingleObject returned");
   CHECK(ret & 0x100u, "SetEvent/ResetEvent worked");
+  {
+    constexpr u64 invalid_handle = 0x1234u;
+    trt_sync_reset_launch_stats();
+    trt_SetLastError(0);
+    CHECK(!trt_SetEvent(invalid_handle) && trt_GetLastError() == 6,
+          "SetEvent reports ERROR_INVALID_HANDLE on failure");
+    trt_SetLastError(0);
+    CHECK(!trt_ResetEvent(invalid_handle) && trt_GetLastError() == 6,
+          "ResetEvent reports ERROR_INVALID_HANDLE on failure");
+    CHECK(trt_WaitForSingleObject(invalid_handle, 0) == 0xFFFFFFFFu &&
+              trt_GetLastError() == 6,
+          "WaitForSingleObject reports WAIT_FAILED and ERROR_INVALID_HANDLE");
+    auto* event = trt_CreateEventW(nullptr, 0, 0, nullptr);
+    const auto handle = reinterpret_cast<u64>(event);
+    CHECK(event && trt_SetEvent(handle) && trt_WaitForSingleObject(handle, 0) == 0 &&
+              trt_WaitForSingleObject(handle, 0) == 0x102u,
+          "auto-reset event wakes once, then times out");
+    if (event) trt_CloseHandle(event);
+    trt_sync_launch_stats stats{};
+    trt_sync_get_launch_stats(&stats);
+    CHECK(stats.wait_completed == 1 && stats.wait_timed_out == 1 &&
+              stats.wait_failed == 1 && stats.event_failed == 1 && stats.event_signaled == 1,
+          "synchronization diagnostics distinguish outcomes");
+  }
+
   CHECK(ret & 0x200u, "focus lifecycle (SetFocus/GetFocus)");
   CHECK(ret & 0x400u, "PostQuitMessage accepted");
   CHECK(ret & 0x800u, "GetClientRect answered");
