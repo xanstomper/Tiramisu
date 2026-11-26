@@ -2202,6 +2202,7 @@ int x86_step(x86_context* ctx) {
     // entry hits 0xA1 (`mov eax, ds:0x11bacc0`) right after the QPC probe.
     if (op >= 0xA0 && op <= 0xA3) {
         uint32_t addr = read_imm32(ctx);
+        if (g_seg_override == 4) addr += ctx->regs.fs_base;
         if (op == 0xA0) {
             uint32_t v = x86_mem_read8(ctx, addr);
             ctx->regs.eax = (ctx->regs.eax & 0xFFFFFF00) | v;
