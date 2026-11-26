@@ -103,6 +103,11 @@ int trt_mono_run(const trt_mono_config* cfg, const char* const* args,
 // Human-readable detail of the last embedding failure ("" when none).
 const char* trt_mono_last_error(void);
 
+// 1 when this build embeds a managed runtime (Mono), 0 when it was compiled
+// without one. The launch preflight uses it to name a managed title as
+// unrunnable up front instead of letting mscoree!<Flavor>Main fail later.
+int trt_mono_host_present(void);
+
 #ifdef __cplusplus
 }
 #endif

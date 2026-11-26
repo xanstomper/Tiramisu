@@ -4,6 +4,7 @@
 #include "images.h"
 #include "pe.h"
 #include "thunk.h"
+#include "dynamic_api.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,6 +61,9 @@ int image_trap(trt_x86_ctx* c, u32 va, void* user) {
     void* fn = g_trap_rs.resolve
                   ? g_trap_rs.resolve(g_trap_rs.user, mod, sym, ord)
                   : trt_resolve_module(nullptr, mod, sym, ord);
+    if (!fn) {
+      fn = trt_dynamic_synthesize_api(mod, sym, ord);
+    }
     u32 ret_va = 0;
     trt_x86_mem_read(c, c->r[X86_ESP], 4, &ret_va);
     if (!fn) {

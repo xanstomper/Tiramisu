@@ -11,6 +11,7 @@
 
 #ifdef _WIN32
 #include <direct.h>
+#include <windows.h>
 #else
 #include <sys/stat.h>
 #endif
@@ -20,7 +21,10 @@ namespace longan {
 namespace {
 
 std::mutex g_mu;
+host_settings g_base;
 host_settings g_live;
+std::string g_profile_ini;
+std::string g_env_ini;
 // <LocalState>\cache\shaders, resolved in settings_load(). Read by the bridge
 // through trt_settings_shader_cache_dir() so a translation done in one launch
 // is a hit in the next.
@@ -86,6 +90,33 @@ int make_dir(std::string dir) {
   return 0;
 }
 
+// g_mu is held by the caller. Only g_base is serialized, so a guest
+// override or environment value never leaks into the next session's INI.
+int rebuild_live_settings() {
+  g_live = g_base;
+  const int profile_keys = g_live.apply_ini(g_profile_ini);
+  return profile_keys + g_live.apply_ini(g_env_ini);
+}
+
+bool write_ini_atomic(const std::string& path, const std::string& text) {
+  const auto temporary = path + ".tmp";
+  FILE* file = fopen(temporary.c_str(), "wb");
+  if (!file) return false;
+  const bool written = fwrite(text.data(), 1, text.size(), file) == text.size();
+  const bool closed = fclose(file) == 0;
+  bool committed = false;
+  if (written && closed) {
+#ifdef _WIN32
+    committed = MoveFileExA(temporary.c_str(), path.c_str(),
+                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    committed = rename(temporary.c_str(), path.c_str()) == 0;
+#endif
+  }
+  if (!committed) remove(temporary.c_str());
+  return committed;
+}
+
 } // namespace
 
 std::string host_settings::to_ini() const {
@@ -117,6 +148,9 @@ std::string host_settings::to_ini() const {
   s += "required_services=";
   s += required_services;
   s += "\n";
+  s += "network_games_root=";
+  s += network_games_root;
+  s += "\n";
   snprintf(buf, sizeof(buf), "log_lines=%d\n", log_lines);
   s += buf;
   snprintf(buf, sizeof(buf),
@@ -146,11 +180,10 @@ int host_settings::apply_ini(const std::string& text) {
     const std::string key = trim(line.substr(0, eq));
     const std::string val = trim(line.substr(eq + 1));
     if (key.empty()) continue;
-    ++applied;
     if (key == "default_input") {
-      if (val == "auto" || val == "controller" || val == "kbm" ||
-          val == "pad2kbm")
-        default_input = val;
+      if (val != "auto" && val != "controller" && val != "kbm" && val != "pad2kbm")
+        continue;
+      default_input = val;
     } else if (key == "launch_args") {
       // Quotes are for readability in the file; the guest gets the raw text.
       std::string v = val;
@@ -162,6 +195,8 @@ int host_settings::apply_ini(const std::string& text) {
     } else if (key == "required_services") {
       required_services =
           val.size() > 256 ? val.substr(0, 256) : val;
+    } else if (key == "network_games_root") {
+      network_games_root = val.size() > 1024 ? val.substr(0, 1024) : val;
     } else if (key == "mouse_speed") {
       mouse_speed = clampi(atoi(val.c_str()), 1, 100);
     } else if (key == "wheel_speed") {
@@ -210,8 +245,10 @@ int host_settings::apply_ini(const std::string& text) {
       input_deadzone = clampi(atoi(val.c_str()), 0, 50);
     } else if (key == "texture_quality") {
       texture_quality = clampi(atoi(val.c_str()), 0, 3);
+    } else {
+      continue;  // Unknown keys do not count toward the applied total.
     }
-    // unknown keys are kept in the file but ignored — never fatal
+    ++applied;
   }
   return applied;
 }
@@ -230,25 +267,7 @@ bool service_known(const std::string& id) {
 // NOTE: settings.cpp is linked on its own by tests/test_settings.cpp, so it
 // must not reference the engine. The trt layer owns the FSB5 console decode
 // gate; main.cpp applies `fsb_decode` to it after each ini load.
-int settings_load(const std::string& local_state) {
-  if (!local_state.empty())
-    g_shader_cache_dir = local_state + k_sep + "cache" + k_sep + "shaders";
-  int applied = 0;
-  if (FILE* f = fopen((local_state + k_sep + "settings.ini").c_str(), "rb")) {
-    std::string text;
-    char buf[1024];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
-    fclose(f);
-    std::lock_guard<std::mutex> lk(g_mu);
-    applied = g_live.apply_ini(text);
-  }
-  // The environment beats the file: a launcher sets TIRAMISU_FRAME_RATE_CAP=30
-  // for one run without rewriting settings the user tuned.
-  return applied + settings_apply_env();
-}
-
-int settings_apply_env() {
+static std::string settings_environment_ini() {
   static const char* const k_keys[] = {
       "default_input",  "launch_args",        "required_services",
       "mouse_speed",    "wheel_speed",        "pad_vibration",
@@ -270,9 +289,64 @@ int settings_apply_env() {
     text += v;
     text += '\n';
   }
-  if (text.empty()) return 0;
-  std::lock_guard<std::mutex> lk(g_mu);
-  return g_live.apply_ini(text);
+  return text;
+}
+
+int settings_load(const std::string& local_state) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  g_base = {};
+  if (!local_state.empty())
+    g_shader_cache_dir = local_state + k_sep + "cache" + k_sep + "shaders";
+  int applied = 0;
+  if (FILE* f = fopen((local_state + k_sep + "settings.ini").c_str(), "rb")) {
+    std::string text;
+    char buf[1024];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
+    const bool complete = !ferror(f);
+    fclose(f);
+    if (complete) applied = g_base.apply_ini(text);
+  }
+  g_env_ini = settings_environment_ini();
+  return applied + rebuild_live_settings();
+}
+
+int settings_apply_env() {
+  std::lock_guard<std::mutex> lock(g_mu);
+  g_env_ini = settings_environment_ini();
+  rebuild_live_settings();
+  host_settings env{};
+  return env.apply_ini(g_env_ini);
+}
+
+void settings_clear_profile() {
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (g_profile_ini.empty()) return;
+  g_profile_ini.clear();
+  rebuild_live_settings();
+}
+
+host_settings settings_get_global() {
+  std::lock_guard<std::mutex> lock(g_mu);
+  return g_base;
+}
+
+std::string settings_title_profile_dir(const std::string& local_state,
+                                      const std::string& source_path) {
+  // Use the source path rather than a display title that can collide across
+  // library roots. Normalize separators and native Windows casing.
+  uint64_t hash = 14695981039346656037ULL;
+  for (unsigned char c : source_path) {
+    if (c == '\\') c = '/';
+#ifdef _WIN32
+    if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+#endif
+    hash ^= c;
+    hash *= 1099511628211ULL;
+  }
+  char key[24];
+  snprintf(key, sizeof(key), "title-%016llx", static_cast<unsigned long long>(hash));
+  return local_state + k_sep + "profiles" + k_sep + key;
 }
 
 int settings_unknown_services(const std::string& list, std::string* unknown) {
@@ -296,53 +370,61 @@ int settings_unknown_services(const std::string& list, std::string* unknown) {
 }
 
 int settings_save(const std::string& local_state) {
-  std::lock_guard<std::mutex> lk(g_mu);
-  const std::string text = g_live.to_ini();
-  FILE* f = fopen((local_state + k_sep + "settings.ini").c_str(), "wb");
-  if (!f) return -1;
-  const size_t w = fwrite(text.data(), 1, text.size(), f);
-  fclose(f);
-  return (w == text.size()) ? 0 : -1;
+  std::lock_guard<std::mutex> lock(g_mu);
+  return write_ini_atomic(local_state + k_sep + "settings.ini", g_base.to_ini())
+             ? 0 : -1;
 }
 
-int settings_load_profile(const std::string& game_dir,
-                          const std::string& fallback_dir) {
-  FILE* f = fopen(profile_path(game_dir).c_str(), "rb");
-  // A read-only or disc-mounted game folder has no profile to read; the
-  // writable per-title store is where the dashboard puts one.
-  if (!f && !fallback_dir.empty())
-    f = fopen(profile_path(fallback_dir).c_str(), "rb");
-  if (!f) return 0;
-  std::string text;
-  char buf[1024];
-  size_t n;
-  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
-  fclose(f);
-
-  int applied;
-  {
-    std::lock_guard<std::mutex> lk(g_mu);
-    applied = g_live.apply_ini(text);
+std::string settings_read_user_profile(const std::string& dir) {
+  if (dir.empty()) return {};
+  FILE* file = fopen(profile_path(dir).c_str(), "rb");
+  if (!file) return {};
+  std::string result;
+  char block[1024];
+  size_t count;
+  while ((count = fread(block, 1, sizeof(block), file)) > 0) {
+    result.append(block, count);
+    if (result.size() > 64 * 1024) break;
   }
-  return applied + settings_apply_env();  // env still wins over the profile
+  if (ferror(file) || result.size() > 64 * 1024) result.clear();
+  fclose(file);
+  return result;
+}
+
+bool settings_write_user_profile(const std::string& dir, const std::string& text) {
+  if (dir.empty() || text.size() > 64 * 1024 || text.find('\0') != std::string::npos)
+    return false;
+  std::lock_guard<std::mutex> lock(g_mu);
+  make_dir(dir);
+  return write_ini_atomic(profile_path(dir), text);
+}
+
+int settings_load_profile(const std::string& game_dir, const std::string& user_profile_dir) {
+  auto profile = settings_read_user_profile(game_dir);
+  if (!user_profile_dir.empty() && user_profile_dir != game_dir)
+    profile += '\n' + settings_read_user_profile(user_profile_dir);
+  std::lock_guard<std::mutex> lock(g_mu);
+  g_profile_ini = std::move(profile);
+  g_env_ini = settings_environment_ini();
+  return rebuild_live_settings();
 }
 
 int settings_write_profile_stub(const std::string& dir,
                                 const std::string& title) {
+  std::lock_guard<std::mutex> lock(g_mu);
   const std::string path = profile_path(dir);
   if (FILE* exists = fopen(path.c_str(), "rb")) {
     fclose(exists);
     return 0;  // never clobber a title the user already tuned
   }
   make_dir(dir);  // parent usually exists; a failure shows up as the write below
-  FILE* f = fopen(path.c_str(), "wb");
-  if (!f) return -1;
+
   std::string text;
   text += "# Tiramisu per-title overrides — " + title + "\n";
   text += "# Applied on top of settings.ini for this title only. Missing keys\n";
   text += "# keep the global value, so this file can stay short.\n";
   text += "\n# Arguments passed to the game (beats the synthesizer's guesses).\n";
-  text += "launch_args=\n";
+  text += "# launch_args=\n";
   text += "\n# Any settings.ini key works here, for example:\n";
   text += "# resolution_scale=100\n";
   text += "# frame_rate_cap=60\n";
@@ -351,28 +433,23 @@ int settings_write_profile_stub(const std::string& dir,
   text += "# audio_buffer_ms=20\n";
   text += "# vsync=1\n";
   text += "# win11_personality=0\n";
-  const size_t w = fwrite(text.data(), 1, text.size(), f);
-  fclose(f);
-  return (w == text.size()) ? 1 : -1;
+  return write_ini_atomic(path, text) ? 1 : -1;
 }
 
-void settings_store(const host_settings& s, const std::string& local_state) {
-  {
-    std::lock_guard<std::mutex> lk(g_mu);
-    host_settings c = s;  // clamp the same way apply_ini does
-    c.mouse_speed = clampi(c.mouse_speed, 1, 100);
-    c.wheel_speed = clampi(c.wheel_speed, 1, 100);
-    c.os_major = clampi(c.os_major, 5, 12);
-    c.os_minor = clampi(c.os_minor, 0, 99);
-    c.os_build = clampi(c.os_build, 0, 99999);
-    c.log_lines = clampi(c.log_lines, 4, 40);
-    if (c.default_input != "auto" && c.default_input != "controller" &&
-        c.default_input != "kbm" && c.default_input != "pad2kbm")
-      c.default_input = "auto";
-    if (c.launch_args.size() > 512) c.launch_args.resize(512);
-    g_live = c;
-  }
-  settings_save(local_state);
+bool settings_store(const host_settings& s, const std::string& local_state) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  // Persist the same bounded values a reload would produce. One validation
+  // path covers settings entered in the TV UI, web UI, and INI file.
+  for (const auto* text : {&s.launch_args, &s.required_services, &s.network_games_root})
+    if (text->find_first_of("\r\n") != std::string::npos ||
+        text->find('\0') != std::string::npos) return false;
+  host_settings c;
+  c.apply_ini(s.to_ini());
+  if (!write_ini_atomic(local_state + k_sep + "settings.ini", c.to_ini()))
+    return false;
+  g_base = std::move(c);
+  rebuild_live_settings();
+  return true;
 }
 
 host_settings settings_get() {

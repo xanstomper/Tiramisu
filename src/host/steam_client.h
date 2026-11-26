@@ -14,6 +14,9 @@
 
 namespace longan {
 
+inline constexpr char kSteamInstallPending[] = "\\.tiramisu\\steam-install-pending";
+inline constexpr char kSteamLaunchExe[] = "\\.tiramisu\\steam-launch-exe.txt";
+
 struct steam_library_item {
   uint32_t app_id = 0;
   std::string title;
@@ -21,6 +24,7 @@ struct steam_library_item {
   std::string size_str;
   bool installed = false;
   bool downloading = false;
+  bool queued = false;
   float download_pct = 0.0f;
   std::string status_text;
   std::string install_dir;
@@ -54,8 +58,9 @@ void steam_client_rescan_local();
 
 // Download and install an owned Steam game natively onto the console.
 // Fails visibly with status_text if signed out, unowned, or unsupported codec.
-void steam_client_download_app(uint32_t app_id,
+bool steam_client_download_app(uint32_t app_id,
                                std::function<void()> on_complete = nullptr);
+bool steam_client_cancel_download(uint32_t app_id);
 
 // Snapshot current account + library items for UI/main loop (thread-safe).
 steam_account_snapshot steam_client_account();

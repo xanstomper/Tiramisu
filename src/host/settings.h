@@ -23,6 +23,9 @@ struct host_settings {
   // A title that needs one we do not have should say so in the log before it
   // fails somewhere confusing; a typo in the list is caught the same way.
   std::string required_services;
+  // Optional UNC or mounted-directory root for game folders streamed from a
+  // PC share; scanned alongside LocalState and packaged network-games.
+  std::string network_games_root;
   int mouse_speed = 50;                // gamepad-as-mouse speed, 1..100
   int wheel_speed = 50;                // pad dpad wheel speed, 1..100
   bool pad_vibration = true;           // let guests rumble the pad
@@ -45,7 +48,7 @@ struct host_settings {
   // ---- on-screen overlay (new) ----
   bool show_fps = true;                // FPS counter overlay in-game
   bool show_sysinfo = false;           // CPU/GPU/RAM overlay
-  bool quick_menu_enabled = true;      // Back+Start opens quick menu
+  bool quick_menu_enabled = true;      // Shift+Tab opens quick menu
 
   // ---- performance & tuning ----
   int resolution_scale = 100;          // render resolution %, 50..200
@@ -71,14 +74,11 @@ int settings_load(const std::string& local_state);
 // number of overrides applied. Values go through the same validation as the
 // ini, so a bad env value clamps instead of poisoning the session.
 int settings_apply_env();
-// Load a per-game profile from <game_dir>/tiramisu.profile.ini and apply
-// overrides on top of the live settings. Returns applied-key count (0 if
-// no profile file). Unknown keys are ignored (never fatal).
-// When the game folder has no profile, <fallback_dir>/tiramisu.profile.ini is
-// used instead (the writable per-title store), so a title can be tuned on the
-// console without touching a read-only game folder.
+// Apply the game's profile, then its writable override, over global
+// settings. Environment overrides have final precedence. Returns the
+// number of profile and environment keys applied.
 int settings_load_profile(const std::string& game_dir,
-                          const std::string& fallback_dir = "");
+                          const std::string& user_profile_dir = "");
 // Write a commented starter profile to <dir>/tiramisu.profile.ini, creating
 // <dir> if needed. An existing file is never touched. Returns 1 when written,
 // 0 when one was already there, -1 on I/O failure.
@@ -89,8 +89,14 @@ int settings_write_profile_stub(const std::string& dir,
 // are known). Pure: used by the host log line and by the offline tests.
 int settings_unknown_services(const std::string& list,
                               std::string* unknown = nullptr);
-// Replace the live settings (clamped to valid ranges) and persist.
-void settings_store(const host_settings& s, const std::string& local_state);
+// Persist global defaults and recompute the effective launch settings.
+bool settings_store(const host_settings& s, const std::string& local_state);
+host_settings settings_get_global();
+void settings_clear_profile();
+std::string settings_title_profile_dir(const std::string& local_state,
+                                      const std::string& source_path);
+std::string settings_read_user_profile(const std::string& profile_dir);
+bool settings_write_user_profile(const std::string& profile_dir, const std::string& text);
 host_settings settings_get();
 
 // ---- consumed by the trt bridge layer ----

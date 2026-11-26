@@ -45,9 +45,14 @@ void TRT_STDCALL trt_GetSystemInfo(void*);
 int TRT_STDCALL trt_MultiByteToWideChar(u32, u32, const char*, i32, u16*, i32);
 int TRT_STDCALL trt_WideCharToMultiByte(u32, u32, const u16*, i32, char*, i32, const char*, void*);
 u32 TRT_STDCALL trt_GetTempPathW(u32, u16*);
+u32 TRT_STDCALL trt_GetTempFileNameW(const u16*, const u16*, u32, u16*);
+u32 TRT_STDCALL trt_GetTempFileNameA(const char*, const char*, u32, char*);
+u32 TRT_STDCALL trt_GetFileAttributesW(const u16*);
 int TRT_STDCALL trt_CreateDirectoryW(const u16*, void*);
 u64 TRT_STDCALL trt_GetTickCount64(void);
 void TRT_STDCALL trt_PostQuitMessage(i32);
+void* TRT_STDCALL trt_CreateWindowExW(u32, const wchar_t*, const wchar_t*, u32,
+                                     int, int, int, int, void*, void*, void*, void*);
 void* TRT_STDCALL trt_SetFocus(void*);
 void* TRT_STDCALL trt_GetFocus(void);
 int TRT_STDCALL trt_GetClientRect(void*, void*);
@@ -67,6 +72,8 @@ u32 TRT_STDCALL trt_GetLastError(void);
 u32 TRT_STDCALL trt_IsProcessorFeaturePresent(u32);
 int TRT_STDCALL trt_GetCPInfo(u32, void*);
 void* TRT_STDCALL trt_FindFirstFileExW(const u16*, u32, void*, u32, void*, u32);
+void* TRT_STDCALL trt_FindFirstFileA(const char*, void*);
+int   TRT_STDCALL trt_FindNextFileA(void*, void*);
 int TRT_STDCALL trt_GetFileAttributesExW(const u16*, u32, void*);
 int TRT_STDCALL trt_FindNextFileW(void*, void*);
 int TRT_STDCALL trt_FindClose(void*);
@@ -103,7 +110,7 @@ void* linux_alloc(size_t bytes, u64 preferred_base) {
 #endif
     if (preferred_base)
       p = mmap((void*)(uintptr_t)preferred_base, bytes, PROT_READ | PROT_WRITE,
-               MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+               MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   }
   if (!p || p == MAP_FAILED)
     p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
@@ -249,6 +256,7 @@ int main(int argc, char** argv) {
     };
     static const trt_named_fn k_u32[] = {
         {"PostQuitMessage", (void*)&trt_PostQuitMessage},
+        {"CreateWindowExW", (void*)&trt_CreateWindowExW},
         {"SetFocus", (void*)&trt_SetFocus},
         {"GetFocus", (void*)&trt_GetFocus},
         {"GetClientRect", (void*)&trt_GetClientRect},
@@ -277,6 +285,27 @@ int main(int argc, char** argv) {
   }
   CHECK(trt_seal_image(&be, img) == TRT_OK, "image sealed (W^X)");
 
+  static constexpr char first_api[] = "CreateEventW";
+  static constexpr char second_api[] = "SetEvent";
+  gap_trace_record(first_api);
+  gap_trace_begin_launch();
+  trt_launch_api_entry api_entries[2]{};
+  u64 api_calls = 0;
+  CHECK(gap_trace_launch_tail(api_entries, 2, &api_calls) == 0 && api_calls == 0,
+        "launch diagnostics exclude calls from the previous launch");
+  gap_trace_record(first_api);
+  gap_trace_record(first_api);
+  gap_trace_record(second_api);
+  CHECK(gap_trace_launch_tail(api_entries, 2, &api_calls) == 2 && api_calls == 3 &&
+            api_entries[0].name == second_api && api_entries[0].repeats == 1 &&
+            api_entries[1].name == first_api && api_entries[1].repeats == 2,
+        "launch diagnostics report recent API names newest-first and keep repeat counts");
+  for (unsigned i = 0; i < 40; ++i)
+    gap_trace_record(i % 2 == 0 ? first_api : second_api);
+  CHECK(gap_trace_launch_tail(api_entries, 1, &api_calls) == 1 && api_calls == 43 &&
+            api_entries[0].name == second_api && api_entries[0].repeats == 1,
+        "launch diagnostics remain ordered after wrap and respect caller capacity");
+
   const u64 ret = win64_call(img->base + img->entry_rva, 0, 0, 0);
   printf("  guest returned 0x%llx (want 0x3f1fff)\n", (unsigned long long)ret);
 
@@ -289,6 +318,31 @@ int main(int argc, char** argv) {
   CHECK(ret & 0x40u, "CreateThread started a real worker thread");
   CHECK(ret & 0x80u, "the worker ran and WaitForSingleObject returned");
   CHECK(ret & 0x100u, "SetEvent/ResetEvent worked");
+  {
+    constexpr u64 invalid_handle = 0x1234u;
+    trt_sync_reset_launch_stats();
+    trt_SetLastError(0);
+    CHECK(!trt_SetEvent(invalid_handle) && trt_GetLastError() == 6,
+          "SetEvent reports ERROR_INVALID_HANDLE on failure");
+    trt_SetLastError(0);
+    CHECK(!trt_ResetEvent(invalid_handle) && trt_GetLastError() == 6,
+          "ResetEvent reports ERROR_INVALID_HANDLE on failure");
+    CHECK(trt_WaitForSingleObject(invalid_handle, 0) == 0xFFFFFFFFu &&
+              trt_GetLastError() == 6,
+          "WaitForSingleObject reports WAIT_FAILED and ERROR_INVALID_HANDLE");
+    auto* event = trt_CreateEventW(nullptr, 0, 0, nullptr);
+    const auto handle = reinterpret_cast<u64>(event);
+    CHECK(event && trt_SetEvent(handle) && trt_WaitForSingleObject(handle, 0) == 0 &&
+              trt_WaitForSingleObject(handle, 0) == 0x102u,
+          "auto-reset event wakes once, then times out");
+    if (event) trt_CloseHandle(event);
+    trt_sync_launch_stats stats{};
+    trt_sync_get_launch_stats(&stats);
+    CHECK(stats.wait_completed == 1 && stats.wait_timed_out == 1 &&
+              stats.wait_failed == 1 && stats.event_failed == 1 && stats.event_signaled == 1,
+          "synchronization diagnostics distinguish outcomes");
+  }
+
   CHECK(ret & 0x200u, "focus lifecycle (SetFocus/GetFocus)");
   CHECK(ret & 0x400u, "PostQuitMessage accepted");
   CHECK(ret & 0x800u, "GetClientRect answered");
@@ -385,7 +439,11 @@ int main(int argc, char** argv) {
   {
     u16 tbuf[64]; const u32 n =
       (u32)win64_call((void*)&trt_GetTempPathW, 64, (u64)(uintptr_t)tbuf, 0);
-    CHECK(n > 1 && n <= 64, "GetTempPathW answers with a length");
+    CHECK(n == 8 && tbuf[n] == 0, "GetTempPathW success excludes the terminator");
+    u16 short_buf[8]{0x1122};
+    CHECK(trt_GetTempPathW(0, nullptr) == 9 &&
+              trt_GetTempPathW(8, short_buf) == 9 && short_buf[0] == 0x1122,
+          "GetTempPathW query and short buffer return the required capacity");
     char t8[128];
     for (u32 i = 0; i < n && i < 63; ++i) t8[i] = (char)tbuf[i];
     t8[n && n <= 63 ? n : 63] = 0;
@@ -402,6 +460,28 @@ int main(int argc, char** argv) {
     snprintf(want, sizeof(want), "%s/Temp/_MEIt", argv[2]);
     CHECK(stat(want, &st) == 0 && (st.st_mode & S_IFDIR),
           "C:\\Temp\\_MEIt materialised as real dirs under the c: mount");
+
+    const u16 prefix[] = {'e','n','g','i','n','e',0};
+    u16 named[260]{}, first[260]{};
+    CHECK(trt_GetTempFileNameW(tbuf, prefix, 1, named) == 1 &&
+              trt_GetFileAttributesW(named) == 0xffffffffu,
+          "a specified temp-file ID returns a path without creating a file");
+    const void* invalid = reinterpret_cast<void*>(static_cast<uintptr_t>(-1));
+    void* existing = trt_CreateFileW(named, 0x40000000u, 0, nullptr, 1, 0, nullptr);
+    CHECK(existing != invalid, "create a conflicting temp filename");
+    if (existing != invalid) trt_CloseHandle(existing);
+    CHECK(trt_CreateFileW(named, 0x40000000u, 0, nullptr, 1, 0, nullptr) == invalid,
+          "CREATE_NEW refuses to reopen or truncate an existing file");
+    const u32 first_id = trt_GetTempFileNameW(tbuf, prefix, 0, first);
+    CHECK(first_id && first_id != 1 && trt_GetFileAttributesW(first) != 0xffffffffu,
+          "GetTempFileNameW skips occupied IDs and creates an empty file");
+    char other[260]{};
+    const u32 other_id = trt_GetTempFileNameA("C:\\Temp", "engine", 0, other);
+    CHECK(other_id && other_id != first_id && strstr(other, "C:\\Temp\\eng") == other,
+          "GetTempFileNameA shares the allocator and adds the missing separator");
+    const u16 missing[] = {'C',':','\\','n','o','p','e',0};
+    CHECK(trt_GetTempFileNameW(missing, prefix, 0, first) == 0,
+          "GetTempFileNameW reports a missing directory");
   }
 
   // ---- STAGE 7: LoadLibraryW bare-name miss falls back to system modules --
@@ -517,6 +597,28 @@ int main(int argc, char** argv) {
     u16 pat3[] = { 'C', ':', '\\', 'n', 'o', 'd', 'i', 'r', '\\', '*', 0 };
     CHECK(trt_FindFirstFileExW(pat3, 0, &fd, 0, nullptr, 0) == (void*)(uintptr_t)-1,
           "FindFirstFileExW(missing dir) -> INVALID_HANDLE_VALUE");
+
+    // ---- ANSI wrappers: many apps import FindFirstFileA, which used to fall
+    // through to the real host API (no guest C:\ there). The A path must
+    // narrow the same 592-byte record to the 320-byte A layout.
+    struct find_data_a { u32 attrs; u32 c_lo, c_hi, a_lo, a_hi, w_lo, w_hi;
+                         u32 szhi, szlo, r1, r2;
+                         char name[260]; char alt[14]; char pad[2]; };
+    static_assert(offsetof(find_data_a, name) == 44, "WIN32_FIND_DATAA cFileName offset");
+    static_assert(sizeof(find_data_a) == 320, "WIN32_FIND_DATAA is 320 bytes");
+    find_data_a fa;
+    memset(&fa, 0, sizeof(fa));
+    void* ah = trt_FindFirstFileA("C:\\seedfind\\*.txt", &fa);
+    CHECK(ah != (void*)(uintptr_t)-1, "FindFirstFileA(C:\\seedfind\\*.txt) -> handle");
+    if (ah != (void*)(uintptr_t)-1) {
+      CHECK(strstr(fa.name, "seed_c.txt") != nullptr, "A record carries seed_c.txt");
+      CHECK(fa.szlo == 3 && fa.szhi == 0, "A record carries the 3-byte size");
+      memset(&fa, 0, sizeof(fa));
+      CHECK(trt_FindNextFileA(ah, &fa) == 0, "A enumeration ends honestly");
+      CHECK(trt_FindClose(ah) == 1, "A handle closes");
+    }
+    CHECK(trt_FindFirstFileA("C:\\nodir\\*", &fa) == (void*)(uintptr_t)-1,
+          "FindFirstFileA(missing dir) -> INVALID_HANDLE_VALUE");
   }
 
   // ---- STAGE 9: WIN32_FILE_ATTRIBUTE_DATA layout (GetFileAttributesExW) ----
@@ -823,6 +925,26 @@ int main(int argc, char** argv) {
     const u32 need_len = fn_gfp(hf, tiny, 4, 0u);
     CHECK(need_len == dos_len + 1 && trt_GetLastError() == 122u,
           "GetFinalPathNameByHandleW small buf -> need+1 + ERROR_INSUFFICIENT_BUFFER(122)");
+
+    u16 directory[64], directory_path[256]{};
+    w16(directory, "C:\\Temp");
+    const auto invalid = reinterpret_cast<void*>(static_cast<uintptr_t>(-1));
+    CHECK(trt_CreateFileW(directory, 0, 7, nullptr, 3, 0x80, nullptr) == invalid &&
+              trt_GetLastError() == 5,
+          "CreateFileW rejects a directory open without backup semantics");
+    void* dir = trt_CreateFileW(directory, 0, 7, nullptr, 3, 0x02000080u, nullptr);
+    CHECK(dir != invalid && fn_gfp(dir, directory_path, 256, 0) > 0 &&
+              u16_starts_with(directory_path, "\\\\?\\C:\\") &&
+              u16_ends_with(directory_path, "\\Temp"),
+          "GetFinalPathNameByHandleW returns the guest path for a directory");
+    if (dir != invalid) {
+      size_t written = 99;
+      CHECK(!trt_file_pwrite(dir, 0, "x", 1, &written) && written == 0,
+            "virtual directory handles reject file writes");
+      trt_CloseHandle(dir);
+      CHECK(fn_gfp(dir, directory_path, 256, 0) == 0 && trt_GetLastError() == 6,
+            "closed directory handles no longer yield a path");
+    }
 
     // DuplicateHandle refcounting keeps FILE* open across CloseHandle(orig)
     void* hf_dup = nullptr;

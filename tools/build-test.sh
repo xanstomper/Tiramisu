@@ -217,6 +217,11 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   tests/test_libload.cpp "$out/libtrt.a" \
   -o "$out/test_libload"
 "$out/test_libload" "$out/guest_libload.exe" "$out"
+split_dir="$out/test_libload_split"
+mkdir -p "$split_dir/bin"
+cp "$out/guest_libload.exe" "$split_dir/bin/"
+cp "$out/guestdll.dll" "$split_dir/"
+"$out/test_libload" "$split_dir/bin/guest_libload.exe" "$split_dir/bin" "$split_dir"
 
 # --- 8. the graphics bridge: the guest's D3D11 calls must reach the host's GPU ---
 SDK="$HOME/.cache/uwp-crossbuild/xwin/sdk/include"
@@ -569,6 +574,83 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   -o "$out/test_gdi"
 "$out/test_gdi" "$out/guest_gdi.exe"
 
+# --- 26b. desktop-application paint path: window -> WM_PAINT -> GDI raster --
+# A desktop-shaped guest (RegisterClassEx -> CreateWindowEx -> message pump)
+# must receive the paint cycle, run its own WM_PAINT handler, and its
+# PatBlt/TextOutA/Rectangle imports must leave real pixels on the window's
+# surface. The test dumps the surface and counts them.
+cat > "$out/desktop_u.def" <<'DEOF'
+LIBRARY user32
+EXPORTS
+    RegisterClassExW
+    CreateWindowExW
+    ShowWindow
+    GetMessageW
+    TranslateMessage
+    DispatchMessageW
+    PostQuitMessage
+    DefWindowProcW
+    BeginPaint
+    EndPaint
+    ScrollWindowEx
+    InvalidateRect
+    GetUpdateRect
+DEOF
+cat > "$out/desktop_g.def" <<'DEOF'
+LIBRARY gdi32
+EXPORTS
+    CreateFontIndirectW
+    SelectObject
+    PatBlt
+    TextOutA
+    Rectangle
+    RoundRect
+    SetTextColor
+    SetBkColor
+    SetBkMode
+    CreateSolidBrush
+    GetTextExtentPoint32A
+    BeginPath
+    EndPath
+    FillPath
+    SelectClipPath
+    SelectClipRgn
+DEOF
+cat > "$out/desktop_gp.def" <<'DEOF'
+LIBRARY gdiplus
+EXPORTS
+    GdiplusStartup
+    GdipCreateFromHDC
+    GdipCreateSolidFill
+    GdipFillRectangleI
+    GdipCreateBitmapFromScan0
+    GdipDrawImageI
+    GdipScaleTransform
+    GdipResetTransform
+DEOF
+cat > "$out/desktop_msimg.def" <<'DEOF'
+LIBRARY msimg32
+EXPORTS
+    AlphaBlend
+    GradientFill
+DEOF
+rm -f "$out/desktop_u.lib" "$out/desktop_g.lib" "$out/desktop_gp.lib" \
+      "$out/desktop_msimg.lib"
+"$LLD_LINK" /lib /def:"$out/desktop_u.def" /out:"$out/desktop_u.lib" /machine:x64 /noentry
+"$LLD_LINK" /lib /def:"$out/desktop_g.def" /out:"$out/desktop_g.lib" /machine:x64 /noentry
+"$LLD_LINK" /lib /def:"$out/desktop_gp.def" /out:"$out/desktop_gp.lib" /machine:x64 /noentry
+"$LLD_LINK" /lib /def:"$out/desktop_msimg.def" /out:"$out/desktop_msimg.lib" /machine:x64 /noentry
+"$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c tests/guest_desktop.c -o "$out/guest_desktop.obj"
+"$LLD_LINK" "$out/guest_desktop.obj" "$out/desktop_u.lib" "$out/desktop_g.lib" \
+  "$out/desktop_gp.lib" "$out/desktop_msimg.lib" "$out/kernel32.lib" \
+  /NODEFAULTLIB /ENTRY:desktop_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
+  /DYNAMICBASE /BASE:0x2C00000 /OUT:"$out/guest_desktop.exe"
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_desktop_paint.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_desktop_paint"
+"$out/test_desktop_paint" "$out/guest_desktop.exe"
+
 # --- 14. dsound: DirectSound -> console sink (M6 coverage) ------------------
 rm -f "$out/dsound.lib"
 "$LLD_LINK" /lib /def:src/guest/dsound.def /out:"$out/dsound.lib" /machine:x64 /noentry
@@ -830,6 +912,21 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   -o "$out/test_membudget"
 "$out/test_membudget"
 
+# --- 41a. 32 MB ESRAM acceleration & memory tiering for Xbox One / One S ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_esram.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_esram"
+"$out/test_esram"
+
+# --- 41a2. last-gen console profile + D3D11 feature-level clamp -----------
+# One-family hardware is not reachable from this gate; the family table,
+# budgets, ESRAM ledger and the levels swapchain_create() requests are.
+clang++ -std=c++20 -O2 -Wall -no-pie -Isrc/host \
+  tests/test_console_profile.cpp src/host/console_detect.cpp \
+  src/host/settings.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_console_profile"
+"$out/test_console_profile"
+
 # --- 41b. file-backed read-only views: MapViewOfFile over a real archive
 #          maps the page cache (address space, NOT the 5 GB commit ledger) so
 #          the SSD and RAM overlap; write/COW views, views past EOF and
@@ -1059,3 +1156,14 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   tests/test_winmm_midi.cpp "$out/libtrt.a" -lpthread \
   -o "$out/test_winmm_midi"
 "$out/test_winmm_midi"
+
+# --- activation contexts + .lnk reader (mapped from DesktopMode_uwp, MIT) -----
+clang++ -std=c++17 -O2 -Wall -no-pie -Isrc/trt tests/test_actctx.cpp \
+  -o "$out/test_actctx"
+"$out/test_actctx"
+
+# --- version.dll bridge (GetFileVersionInfo*/VerQueryValue*; mapped from
+#     DesktopMode_uwp VersionShims, MIT) --------------------------------------
+clang++ -std=c++17 -O2 -Wall -no-pie -Isrc/trt tests/test_version.cpp \
+  -o "$out/test_version"
+"$out/test_version" corpus-local/botw-native/BotW-Native-Setup.exe

@@ -35,7 +35,8 @@ void trt_input_set_cursor_pos(int x, int y);
 void trt_input_set_clip_rect(bool enable, i32 left, i32 top, i32 right, i32 bottom);
 bool trt_input_get_clip_rect(i32* left, i32* top, i32* right, i32* bottom);
 void trt_input_mouse_delta_raw(i32 dx, i32 dy);        // REAL mouse deltas (MouseDevice)
-void trt_input_mouse_button(int btn /*0=L 1=R 2=M 3=X1 4=X2*/, bool down);
+// Returns true when the event changes the button state.
+bool trt_input_mouse_button(int btn /*0=L 1=R 2=M 3=X1 4=X2*/, bool down);
 void trt_input_wheel(i32 delta);
 void trt_input_pad_state(i16 lx, i16 ly, i16 rx, i16 ry,
                          u16 buttons /*XINPUT_GAMEPAD_* bits*/,
@@ -73,11 +74,13 @@ void  trt_pad_set_vibration(u32 index, u16 left_motor, u16 right_motor);
 bool  trt_pad_get_vibration(u32 index, u16* left_motor, u16* right_motor);
 int   trt_display_size(int* w, int* h);
 u16   trt_key_scan(u16 vk);                            // last scan code per VK
+void  trt_input_copy_dik_state(u8 out[256]);
 
 // raw input (the layer most PC engines actually read)
 bool trt_raw_register(const void* devices, u32 count); // RAWINPUTDEVICE[]
 // hRawInput handles handed out through WM_INPUT lparams
 bool trt_raw_copy(u64 handle, u8 out[48], u32* size);
+u64 trt_raw_target_window(u64 handle);
 u32 trt_raw_read_buffer(void* out, u32* size);
 
 // ---- message queue ----

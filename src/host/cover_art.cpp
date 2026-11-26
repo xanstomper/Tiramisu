@@ -164,6 +164,37 @@ bool http_get_text(const std::string& url, std::string* out) {
   }
 }
 
+// A store search for a generic folder name ("hermes") returns whatever Steam
+// ranks first (Hello Kitty Island Adventure, in the case that motivated this).
+// Only accept a candidate whose name shares a word of 3+ characters with the
+// query, so sideloaded/unknown folders keep a placeholder instead of wrong art.
+static bool cover_name_matches(const std::string& query,
+                               const std::string& candidate) {
+  auto lower = [](std::string s) {
+    for (char& c : s) c = (char)tolower((unsigned char)c);
+    return s;
+  };
+  auto alnum = [](char c) { return isalnum((unsigned char)c) != 0; };
+  const std::string q = lower(query), c = lower(candidate);
+  size_t i = 0;
+  while (i < q.size()) {
+    while (i < q.size() && !alnum(q[i])) ++i;
+    const size_t s = i;
+    while (i < q.size() && alnum(q[i])) ++i;
+    if (i - s < 3) continue;
+    const std::string tok = q.substr(s, i - s);
+    size_t p = 0;
+    while ((p = c.find(tok, p)) != std::string::npos) {
+      const bool left_ok = p == 0 || !alnum(c[p - 1]);
+      const size_t e = p + tok.size();
+      const bool right_ok = e >= c.size() || !alnum(c[e]);
+      if (left_ok && right_ok) return true;
+      p = e;
+    }
+  }
+  return false;
+}
+
 std::string clean_search_name(const std::string& raw) {
   std::string s = raw;
   // Strip staging prefixes like "stage-" or "test-"
@@ -304,8 +335,15 @@ void cover_worker_loop() {
               winrt::hstring(u8to16(resp)));
           if (j.HasKey(L"items")) {
             auto arr = j.GetNamedArray(L"items");
-            if (arr.Size() > 0) {
-              auto it0 = arr.GetObjectAt(0);
+            const uint32_t limit = arr.Size() < 5 ? arr.Size() : 5;
+            for (uint32_t ai = 0; ai < limit; ++ai) {
+              auto it0 = arr.GetObjectAt(ai);
+              std::string cand;
+              if (it0.HasKey(L"name")) {
+                cand = u16to8(
+                    std::wstring(it0.GetNamedString(L"name").c_str()));
+              }
+              if (!cover_name_matches(job.game_name, cand)) continue;
               if (it0.HasKey(L"id")) {
                 resolved_id = (uint32_t)it0.GetNamedNumber(L"id");
               }
@@ -313,6 +351,7 @@ void cover_worker_loop() {
                 fallback_img_url = u16to8(
                     std::wstring(it0.GetNamedString(L"tiny_image").c_str()));
               }
+              break;
             }
           }
         } catch (...) {

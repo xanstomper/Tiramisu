@@ -97,6 +97,11 @@ int TRT_GUEST_ABI trt_SteamAPI_InitFlat(char* out_err_msg) {
   if (out_err_msg) out_err_msg[0] = 0;
   return 0;  // k_ESteamAPIInitResult_OK
 }
+int TRT_GUEST_ABI trt_SteamAPI_InitSafe(void) { return trt_SteamAPI_Init(); }
+u32 TRT_GUEST_ABI trt_Steam_GetHSteamUserCurrent(void) { return trt_SteamAPI_GetHSteamUser(); }
+int TRT_GUEST_ABI trt_Steam_RegisterInterfaceFuncs(void*, void*) { return 1; }
+void TRT_GUEST_ABI trt_Steam_RunCallbacks(void) { trt_SteamAPI_RunCallbacks(); }
+const char* TRT_GUEST_ABI trt_SteamAPI_GetSteamInstallPath(void) { return "C:\\Program Files (x86)\\Steam"; }
 void TRT_GUEST_ABI trt_SteamAPI_Shutdown(void) { g_initialized = 0; }
 void trt_steam_set_appid(u32 app_id) { g_app_id = app_id; }
 
@@ -3176,6 +3181,23 @@ int trt_bridge_register_steam(void) {
        (void*)&trt_SteamAPI_ISteamApps_GetCurrentGameLanguage},
       {"SteamAPI_ISteamUtils_GetAppID",
        (void*)&trt_SteamAPI_ISteamUtils_GetAppID},
+      {"SteamAPI_InitSafe", (void*)&trt_SteamAPI_InitSafe},
+      {"Steam_GetHSteamUserCurrent", (void*)&trt_Steam_GetHSteamUserCurrent},
+      {"Steam_RegisterInterfaceFuncs", (void*)&trt_Steam_RegisterInterfaceFuncs},
+      {"SteamAPI_GetSteamInstallPath", (void*)&trt_SteamAPI_GetSteamInstallPath},
+      {"Steam_RunCallbacks", (void*)&trt_Steam_RunCallbacks},
+      {"SteamAPI_SetTryCatchCallbacks", (void*)&steam_noop_zero},
+      {"SteamAPI_UseBreakpadCrashHandler", (void*)&steam_noop_zero},
+      {"SteamAPI_SetBreakpadAppID", (void*)&trt_steam_set_appid},
+      {"SteamAPI_SetMiniDumpComment", (void*)&steam_noop_zero},
+      {"SteamAPI_WriteMiniDump", (void*)&steam_noop_zero},
+      {"SteamGameServer_InitSafe", (void*)&trt_SteamAPI_InitSafe},
+      {"SteamGameServer_GetHSteamPipe", (void*)&trt_SteamAPI_GetHSteamPipe},
+      {"SteamGameServer_GetHSteamUser", (void*)&trt_SteamAPI_GetHSteamUser},
+      {"SteamGameServer_RunCallbacks", (void*)&steam_noop_zero},
+      {"SteamGameServer_Shutdown", (void*)&steam_noop_zero},
+      {"SteamGameServer_GetSteamID", (void*)&trt_SteamAPI_GetSteamID},
+      {"SteamGameServer_BSecure", (void*)&trt_SteamAPI_InitSafe},
   };
   static trt_named_fn g_all_fns[2048];
   int n = 0;

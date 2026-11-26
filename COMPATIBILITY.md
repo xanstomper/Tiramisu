@@ -82,6 +82,56 @@
   the faulting context without advancing PC.
 - **Gaps:** EH livelock root cause (Python signal handler restart semantics).
 
+## Verified desktop applications
+
+Non-game Win32 programs use a different surface than game engines: ANSI string
+APIs, common dialogs, window icons, GDI text metrics, a message loop and no
+D3D. They are measured on the same ladder.
+
+### PuTTY 0.83 (Win32 GUI terminal, x64)
+- **Status:** Tier A [offline] — full boot ladder, unverified on Xbox
+- **Depth:** CRT ✓ WINMAIN ✓ WINDOW ✓ D3D11 – PUMP ✓ QUIT ✓ EXIT(0) ✓ (8 messages)
+- **Notes:** First non-game desktop app in the corpus. It immediately exposed a
+  host-side crash in `LoadImageA`: a `MAKEINTRESOURCE` atom (0xc8) was logged
+  with `%s`, so the host read address 0xc8. Fixed with `name_or_id()` in
+  `bridge_user32.cpp`; `LoadImageA` now returns real stock icon/cursor handles.
+  PuTTY then boots to its own `ExitProcess(0)`.
+- **Gaps:** PuTTY's window is created and receives the paint cycle, but it only
+  paints a terminal once a session connects, so the offline run shows one
+  font-probe cell rather than a terminal screen. Menus and common dialogs are
+  record handles / honest failures; no printing (winspool is a named stub).
+
+### Desktop paint path (offline gate)
+- **Status:** Tier A [offline] — `tests/test_desktop_paint.cpp`
+- **Depth:** RegisterClassEx ✓ CreateWindowEx ✓ WM_MOVE/SIZE/PAINT ✓ BeginPaint ✓
+  PatBlt ✓ TextOutA ✓ Rectangle ✓ EndPaint ✓ pixels-on-surface ✓
+- **Notes:** A desktop-shaped guest PE runs the whole path and the host counts
+  the pixels: 640x400 white client area, black text, green box. The window's DC
+  surface (`src/trt/gdi_raster.cpp`) is a real 32-bit raster with a clip
+  rectangle and an embedded 8x16 coverage font, dumped as a BMP for inspection.
+  Surfaces are sized to the window's client area (the dump is 640x400, not
+  display-sized), and GetClientRect/BeginPaint report that same rect.
+- **Depth now includes:** GDI+ (Graphics from HDC/HWND, ARGB brushes/pens with
+  real blending, fill/draw rectangle/ellipse/line/polygon/arc/pie, path
+  display lists, bitmaps from Scan0 + scaled DrawImage, DrawString/MeasureString
+  at the requested em size), msimg32 AlphaBlend/TransparentBlt/GradientFill,
+  RoundRect with elliptical corners and Arc/Pie/Chord, ScrollWindowEx pixel
+  scrolling, a real update region (InvalidateRect/GetUpdateRect/ValidateRect
+  and BeginPaint's rcPaint), a full GDI+ affine world transform (translate /
+  scale / rotate / matrix objects / invert, applied vertex by vertex, with
+  glyph and bitmap placement at the transformed origin or box), GDI path
+  recording (BeginPath records
+  Rectangle/Ellipse/RoundRect/Polygon/Arc/Pie/Chord/Polyline/Bezier geometry,
+  then FillPath/StrokePath/StrokeAndFillPath replay it with the ALTERNATE or
+  WINDING fill rule, GetPath reports the vertices, SelectClipPath turns a path
+  into a per-pixel clip), and ASCII+Latin-1 text coverage. Named limits: no anti-aliasing,
+  translate-only transforms, AC_SRC_ALPHA falls back to the constant alpha,
+  GRADIENT_FILL_TRIANGLE is a named FALSE, code points above U+00FF draw a
+  hollow box, rotated/skewed bitmaps draw their transformed bounding box,
+  glyph scaling under a transform is placement-only, WidenPath is a named FALSE, SelectClipPath supports RGN_AND and
+  RGN_COPY only (OR/XOR/DIFF are named FALSE), PathToRegion answers with the
+  path's bounding box.
+
 ## Corpus load matrix (DLLs that map + seal cleanly)
 | PE | Status |
 |----|--------|
@@ -122,8 +172,12 @@ the corpus and maps+seals+boots.
 | Denuvo multiplayer | Various | DRM bypass prohibited |
 | JIT without W^X | Mono/IL2CPP (if W^X denied) | OS policy, not code |
 | Memory pressure | Cyberpunk-class (>5GB) | Console RAM cap |
-| 32-bit x86 | Legacy titles | License decision pending |
 | OpenGL-only | GL-only engines | Cut from scope (no corpus demand) |
+
+**Experimental:** 32-bit x86 (PE32) executes through the in-tree x86-32 JIT and
+is staged by `tools/game-stage.py`, but it is not a supported target until a
+real 32-bit title produces a console completion artifact. The old licensing
+decision block no longer applies.
 
 ## How to add a game
 1. Drop the game folder into `corpus-local/<name>/`

@@ -52,7 +52,7 @@ void* linux_alloc(size_t bytes, u64 preferred_base) {
   }
   void* p = mmap(preferred_base ? (void*)(uintptr_t)preferred_base : nullptr,
                  bytes, PROT_READ | PROT_WRITE,
-                 preferred_base ? (MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS)
+                 preferred_base ? (MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS)
                                 : (MAP_PRIVATE | MAP_ANONYMOUS),
                  -1, 0);
   if (p == MAP_FAILED) return nullptr;
@@ -179,7 +179,7 @@ int failures = 0;
 
 int main(int argc, char** argv) {
   if (argc < 3) {
-    printf("usage: test_libload <guest.exe> <search_dir>\n");
+    printf("usage: test_libload <guest.exe> <search_dir> [content_root]\n");
     return 2;
   }
 
@@ -188,6 +188,7 @@ int main(int argc, char** argv) {
 
   // the runtime knows where the game's own DLLs live
   trt_runtime_init(&be, argv[2]);
+  if (argc > 3) trt_runtime_set_content_root(argv[3]);
   trt_bridge_boot(&be);
   trt_bridge_register_kernel32();
   trt_bridge_register_user32();

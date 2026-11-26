@@ -47,6 +47,7 @@ extern "C" int trt_mem_budget_charge_file_view(u64 bytes);
 extern "C" void trt_mem_budget_discharge_file_view(u64 bytes);
 // host descriptor + size behind a guest file handle (bridge_kernel32.cpp)
 extern "C" int trt_file_host_fd(void* handle, u64* size_out);
+extern "C" const char* trt_file_vpath(void* h);
 
 namespace {
 
@@ -502,11 +503,12 @@ u64 create_mapping_common(u64 hfile, u32 protect, u64 max_size,
   }
   trt_SetLastError(0);
 
-  char line[192];
+  char line[256];
+  const char* vp = trt_file_vpath((void*)(uintptr_t)hfile);
   snprintf(line, sizeof(line),
-           "trt: CreateFileMapping%s(hfile=%p) streaming size=%llu",
+           "trt: CreateFileMapping%s(hfile=%p '%s') streaming size=%llu",
            norm_name.empty() ? "" : "Named",
-           (void*)(uintptr_t)hfile, (unsigned long long)core->size);
+           (void*)(uintptr_t)hfile, vp ? vp : "", (unsigned long long)core->size);
   trt_core_log(line);
   return h;
 }
@@ -872,6 +874,12 @@ int TRT_STDCALL trt_VirtualProtect(void* addr, u64 size, u32 new_protect,
   unsigned prot = 0;
   u32 old_code = 0x04;
   win32_prot_to_trt(new_protect, &prot, &old_code);
+  if (new_protect == 0x04u && size <= SIZE_MAX &&
+      trt_va_is_deferred_readwrite(addr, static_cast<size_t>(size))) {
+    if (old_protect) *old_protect = 0x04u;
+    return 1;
+  }
+  if (!trt_va_prepare_data_range(addr, static_cast<size_t>(size))) return 0;
   const int rc = be->protect((void*)page, aligned, prot);
   if (rc != 0) {
     // W^X two-phase JIT fallback: when host denies RWX (0x40/0x80), arm as RW

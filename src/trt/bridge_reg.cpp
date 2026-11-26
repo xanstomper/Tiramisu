@@ -27,6 +27,7 @@ constexpr int REG_SUCCESS = 0;
 constexpr int REG_ERROR_FILE_NOT_FOUND = 2;
 constexpr int REG_ERROR_ACCESS_DENIED = 5;
 constexpr int REG_ERROR_INVALID_HANDLE = 6;
+constexpr int REG_ERROR_NOT_ENOUGH_MEMORY = 8;
 constexpr int REG_ERROR_NO_MORE_ITEMS = 259;
 constexpr int REG_ERROR_MORE_DATA = 234;
 
@@ -145,8 +146,13 @@ reg_key* open_path(reg_key* root, const char* path, bool create) {
 }
 
 reg_key* root_for_handle(u64 h) {
-  for (int i = 0; i < 5; ++i)
-    if (h == g_root_handles[i]) return &g_roots[i];
+  // Win64 predefined HKEYs are signed LONG constants widened to pointers.
+  // Also accept the zero-extended form used by 32-bit guests.
+  for (int i = 0; i < 5; ++i) {
+    const u64 root = g_root_handles[i];
+    if (h == root || h == (0xffffffff00000000ULL | root))
+      return &g_roots[i];
+  }
   return nullptr;
 }
 
@@ -158,18 +164,12 @@ reg_key* key_for_handle(u64 h) {
   return nullptr;
 }
 
-u64 handle_for_key(reg_key* key) {
-  if (!key) return 0;
-  for (int i = 0; i < 5; ++i)
-    if (key == &g_roots[i]) return g_root_handles[i];
-  for (u32 i = 0; i < g_handle_count; ++i)
-    if (g_open_keys[i] == key) return REG_FIRST_HANDLE + i;
-  if (g_handle_count >= REG_MAX_HANDLES) return 0;
-  g_open_keys[g_handle_count] = key;
-  return REG_FIRST_HANDLE + g_handle_count++;
-}
-
 u64 allocate_handle(reg_key* key) {
+  for (u32 i = 0; i < g_handle_count; ++i) {
+    if (g_open_keys[i]) continue;
+    g_open_keys[i] = key;
+    return REG_FIRST_HANDLE + i;
+  }
   if (g_handle_count >= REG_MAX_HANDLES) return 0;
   g_open_keys[g_handle_count] = key;
   return REG_FIRST_HANDLE + g_handle_count++;
@@ -376,14 +376,16 @@ void load_hive() {
     const u32 type = (u32)strtoul(type_s, nullptr, 10);
     u8 buf[2048];
     u32 size = 0;
-    if (type == TRT_REG_DWORD) {
-      const u32 n32 = (u32)strtoul(data_s, nullptr, 10);
-      memcpy(buf, &n32, 4);
-      size = 4;
-    } else if (type == TRT_REG_QWORD) {
-      const u64 n64 = strtoull(data_s, nullptr, 10);
-      memcpy(buf, &n64, 8);
-      size = 8;
+    const size_t numeric_size = type == TRT_REG_DWORD ? sizeof(u32)
+                              : type == TRT_REG_QWORD ? sizeof(u64) : 0;
+    // write_hive stores numeric values as little-endian hex bytes too.
+    // Continue accepting older decimal entries without the full hex width.
+    if (numeric_size && strlen(data_s) != numeric_size * 2) {
+      char* end = nullptr;
+      const u64 number = strtoull(data_s, &end, 10);
+      if (end == data_s || *end != '\0') continue;
+      size = static_cast<u32>(numeric_size);
+      memcpy(buf, &number, size);
     } else if (!hex_decode(data_s, buf, sizeof(buf), &size)) {
       continue;
     }
@@ -442,7 +444,9 @@ int TRT_GUEST_ABI trt_RegOpenKeyExW(u64 hkey, const u16* subkey, u32 options,
     // Wine/Windows: opening a missing key with KEY_WOW64_* etc. still fails
     return REG_ERROR_FILE_NOT_FOUND;
   }
-  *out = (void*)handle_for_key(key);
+  const u64 handle = allocate_handle(key);
+  if (!handle) return REG_ERROR_NOT_ENOUGH_MEMORY;
+  *out = reinterpret_cast<void*>(static_cast<uintptr_t>(handle));
   return REG_SUCCESS;
 }
 
@@ -455,7 +459,14 @@ int TRT_GUEST_ABI trt_RegCreateKeyExW(u64 hkey, const u16* subkey, u32 reserved,
   if (!root || !out) return REG_ERROR_INVALID_HANDLE;
   char path[256];
   reg_to_utf8(subkey, path, sizeof(path));
-  reg_key* existing = path[0] ? open_path(root, path, false) : nullptr;
+  if (g_handle_count == REG_MAX_HANDLES) {
+    bool has_free_slot = false;
+    for (u32 i = 0; i < g_handle_count; ++i) {
+      if (!g_open_keys[i]) { has_free_slot = true; break; }
+    }
+    if (!has_free_slot) return REG_ERROR_NOT_ENOUGH_MEMORY;
+  }
+  reg_key* existing = path[0] ? open_path(root, path, false) : root;
   reg_key* key = existing;
   if (!key) {
     key = open_path(root, path, true);
@@ -465,14 +476,15 @@ int TRT_GUEST_ABI trt_RegCreateKeyExW(u64 hkey, const u16* subkey, u32 reserved,
   } else if (disposition) {
     *disposition = 2;  // REG_OPENED_EXISTING_KEY
   }
-  *out = (void*)handle_for_key(key);
+  const u64 handle = allocate_handle(key);
+  if (!handle) return REG_ERROR_NOT_ENOUGH_MEMORY;
+  *out = reinterpret_cast<void*>(static_cast<uintptr_t>(handle));
   write_hive();
   return REG_SUCCESS;
 }
 
 int TRT_GUEST_ABI trt_RegQueryValueExW(u64 hkey, const u16* name, u32* reserved,
-                                       u32* type, u8* data, u32 cbData,
-                                       u32* cbDataOut) {
+                                       u32* type, u8* data, u32* lpcbData) {
   (void)reserved;
   load_hive();
   reg_key* key = key_for_handle(hkey);
@@ -486,9 +498,10 @@ int TRT_GUEST_ABI trt_RegQueryValueExW(u64 hkey, const u16* name, u32* reserved,
   reg_value* v = find_value(key, vname);
   if (!v) { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: RegQueryValueExW -> name=\"%.64s\" value=NULL (not found)", vname); trt_core_log(st_line); return REG_ERROR_FILE_NOT_FOUND; }
   if (type) *type = v->type;
-  if (cbDataOut) *cbDataOut = v->size;
+  const u32 capacity = lpcbData && data ? *lpcbData : 0;
+  if (lpcbData) *lpcbData = v->size;
   if (!data) return REG_SUCCESS;
-  if (cbData < v->size) return REG_ERROR_MORE_DATA;
+  if (capacity < v->size) return REG_ERROR_MORE_DATA;
   memcpy(data, v->data, v->size);
   { char st_tmp[136]; char st_line[256]; if (v->type == TRT_REG_SZ || v->type == TRT_REG_EXPAND_SZ) { const u16* st_w = (const u16*)v->data; size_t st_n = v->size / 2; if (st_n > 132) st_n = 132; size_t st_i = 0; for (; st_i < st_n && st_w[st_i]; ++st_i) st_tmp[st_i] = (char)(st_w[st_i] & 0x7f); st_tmp[st_i] = 0; snprintf(st_line, sizeof(st_line), "strtrace: RegQueryValueExW -> name=\"%.64s\" type=%u value=\"%.128s\"", vname, v->type, st_tmp); } else { snprintf(st_line, sizeof(st_line), "strtrace: RegQueryValueExW -> name=\"%.64s\" type=%u size=%u (non-string)", vname, v->type, v->size); } trt_core_log(st_line); }
   return REG_SUCCESS;
@@ -600,7 +613,7 @@ int TRT_GUEST_ABI trt_RegOpenCurrentUser(u32 sam, u64* phk) {
   if (!phk) return 87;
   load_hive();
   *phk = allocate_handle(&g_roots[1]);  // HKCU
-  return *phk ? REG_SUCCESS : 8;
+  return *phk ? REG_SUCCESS : REG_ERROR_NOT_ENOUGH_MEMORY;
 }
 
 int TRT_GUEST_ABI trt_RegConnectRegistryW(const u16* machine, u64 hkey, u64* phk) {
@@ -610,7 +623,7 @@ int TRT_GUEST_ABI trt_RegConnectRegistryW(const u16* machine, u64 hkey, u64* phk
   reg_key* k = key_for_handle(hkey);
   if (!k) return REG_ERROR_INVALID_HANDLE;
   *phk = allocate_handle(k);
-  return *phk ? REG_SUCCESS : 8;
+  return *phk ? REG_SUCCESS : REG_ERROR_NOT_ENOUGH_MEMORY;
 }
 
 int TRT_GUEST_ABI trt_RegSaveKeyW(u64 hkey, const u16* file, void* sa) {
@@ -623,14 +636,14 @@ int TRT_GUEST_ABI trt_RegLoadKeyW(u64 hkey, const u16* subkey, const u16* file) 
 }
 
 int TRT_GUEST_ABI trt_RegCloseKey(u64 hkey) {
-  if (hkey >= REG_FIRST_HANDLE && hkey < REG_FIRST_HANDLE + REG_MAX_HANDLES) {
-    const u32 idx = (u32)(hkey - REG_FIRST_HANDLE);
-    if (idx < g_handle_count) g_open_keys[idx] = nullptr;
-    return REG_SUCCESS;
-  }
+  if (root_for_handle(hkey)) return REG_SUCCESS;
+  if (hkey < REG_FIRST_HANDLE || hkey - REG_FIRST_HANDLE >= g_handle_count)
+    return REG_ERROR_INVALID_HANDLE;
+  reg_key*& slot = g_open_keys[hkey - REG_FIRST_HANDLE];
+  if (!slot) return REG_ERROR_INVALID_HANDLE;
+  slot = nullptr;
   return REG_SUCCESS;
 }
-
 int TRT_GUEST_ABI trt_RegEnumKeyExW(u64 hkey, u32 index, u16* name,
                                      u32 cchMax, u32* reserved,
                                      u32* lpcchName, u32* last_write) {

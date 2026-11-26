@@ -6,6 +6,9 @@
 // device list, clipboard, keyboard layout/translation, cursor/icon records,
 // window properties, touch/pointer stubs, menus, paint/rect helpers, DPI
 // awareness, and ANSI/Wide wrappers.
+#include "bridge_gdi.h"
+#include "bridge_user32.h"
+#include "gdi_raster.h"
 #include "thunk.h"
 #include "trt.h"
 #include "pe.h"
@@ -17,7 +20,10 @@
 #include <string.h>
 
 #include <array>
+#include <atomic>
 #include <mutex>
+#include <string>
+#include <vector>
 #include <unordered_map>
 
 namespace u32gap {
@@ -27,15 +33,6 @@ void line(const char* s) { trt_core_log(s); }
 
 namespace {
 
-struct gap_window {
-  u64 handle;
-  u64 class_atom;
-  i64 proc;
-  wchar_t title[64];
-};
-
-extern "C" gap_window* trt_u32_windows(void);
-extern "C" int* trt_u32_win_count(void);
 extern "C" void TRT_STDCALL trt_SetLastError(u32 e);
 extern "C" u16 TRT_STDCALL trt_RegisterClassExW(const void* wcx);
 extern "C" void* TRT_STDCALL trt_CreateWindowExW(u32 exstyle,
@@ -49,6 +46,13 @@ extern "C" int TRT_STDCALL trt_PostMessageW(void* hwnd, u32 msg, u64 wp, i64 lp)
 extern "C" i64 TRT_STDCALL trt_DispatchMessageW(const void* m);
 extern "C" i64 TRT_STDCALL trt_SendMessageW(void* hwnd, u32 msg, u64 wp, i64 lp);
 extern "C" void* TRT_STDCALL trt_GetDC(void* hwnd);
+extern "C" int trt_user32_client_size(void* hwnd, i32* w, i32* h);
+extern "C" int trt_user32_window_rect(void* hwnd, i32* rect);
+extern "C" int TRT_STDCALL trt_SetWindowPos(void* hwnd, void* after, i32 x,
+                                          i32 y, i32 cx, i32 cy, u32 flags);
+extern "C" void trt_user32_invalidate(void* hwnd, const i32* rect);
+extern "C" int trt_user32_update_rect(void* hwnd, i32* rect);
+extern "C" void trt_user32_validate(void* hwnd, const i32* rect);
 extern "C" int TRT_STDCALL trt_ReleaseDC(void* hwnd, void* hdc);
 extern "C" int TRT_STDCALL trt_GetSystemMetrics(int idx);
 extern "C" u32 TRT_STDCALL trt_MapVirtualKeyW(u32 code, u32 type);
@@ -56,12 +60,6 @@ extern "C" u32 trt_vk_to_char_ex(u32 vk, const u8* ks);
 extern "C" i16 trt_char_to_vk_scan(u16 ch);
 extern "C" u32 TRT_STDCALL trt_WaitForMultipleObjects(u32 count,
     const u64* handles, int wait_all, u32 ms);
-
-gap_window* win_for(u64 hwnd) {
-  for (int i = 0; i < *trt_u32_win_count(); ++i)
-    if (trt_u32_windows()[i].handle == hwnd) return &trt_u32_windows()[i];
-  return nullptr;
-}
 
 // Per-window GWL_* / GWLP_* slot storage indexed directly by (k_slot_base + idx)
 // so GWLP_USERDATA (-21), GWL_EXSTYLE (-20), GWL_STYLE (-16), GWLP_ID (-12),
@@ -246,13 +244,7 @@ void* TRT_STDCALL trt_CreateWindowExA(u32 exstyle, const char* cls,
 
 // ---- Window Long / LongPtr ----
 i64 TRT_STDCALL trt_SetWindowLongPtrW(u64 hwnd, int idx, i64 value) {
-  if (idx == -4) {  // GWLP_WNDPROC
-    if (gap_window* w = win_for(hwnd)) {
-      const i64 old = w->proc;
-      w->proc = value;
-      return old;
-    }
-  }
+  if (idx == -4) return trt_user32_window_proc(hwnd, &value);
   void** slots = slots_for(hwnd);
   const int slot = k_slot_base + idx;
   if (slot < 0 || slot >= k_slot_count) return 0;
@@ -262,10 +254,7 @@ i64 TRT_STDCALL trt_SetWindowLongPtrW(u64 hwnd, int idx, i64 value) {
 }
 
 i64 TRT_STDCALL trt_GetWindowLongPtrW(u64 hwnd, int idx) {
-  if (idx == -4) {  // GWLP_WNDPROC
-    if (gap_window* w = win_for(hwnd)) return w->proc;
-    return 0;
-  }
+  if (idx == -4) return trt_user32_window_proc(hwnd, nullptr);
   void** slots = slots_for(hwnd);
   const int slot = k_slot_base + idx;
   if (slot < 0 || slot >= k_slot_count) return 0;
@@ -290,36 +279,28 @@ i32 TRT_STDCALL trt_SetWindowLongA(u64 hwnd, int idx, i32 value) {
 
 // ---- Window Text ----
 int TRT_STDCALL trt_GetWindowTextW(u64 hwnd, u16* str, int maxCount) {
-  if (!str || maxCount <= 0) return 0;
-  gap_window* w = win_for(hwnd);
-  if (!w) { str[0] = 0; return 0; }
-  int i = 0;
-  for (; w->title[i] && i < maxCount - 1; ++i) str[i] = (u16)w->title[i];
-  str[i] = 0;
-  return i;
+  return str && maxCount > 0 ? trt_user32_window_title(hwnd, str, maxCount) : 0;
 }
 int TRT_STDCALL trt_GetWindowTextA(u64 hwnd, char* str, int maxCount) {
   if (!str || maxCount <= 0) return 0;
-  gap_window* w = win_for(hwnd);
-  if (!w) { str[0] = 0; return 0; }
-  int i = 0;
-  for (; w->title[i] && i < maxCount - 1; ++i) str[i] = (char)w->title[i];
-  str[i] = 0;
-  return i;
+  u16 title[64];
+  const int length = trt_user32_window_title(hwnd, title, maxCount < 64 ? maxCount : 64);
+  for (int i = 0; i < length; ++i) str[i] = static_cast<char>(title[i]);
+  str[length] = 0;
+  return length;
 }
 int TRT_STDCALL trt_GetWindowTextLengthW(u64 hwnd) {
-  gap_window* w = win_for(hwnd);
-  if (!w) return 0;
-  int i = 0;
-  while (w->title[i]) ++i;
-  return i;
+  return trt_user32_window_title(hwnd, nullptr, 0);
 }
 int TRT_STDCALL trt_GetWindowTextLengthA(u64 hwnd) {
   return trt_GetWindowTextLengthW(hwnd);
 }
+extern i64 TRT_STDCALL trt_SetWindowTextW(void* hwnd, const u16* text);
 int TRT_STDCALL trt_SetWindowTextA(void* hwnd, const char* text) {
-  (void)hwnd; (void)text;
-  return 1;
+  u16 title[64] = {};
+  for (int i = 0; text && i < 63 && text[i]; ++i)
+    title[i] = static_cast<u8>(text[i]);
+  return static_cast<int>(trt_SetWindowTextW(hwnd, title));
 }
 
 // ---- Monitor & Display Enumeration (1920x1080@60Hz Primary Monitor) ----
@@ -530,18 +511,22 @@ i32 TRT_STDCALL trt_DisplayConfigGetDeviceInfo(void* requestPacket) {
 
 // ---- Raw Input extensions ----
 u32 TRT_STDCALL trt_GetRawInputDeviceList(void* list, u32* numDevices, u32 cbSize) {
-  if (!numDevices || cbSize != 24) return (u32)-1;
-  // Report 2 raw input devices (mouse + keyboard)
+  struct rid_list { u64 hDevice; u32 dwType; u32 _pad; };
+  static_assert(sizeof(rid_list) == 16, "RAWINPUTDEVICELIST Win64 layout");
+  if (!numDevices || cbSize != sizeof(rid_list)) {
+    trt_SetLastError(87);  // ERROR_INVALID_PARAMETER
+    return (u32)-1;
+  }
+  // Report the synthetic devices backed by Tiramisu's keyboard and pointer path.
   if (!list) {
     *numDevices = 2;
     return 0;
   }
   if (*numDevices < 2) {
     *numDevices = 2;
-    trt_SetLastError(122);
+    trt_SetLastError(122);  // ERROR_INSUFFICIENT_BUFFER
     return (u32)-1;
   }
-  struct rid_list { u64 hDevice; u32 dwType; u32 _pad; };
   rid_list* out = (rid_list*)list;
   out[0] = {0x00060001ULL, 0 /*RIM_TYPEMOUSE*/, 0};
   out[1] = {0x00060002ULL, 1 /*RIM_TYPEKEYBOARD*/, 0};
@@ -614,6 +599,15 @@ u32 TRT_STDCALL trt_GetRawInputBuffer(void* pData, u32* pcbSize, u32 cbSizeHeade
     return (u32)-1;
   }
   const u32 count = trt_raw_read_buffer(pData, pcbSize);
+  static std::atomic<unsigned> raw_buffer_calls{0};
+  const unsigned n = raw_buffer_calls.fetch_add(1, std::memory_order_relaxed);
+  if (n < 16 || count > 0) {
+    char line[144];
+    snprintf(line, sizeof(line),
+             "input: GetRawInputBuffer call=%u result=%u bytes=%u",
+             n + 1, count, *pcbSize);
+    trt_core_log(line);
+  }
   if (count == (u32)-1) trt_SetLastError(122);
   return count;
 }
@@ -647,8 +641,8 @@ int TRT_STDCALL trt_MapWindowPoints(void* hWndFrom, void* hWndTo, void* lpPoints
   return 0;
 }
 int TRT_STDCALL trt_GetWindowRect(void* hwnd, void* lpRect) {
-  (void)hwnd;
   if (!lpRect) return 0;
+  if (trt_user32_window_rect(hwnd, static_cast<i32*>(lpRect))) return 1;
   int w = 1920, h = 1080;
   trt_display_size(&w, &h);
   rect_i32* r = (rect_i32*)lpRect;
@@ -1420,11 +1414,12 @@ int TRT_STDCALL trt_GetUserObjectInformationA(void* hObj, int nIndex, void* pvIn
 
 // ---- Rect, Paint & DC helpers ----
 int TRT_STDCALL trt_InvalidateRect(u64 hwnd, const void* rect, int erase) {
-  (void)hwnd; (void)rect; (void)erase;
+  (void)erase;  // the window is repainted with its own background class
+  trt_user32_invalidate((void*)(uintptr_t)hwnd, (const i32*)rect);
   return 1;
 }
 int TRT_STDCALL trt_ValidateRect(void* hwnd, const void* lpRect) {
-  (void)hwnd; (void)lpRect;
+  trt_user32_validate(hwnd, (const i32*)lpRect);
   return 1;
 }
 int TRT_STDCALL trt_InvalidateRgn(void* hwnd, void* hRgn, int bErase) {
@@ -1443,12 +1438,28 @@ int TRT_STDCALL trt_RedrawWindow(void* hwnd, const void* lprcUpdate,
 void* TRT_STDCALL trt_BeginPaint(void* hwnd, void* lpPaint) {
   // PAINTSTRUCT on x64 (72 bytes): hdc(8), fErase(4), rcPaint(16), ...
   void* hdc = trt_GetDC(hwnd);
+  {
+    char line[96];
+    snprintf(line, sizeof(line), "user32: BeginPaint(hwnd=0x%llx) -> hdc=%p",
+             (unsigned long long)(uintptr_t)hwnd, hdc);
+    trt_core_log(line);
+  }
   if (lpPaint) {
     memset(lpPaint, 0, 72);
     *(void**)lpPaint = hdc;
     *(i32*)((u8*)lpPaint + 8) = 1;
     rect_i32* rc = (rect_i32*)((u8*)lpPaint + 12);
-    rc->l = 0; rc->t = 0; rc->r = 1920; rc->b = 1080;
+    // rcPaint is what the window actually owes a repaint to (the paint cycle
+    // invalidates the client, InvalidateRect can narrow it), else its client.
+    i32 cw = 1920, ch = 1080;
+    trt_user32_client_size(hwnd, &cw, &ch);
+    i32 upd[4] = {0, 0, cw, ch};
+    if (hwnd) trt_user32_update_rect(hwnd, upd);
+    rc->l = upd[0];
+    rc->t = upd[1];
+    rc->r = upd[2];
+    rc->b = upd[3];
+    if (hwnd) trt_user32_validate(hwnd, nullptr);  // BeginPaint consumes it
   }
   return hdc;
 }
@@ -1462,9 +1473,19 @@ void* TRT_STDCALL trt_GetDCEx(void* hwnd, void* hrgnClip, u32 flags) {
   return trt_GetDC(hwnd);
 }
 int TRT_STDCALL trt_GetUpdateRect(void* hwnd, void* lpRect, int bErase) {
-  (void)hwnd; (void)bErase;
-  if (lpRect) memset(lpRect, 0, 16);
-  return 0;
+  (void)bErase;
+  i32 rc[4] = {0, 0, 0, 0};
+  const int owed = hwnd ? trt_user32_update_rect(hwnd, rc) : 0;
+  if (!owed && hwnd) {
+    // No explicit invalidation: a window that owes a paint owes its client.
+    i32 cw = 0, ch = 0;
+    trt_user32_client_size(hwnd, &cw, &ch);
+    rc[0] = rc[1] = 0;
+    rc[2] = cw;
+    rc[3] = ch;
+  }
+  if (lpRect) memcpy(lpRect, rc, sizeof(rc));
+  return owed || hwnd ? 1 : 0;
 }
 int TRT_STDCALL trt_GetUpdateRgn(void* hwnd, void* hRgn, int bErase) {
   (void)hwnd; (void)hRgn; (void)bErase;
@@ -1474,20 +1495,74 @@ int TRT_STDCALL trt_LockWindowUpdate(void* hWndLock) { (void)hWndLock; return 1;
 int TRT_STDCALL trt_ScrollWindowEx(void* hWnd, int dx, int dy, const void* prcScroll,
                                    const void* prcClip, void* hrgnUpdate,
                                    void* prcUpdate, u32 flags) {
-  (void)hWnd; (void)dx; (void)dy; (void)prcScroll; (void)prcClip;
-  (void)hrgnUpdate; (void)prcUpdate; (void)flags;
+  // Real scroll: move the window DC's pixels, like GDI does before the app
+  // repaints the exposed strip. List panes that blit-and-shift depend on this.
+  (void)prcClip;
+  (void)hrgnUpdate;
+  (void)flags;
+  if (!hWnd) return 0;
+  void* hdc = trt_GetDC(hWnd);
+  if (!hdc) {
+    trt_core_log("user32: ScrollWindowEx -> no DC for the window (no scroll)");
+    return 0;
+  }
+  i32 l = 0, t = 0, r = 0, b = 0;
+  if (prcScroll) {
+    const i32* rc = (const i32*)prcScroll;
+    l = rc[0];
+    t = rc[1];
+    r = rc[2];
+    b = rc[3];
+  } else {
+    i32 cw = 0, ch = 0;
+    trt_user32_client_size(hWnd, &cw, &ch);
+    r = cw;
+    b = ch;
+  }
+  trt_raster::scroll(hdc, dx, dy, l, t, r, b);
+  trt_ReleaseDC(hWnd, hdc);
+  if (prcUpdate) {
+    // The strip that scrolling exposed is the update rectangle.
+    i32* rc = (i32*)prcUpdate;
+    if (prcScroll) {
+      const i32* s = (const i32*)prcScroll;
+      rc[0] = dx > 0 ? s[0] : (dx < 0 ? s[2] + dx : s[0]);
+      rc[1] = dy > 0 ? s[1] : (dy < 0 ? s[3] + dy : s[1]);
+      rc[2] = dx > 0 ? s[0] + dx : s[2];
+      rc[3] = dy > 0 ? s[1] + dy : s[3];
+    } else {
+      rc[0] = rc[1] = 0;
+      rc[2] = r;
+      rc[3] = b;
+    }
+  }
   return 1;
 }
+// FillRect/FrameRect/InvertRect are the rectangle primitives dialogs and
+// controls use to paint themselves; they take the brush as an argument instead
+// of a DC selection. They now write the DC's raster surface.
 int TRT_STDCALL trt_FillRect(void* hDC, const void* lprc, void* hbr) {
-  (void)hDC; (void)lprc; (void)hbr;
+  if (!hDC || !lprc) {
+    trt_core_log("user32: FillRect -> 0 (NULL DC or rect)");
+    return 0;
+  }
+  const i32* r = (const i32*)lprc;
+  if ((u32)(uintptr_t)hbr == 0x80000005u) return 1;  // NULL_BRUSH: nothing
+  trt_raster::fill(hDC, r[0], r[1], r[2], r[3], trt_gdi_brush_color(hbr));
   return 1;
 }
 int TRT_STDCALL trt_FrameRect(void* hDC, const void* lprc, void* hbr) {
-  (void)hDC; (void)lprc; (void)hbr;
+  if (!hDC || !lprc) return 0;
+  const i32* r = (const i32*)lprc;
+  if ((u32)(uintptr_t)hbr == 0x80000005u) return 1;
+  trt_raster::frame(hDC, r[0], r[1], r[2], r[3], trt_gdi_brush_color(hbr), 1);
   return 1;
 }
 int TRT_STDCALL trt_InvertRect(void* hDC, const void* lprc) {
-  (void)hDC; (void)lprc;
+  if (!hDC || !lprc) return 0;
+  const i32* r = (const i32*)lprc;
+  trt_raster::blit(hDC, r[0], r[1], r[2] - r[0], r[3] - r[1], hDC, r[0], r[1],
+                   0x00550009u /*DSTINVERT*/, 0);
   return 1;
 }
 int TRT_STDCALL trt_SetRect(void* lprc, int xLeft, int yTop, int xRight, int yBottom) {
@@ -1544,8 +1619,11 @@ int TRT_STDCALL trt_IsRectEmpty(const void* lprc) {
 
 int TRT_STDCALL trt_MoveWindow(u64 hwnd, int x, int y, int w, int h,
                                int repaint) {
-  (void)hwnd; (void)x; (void)y; (void)w; (void)h; (void)repaint;
-  return 1;
+  // Route the same move/resize through the window registry.
+  constexpr u32 no_zorder = 0x0004u, no_activate = 0x0010u, no_redraw = 0x0008u;
+  return trt_SetWindowPos(reinterpret_cast<void*>(static_cast<uintptr_t>(hwnd)),
+                         nullptr, x, y, w, h,
+                         no_zorder | no_activate | (repaint ? 0 : no_redraw));
 }
 
 // ---- DPI & System Parameters ----
@@ -1616,6 +1694,98 @@ void* TRT_STDCALL trt_GetSysColorBrush(int nIndex) {
 }
 
 // ---- Dialogs & MessageBox ----
+// DialogBoxParamW used to throw the template away, so an engine's own fatal
+// message (Unity's "Failed to initialize Direct3D", UE's "LowLevelFatalError")
+// never reached the log. These helpers read the DLGTEMPLATE the guest built and
+// name its caption and item text before the API returns IDCANCEL.
+static u16 rd16le(const u8* p) { return (u16)(p[0] | ((u16)p[1] << 8)); }
+static u32 rd32le(const u8* p) {
+  return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
+}
+static std::string u16_ascii(const u16* s, size_t max_chars) {
+  std::string out;
+  if (!s) return out;
+  for (size_t i = 0; i < max_chars && s[i]; ++i) {
+    const u16 c = s[i];
+    out.push_back(c < 0x20 ? ' ' : (c < 0x80 ? (char)c : '?'));
+  }
+  return out;
+}
+// One variable-length template string: 0x0000 = empty, 0xFFFF = ordinal in the
+// next word, otherwise a NUL-terminated UTF-16 string.
+static std::string dlg_field(const u8*& p, const u8* end) {
+  std::string out;
+  if (p + 2 > end) { p = end; return out; }
+  const u16 first = rd16le(p);
+  if (first == 0) { p += 2; return out; }
+  if (first == 0xFFFF) {
+    p += (p + 4 <= end) ? 4 : 2;
+    return "<ordinal>";
+  }
+  while (p + 2 <= end) {
+    const u16 c = rd16le(p);
+    p += 2;
+    if (!c) break;
+    out.push_back(c < 0x20 ? ' ' : (c < 0x80 ? (char)c : '?'));
+  }
+  return out;
+}
+static void dlg_align(const u8* base, const u8*& p, const u8* end) {
+  p += (size_t)(4 - ((size_t)(p - base) & 3)) & 3;
+  if (p > end) p = end;
+}
+static void log_dialog_template(const void* tmpl, const char* api) {
+  const u8* base = (const u8*)tmpl;
+  if (!base) {
+    char line[160];
+    snprintf(line, sizeof(line), "%s -> -1 (null template; no dialog host)", api);
+    LOG(line);
+    return;
+  }
+  const u8* end = base + (64u * 1024u);  // guard against a runaway walk
+  const u32 style = rd32le(base);
+  const u32 exstyle = rd32le(base + 4);
+  const u16 cdit = rd16le(base + 8);
+  const i16 x = (i16)rd16le(base + 10), y = (i16)rd16le(base + 12);
+  const i16 cx = (i16)rd16le(base + 14), cy = (i16)rd16le(base + 16);
+  const u8* p = base + 18;
+  const std::string menu = dlg_field(p, end);
+  const std::string cls = dlg_field(p, end);
+  const std::string title = dlg_field(p, end);
+  char head[640];
+  snprintf(head, sizeof(head),
+           "%s [%s] class=%s menu=%s items=%u style=0x%08x exstyle=0x%08x "
+           "size=%dx%d@%d,%d",
+           api, title.empty() ? "<no caption>" : title.c_str(),
+           cls.empty() ? "default" : cls.c_str(),
+           menu.empty() ? "none" : menu.c_str(), (unsigned)cdit, style, exstyle,
+           (int)cx, (int)cy, (int)x, (int)y);
+  LOG(head);
+  for (u16 i = 0; i < cdit && i < 32 && p + 18 <= end; ++i) {
+    const u32 istyle = rd32le(p);
+    const u16 iid = rd16le(p + 16);
+    p += 18;
+    const std::string icls = dlg_field(p, end);
+    const std::string itext = dlg_field(p, end);
+    u16 extra = 0;
+    if (p + 2 <= end) { extra = rd16le(p); p += 2; }
+    p += (p + extra <= end) ? extra : (size_t)(end - p);
+    dlg_align(base, p, end);
+    if (itext.empty()) continue;  // a control with no text has nothing to name
+    char line[640];
+    snprintf(line, sizeof(line), "%s item #%u (%s, style=0x%08x): %s", api,
+             (unsigned)iid, icls.empty() ? "default class" : icls.c_str(),
+             istyle, itext.c_str());
+    LOG(line);
+  }
+  char tail[192];
+  snprintf(tail, sizeof(tail),
+           "%s -> -1 (no dialog host: the text above is the game's own "
+           "message, not drawn)",
+           api);
+  LOG(tail);
+}
+
 int TRT_STDCALL trt_MessageBoxW(void* parent, const u16* text, const u16* cap,
                                 u32 type) {
   (void)parent; (void)type;
@@ -1651,11 +1821,60 @@ int TRT_STDCALL trt_MessageBoxExA(void* hWnd, const char* lpText,
   return trt_MessageBoxA(hWnd, lpText, lpCaption, uType);
 }
 int TRT_STDCALL trt_MessageBoxIndirectW(const void* lpmbp) {
-  (void)lpmbp;
+  if (!lpmbp) return 1;
+  const u8* b = (const u8*)lpmbp;
+  const u32 cb = rd32le(b);
+  // MSGBOXPARAMSW field order. The pointers are guest-width, and cbSize tells
+  // which layout the guest built: a PE32 guest's struct is 40 bytes, a PE64
+  // guest's is 80.
+  const size_t pw = (cb && cb < 56) ? 4 : 8;
+  const size_t off = (pw == 8) ? 8 : 4;  // after cbSize + alignment
+  auto rd_ptr = [&](size_t o) -> const void* {
+    if (pw == 8) {
+      u64 v = 0;
+      memcpy(&v, b + o, 8);
+      return (const void*)(uintptr_t)v;
+    }
+    u32 v = 0;
+    memcpy(&v, b + o, 4);
+    return (const void*)(uintptr_t)v;
+  };
+  const u16* text = (const u16*)rd_ptr(off + 2 * pw);
+  const u16* cap = (const u16*)rd_ptr(off + 3 * pw);
+  const u32 style = rd32le(b + off + 4 * pw);
+  char line[640];
+  snprintf(line, sizeof(line),
+           "user32: MessageBoxIndirectW [%s] %s (style=0x%08x) -> ID_OK "
+           "(no modal UI on console)",
+           u16_ascii(cap, 80).c_str(), u16_ascii(text, 400).c_str(), style);
+  LOG(line);
   return 1;
 }
 int TRT_STDCALL trt_MessageBoxIndirectA(const void* lpmbp) {
-  (void)lpmbp;
+  if (!lpmbp) return 1;
+  const u8* b = (const u8*)lpmbp;
+  const u32 cb = rd32le(b);
+  const size_t pw = (cb && cb < 56) ? 4 : 8;
+  const size_t off = (pw == 8) ? 8 : 4;
+  auto rd_ptr = [&](size_t o) -> const void* {
+    if (pw == 8) {
+      u64 v = 0;
+      memcpy(&v, b + o, 8);
+      return (const void*)(uintptr_t)v;
+    }
+    u32 v = 0;
+    memcpy(&v, b + o, 4);
+    return (const void*)(uintptr_t)v;
+  };
+  const char* text = (const char*)rd_ptr(off + 2 * pw);
+  const char* cap = (const char*)rd_ptr(off + 3 * pw);
+  const u32 style = rd32le(b + off + 4 * pw);
+  char line[640];
+  snprintf(line, sizeof(line),
+           "user32: MessageBoxIndirectA [%s] %s (style=0x%08x) -> ID_OK "
+           "(no modal UI on console)",
+           cap ? cap : "", text ? text : "", style);
+  LOG(line);
   return 1;
 }
 
@@ -1667,13 +1886,24 @@ int TRT_STDCALL trt_DestroyIcon(void* icon) {
 
 int TRT_STDCALL trt_DrawTextW(void* hdc, u16* text, int count, void* rect,
                               u32 format) {
-  (void)hdc; (void)text; (void)count; (void)rect; (void)format;
-  return 16;
+  if (!hdc || !text || !rect) return 0;
+  if (count < 0) {  // -1 = NUL-terminated
+    count = 0;
+    while (text[count]) ++count;
+  }
+  return trt_gdi_draw_text(hdc, text, count, rect, format);
 }
 int TRT_STDCALL trt_DrawTextA(void* hdc, const char* text, int count,
                               void* rect, u32 format) {
-  (void)hdc; (void)text; (void)count; (void)rect; (void)format;
-  return 16;
+  if (!hdc || !text || !rect) return 0;
+  if (count < 0) {
+    count = 0;
+    while (text[count]) ++count;
+  }
+  if (count > 8192) count = 8192;
+  std::vector<u16> wide((size_t)count + 1);
+  for (int i = 0; i < count; ++i) wide[(size_t)i] = (u16)(u8)text[i];
+  return trt_gdi_draw_text(hdc, wide.data(), count, rect, format);
 }
 u32 TRT_STDCALL trt_GetDialogBaseUnits(void) {
   return (16u << 16) | 8u;
@@ -1681,14 +1911,26 @@ u32 TRT_STDCALL trt_GetDialogBaseUnits(void) {
 void* TRT_STDCALL trt_DialogBoxIndirectParamW(void* inst, const void* tmpl,
                                               void* parent, void* proc,
                                               i64 init) {
-  (void)inst; (void)tmpl; (void)parent; (void)proc; (void)init;
-  LOG("user32: DialogBoxIndirectParamW -> -1 (no dialog host; named gap)");
+  (void)inst; (void)parent; (void)proc; (void)init;
+  log_dialog_template(tmpl, "user32: DialogBoxIndirectParamW");
   return (void*)(uintptr_t)-1;
 }
 void* TRT_STDCALL trt_DialogBoxParamW(void* inst, const u16* tmpl, void* parent,
                                       void* proc, i64 init) {
-  (void)inst; (void)tmpl; (void)parent; (void)proc; (void)init;
-  LOG("user32: DialogBoxParamW -> -1 (no dialog host)");
+  (void)inst; (void)parent; (void)proc; (void)init;
+  const uintptr_t v = (uintptr_t)tmpl;
+  if (v <= 0xFFFF) {
+    // A template from the exe's own resources: the id is all we can name
+    // without walking the resource section.
+    char line[160];
+    snprintf(line, sizeof(line),
+             "user32: DialogBoxParamW -> -1 (template resource #%u; no dialog "
+             "host)",
+             (unsigned)v);
+    LOG(line);
+  } else {
+    log_dialog_template(tmpl, "user32: DialogBoxParamW");
+  }
   return (void*)(uintptr_t)-1;
 }
 int TRT_STDCALL trt_SetDlgItemTextW(void* hDlg, int nIDDlgItem, const u16* lpString) {

@@ -110,12 +110,17 @@ status or a fresh CoreWindow pointer event flips `g_host_mouse_present`, and an
 auto-selected pad-as-mouse cursor is released (`hardware mouse active ->
 pad-as-mouse OFF`) so the physical device drives the cursor immediately.
 
-With the spoof active the shell really does grant a pointer (console log:
-`keyboard=1 mouse=1`, `PointerDevices count=1`, `physical relative mouse motion
-received`). The host therefore leaves the OS/shell cursor visible and no longer
-stacks its D2D arrow on top of it; the drawn cursor is kept only as a fallback
-for pad-as-mouse sessions. Two cursors used to overlap and the drawn one froze
-when GameInput stopped reporting deltas.
+On a previously tested Series S, the Edge-identity package received physical
+mouse input (console log: `keyboard=1 mouse=1`, `PointerDevices count=1`,
+`physical relative mouse motion received`).
+
+When Tiramisu receives pointer input, its white arrow with a dark outline
+replaces the shell cursor on the dashboard and quick menu. It stays visible
+when the mouse is idle. Games with a live Tiramisu presentation overlay can show
+the same style of arrow, while honoring the guest's cursor visibility and
+clipping. Other rendering paths use the shell cursor. GameInput, MouseDevice
+and CoreWindow can all deliver physical motion. Overlapping button reports
+generate one guest press or release.
 
 **Games disappear after the identity change** because the PFN determines the
 LocalState folder. Migrate the old state (games, profiles, covers, drive_c,

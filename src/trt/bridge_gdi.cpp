@@ -9,19 +9,29 @@
 #include "bridge_gdi.h"
 #include "bridge_opengl32.h"
 #include "bridge_user32.h"
+#include "gdi_raster.h"
+#include "input.h"
 #include "thunk.h"
 #include "trt.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <mutex>
+#include <vector>
 
 namespace gdilog {
 static void line(const char* s) { trt_core_log(s); }
 }
 #define log_line(s_) gdilog::line(s_)
+
+// Defined later in this file (DC text state section and the DC state stack);
+// declared at file scope so early callers (SaveDC, the DC forget hook) reach
+// the same entities instead of anonymous-namespace duplicates.
+extern "C" bool dc_text_state(void* hdc, trt_dc_text_state* st);
+extern "C" void dc_saved_forget(void* hdc);
 
 namespace {
 
@@ -47,6 +57,7 @@ struct gdi_obj {
   u32 dib_colors[256];
   u16 pal_count;
   u32 pal_entries[256];
+  i32 rg_l, rg_t, rg_r, rg_b;  // region bounds (CreateRectRgn)
   bool used;
 };
 constexpr int GDI_MAX_OBJECTS = 128;
@@ -80,9 +91,312 @@ int obj_alloc(u32 type) {
   return -1;
 }
 
+// ---- per-DC selection ----------------------------------------------------
+// Real GDI keeps one current pen, brush, font, bitmap and palette per DC.
+// The user32 DC record only carries a single "selected" slot, so a UI that
+// selected a brush to fill a control erased the selected font and every later
+// TextOut would measure with brush metrics. Keep the real per-type selection
+// here and mirror the most recent one into the DC record for compatibility.
+constexpr u32 STOCK_PEN_BLACK = 0x80000017u;
+constexpr u32 STOCK_BRUSH_WHITE = 0x80000010u;
+constexpr u32 STOCK_FONT_SYSTEM = 0x8000001Eu;
+
+struct dc_selection {
+  void* hdc;
+  void* pen;
+  void* brush;
+  void* font;
+  void* bitmap;
+  void* palette;
+  i32 cur_x, cur_y;    // current position (MoveToEx/LineTo)
+  i32 vp_x, vp_y;      // viewport origin (SetViewportOrgEx), added to drawing
+  u32 brush_color;     // SetDCBrushColor, for the DC_BRUSH stock object
+  u32 pen_color;       // SetDCPenColor
+  bool used;
+};
+constexpr int GDI_MAX_DC_STATE = 32;
+dc_selection g_sel[GDI_MAX_DC_STATE];
+std::mutex g_sel_mu;
+
+dc_selection* dc_sel(void* hdc, bool create) {
+  if (!hdc) return nullptr;
+  for (int i = 0; i < GDI_MAX_DC_STATE; ++i)
+    if (g_sel[i].used && g_sel[i].hdc == hdc) return &g_sel[i];
+  if (!create) return nullptr;
+  for (int i = 0; i < GDI_MAX_DC_STATE; ++i) {
+    if (!g_sel[i].used) {
+      memset(&g_sel[i], 0, sizeof(g_sel[i]));
+      g_sel[i].used = true;
+      g_sel[i].hdc = hdc;
+      g_sel[i].pen = (void*)(uintptr_t)STOCK_PEN_BLACK;
+      g_sel[i].brush = (void*)(uintptr_t)STOCK_BRUSH_WHITE;
+      g_sel[i].font = (void*)(uintptr_t)STOCK_FONT_SYSTEM;
+      // Real GDI hands a fresh memory DC a 1x1 monochrome bitmap, so
+      // SelectObject(bitmap) has a non-NULL previous object.
+      g_sel[i].bitmap = (void*)(uintptr_t)0x80000026u;
+      g_sel[i].brush_color = 0x00FFFFFFu;
+      g_sel[i].pen_color = 0x00000000u;
+      return &g_sel[i];
+    }
+  }
+  // Table full: recycle slot 0 with a named line rather than a wrong answer.
+  log_line("gdi32: DC selection table full -> recycled slot 0");
+  memset(&g_sel[0], 0, sizeof(g_sel[0]));
+  g_sel[0].used = true;
+  g_sel[0].hdc = hdc;
+  g_sel[0].pen = (void*)(uintptr_t)STOCK_PEN_BLACK;
+  g_sel[0].brush = (void*)(uintptr_t)STOCK_BRUSH_WHITE;
+  g_sel[0].font = (void*)(uintptr_t)STOCK_FONT_SYSTEM;
+  g_sel[0].bitmap = (void*)(uintptr_t)0x80000026u;
+  g_sel[0].brush_color = 0x00FFFFFFu;
+  return &g_sel[0];
+}
+
+void dc_sel_forget(void* hdc) {
+  for (int i = 0; i < GDI_MAX_DC_STATE; ++i)
+    if (g_sel[i].used && g_sel[i].hdc == hdc) g_sel[i].used = false;
+}
+
+// Colour of an object handle (brush/pen), with the stock defaults.
+u32 obj_color(void* hobj, u32 fallback) {
+  const u32 h = (u32)(uintptr_t)hobj;
+  switch (h) {
+    case 0x80000010u: return 0x00FFFFFFu;  // WHITE_BRUSH / WHITE_PEN
+    case 0x80000011u: return 0x00C0C0C0u;  // LTGRAY_BRUSH
+    case 0x80000012u: return 0x00808080u;  // GRAY_BRUSH
+    case 0x80000013u: return 0x00404040u;  // DKGRAY_BRUSH
+    case 0x80000014u: return 0x00000000u;  // BLACK_BRUSH
+    case 0x80000005u: return fallback;     // NULL_BRUSH: caller skips the fill
+    case 0x80000006u: return 0x00FFFFFFu;  // WHITE_PEN
+    case 0x80000017u: return 0x00000000u;  // BLACK_PEN
+    default: break;
+  }
+  gdi_obj* o = obj_by_handle(h);
+  return o ? o->color : fallback;
+}
+
+
+// ---- path recording ------------------------------------------------------
+// BeginPath/EndPath record geometry instead of painting it; FillPath,
+// StrokePath and SelectClipPath replay it. GDI also records the shape entry
+// points (Rectangle/Ellipse/RoundRect/Polygon/Arc) into an open path, which is
+// how applications build rounded and elliptical clip regions.
+constexpr u8 PATH_START = 2;  // vertex begins a subpath (PT_MOVETO)
+constexpr u8 PATH_CLOSE = 1;  // vertex closes its subpath (PT_CLOSEFIGURE)
+constexpr int GDI_MAX_PATHS = 32;
+
+struct path_vertex {
+  i32 x, y;
+  u8 flags;
+};
+
+struct path_rec {
+  void* hdc;
+  bool used;
+  bool open;      // between BeginPath and EndPath
+  bool closed;    // EndPath succeeded: the path is replayable
+  int fill_mode;  // 1 = ALTERNATE (default), 2 = WINDING
+  i32 cur_x, cur_y;
+  std::vector<path_vertex> v;
+};
+path_rec g_paths[GDI_MAX_PATHS];
+std::mutex g_path_mu;
+
+path_rec* path_find(void* hdc, bool create) {
+  if (!hdc) return nullptr;
+  std::lock_guard<std::mutex> lk(g_path_mu);
+  for (int i = 0; i < GDI_MAX_PATHS; ++i)
+    if (g_paths[i].used && g_paths[i].hdc == hdc) return &g_paths[i];
+  if (!create) return nullptr;
+  int slot = -1;
+  for (int i = 0; i < GDI_MAX_PATHS; ++i)
+    if (!g_paths[i].used) { slot = i; break; }
+  if (slot < 0) {
+    log_line("gdi32: path table full -> recycled slot 0");
+    slot = 0;
+  }
+  path_rec* p = &g_paths[slot];
+  p->used = true;
+  p->hdc = hdc;
+  p->open = false;
+  p->closed = false;
+  p->fill_mode = 1;
+  p->cur_x = 0;
+  p->cur_y = 0;
+  p->v.clear();
+  return p;
+}
+
+bool path_recording(void* hdc) {
+  path_rec* p = path_find(hdc, false);
+  return p && p->open;
+}
+
+void path_start(path_rec* p, i32 x, i32 y) {
+  if (!p || !p->open) return;
+  path_vertex v;
+  v.x = x;
+  v.y = y;
+  v.flags = PATH_START;
+  p->v.push_back(v);
+  p->cur_x = x;
+  p->cur_y = y;
+}
+
+void path_to(path_rec* p, i32 x, i32 y) {
+  if (!p || !p->open) return;
+  if (p->v.empty()) {  // GDI starts an implicit subpath here
+    path_start(p, x, y);
+    return;
+  }
+  path_vertex v;
+  v.x = x;
+  v.y = y;
+  v.flags = 0;
+  p->v.push_back(v);
+  p->cur_x = x;
+  p->cur_y = y;
+}
+
+void path_close(path_rec* p) {
+  if (!p || !p->open || p->v.empty()) return;
+  p->v.back().flags |= PATH_CLOSE;
+}
+
+void path_record_rect(path_rec* p, i32 l, i32 t, i32 r, i32 b) {
+  path_start(p, l, t);
+  path_to(p, r, t);
+  path_to(p, r, b);
+  path_to(p, l, b);
+  path_close(p);
+}
+
+// Ellipses are recorded as flattened polygons: the raster surface has no
+// curve machinery, and filling/stroking the flattened outline is what the
+// pixels would look like anyway at these sizes.
+void path_record_ellipse(path_rec* p, i32 l, i32 t, i32 r, i32 b) {
+  const float cx = ((float)l + (float)r) / 2.0f;
+  const float cy = ((float)t + (float)b) / 2.0f;
+  const float rx = ((float)r - (float)l) / 2.0f;
+  const float ry = ((float)b - (float)t) / 2.0f;
+  if (rx <= 0.0f || ry <= 0.0f) return;
+  const float rad = rx > ry ? rx : ry;
+  int steps = (int)(rad * 2.0f) + 16;
+  if (steps < 16) steps = 16;
+  if (steps > 720) steps = 720;
+  for (int i = 0; i <= steps; ++i) {
+    const float ang = 6.28318530718f * (float)i / (float)steps;
+    const i32 x = (i32)(cx + rx * cosf(ang));
+    const i32 y = (i32)(cy + ry * sinf(ang));
+    if (i == 0) path_start(p, x, y);
+    else path_to(p, x, y);
+  }
+  path_close(p);
+}
+
+// mode 0 = arc, 1 = pie (through the centre), 2 = chord.
+void path_record_arc(path_rec* p, i32 l, i32 t, i32 r, i32 b, i32 sx, i32 sy,
+                     i32 ex, i32 ey, int mode) {
+  const float cx = ((float)l + (float)r) / 2.0f;
+  const float cy = ((float)t + (float)b) / 2.0f;
+  const float rx = ((float)r - (float)l) / 2.0f;
+  const float ry = ((float)b - (float)t) / 2.0f;
+  if (rx <= 0.0f || ry <= 0.0f) return;
+  constexpr float kPi = 3.14159265358979f;
+  const float a0 = atan2f(((float)sy - cy) / ry, ((float)sx - cx) / rx);
+  const float a1 = atan2f(((float)ey - cy) / ry, ((float)ex - cx) / rx);
+  float sweep = a1 - a0;
+  while (sweep <= 0.0f) sweep += 2.0f * kPi;
+  const int steps = (int)((rx > ry ? rx : ry) * 4.0f) + 8;
+  for (int i = 0; i <= steps; ++i) {
+    const float ang = a0 + sweep * (float)i / (float)steps;
+    const i32 x = (i32)(cx + rx * cosf(ang));
+    const i32 y = (i32)(cy + ry * sinf(ang));
+    if (i == 0) path_start(p, x, y);
+    else path_to(p, x, y);
+  }
+  if (mode == 1) {
+    path_to(p, (i32)cx, (i32)cy);
+    path_close(p);
+  } else if (mode == 2) {
+    path_close(p);
+  }
+}
+
+// Flat sides plus four elliptical corner arcs (ew x eh corner ellipse).
+void path_record_round_rect(path_rec* p, i32 l, i32 t, i32 r, i32 b, i32 ew,
+                            i32 eh) {
+  if (r < l) { const i32 tmp = l; l = r; r = tmp; }
+  if (b < t) { const i32 tmp = t; t = b; b = tmp; }
+  const float rx = (float)(ew > 0 ? ew : 1) / 2.0f;
+  const float ry = (float)(eh > 0 ? eh : 1) / 2.0f;
+  if (rx * 2.0f > (float)(r - l)) return;  // degenerate: keep the caller's pixels
+  if (ry * 2.0f > (float)(b - t)) return;
+  constexpr float kPi = 3.14159265358979f;
+  auto corner = [&](float ccx, float ccy, float a0, float a1, bool first) {
+    const int steps = 12;
+    for (int i = 0; i <= steps; ++i) {
+      const float ang = a0 + (a1 - a0) * (float)i / (float)steps;
+      const i32 x = (i32)(ccx + rx * cosf(ang));
+      const i32 y = (i32)(ccy + ry * sinf(ang));
+      if (first && i == 0) path_start(p, x, y);
+      else path_to(p, x, y);
+    }
+  };
+  const float crx = (float)r - rx, clx = (float)l + rx;
+  const float cby = (float)b - ry, cty = (float)t + ry;
+  corner(crx, cty, -kPi / 2.0f, 0.0f, true);   // top-right
+  corner(crx, cby, 0.0f, kPi / 2.0f, false);   // bottom-right
+  corner(clx, cby, kPi / 2.0f, kPi, false);    // bottom-left
+  corner(clx, cty, kPi, kPi * 1.5f, false);    // top-left
+  path_close(p);
+}
 } // namespace
 
 extern "C" {
+
+// Called from the DC release path (bridge_user32.cpp) so a released DC drops
+// its selection, saved states and raster surface instead of leaking them.
+void trt_gdi_forget_dc(void* hdc) {
+  {
+    std::lock_guard<std::mutex> lk(g_sel_mu);
+    dc_sel_forget(hdc);
+  }
+  {
+    std::lock_guard<std::mutex> lk(g_path_mu);
+    for (int i = 0; i < GDI_MAX_PATHS; ++i) {
+      if (g_paths[i].used && g_paths[i].hdc == hdc) {
+        g_paths[i].v.clear();
+        g_paths[i].used = false;
+        g_paths[i].open = false;
+        g_paths[i].closed = false;
+      }
+    }
+  }
+  dc_saved_forget(hdc);
+  trt_raster::release(hdc);
+}
+
+void trt_gdi_surface_hint(void* hdc, i32 w, i32 h) {
+  trt_raster::get(hdc, w, h);
+}
+
+u32 trt_gdi_brush_color(void* hbrush) {
+  // NULL_BRUSH/stock colours resolve through obj_color; an unknown handle
+  // paints nothing visible, so it falls back to white rather than black.
+  return obj_color(hbrush, 0x00FFFFFFu);
+}
+
+void trt_gdi_forget_draw_state(void* hdc) {
+  {
+    std::lock_guard<std::mutex> lk(g_sel_mu);
+    dc_sel_forget(hdc);
+  }
+  dc_saved_forget(hdc);
+  const i32 w = trt_raster::width(hdc);
+  const i32 h = trt_raster::height(hdc);
+  if (w > 0 && h > 0) trt_raster::set_clip(hdc, 0, 0, w, h);
+}
 
 // ---- objects ----
 
@@ -191,14 +505,18 @@ void* TRT_GUEST_ABI trt_ExtCreatePen(u32 iPenStyle, u32 cWidth,
 }
 
 void* TRT_GUEST_ABI trt_CreateRectRgn(i32 a, i32 b, i32 c, i32 d) {
-  (void)a; (void)b; (void)c; (void)d;
   const int slot = obj_alloc(TRT_GDI_OBJ_REGION);
   if (slot < 0) return nullptr;
+  g_objs[slot].rg_l = a;
+  g_objs[slot].rg_t = b;
+  g_objs[slot].rg_r = c;
+  g_objs[slot].rg_b = d;
   return make_handle(slot);
 }
 void* TRT_GUEST_ABI trt_CreateRectRgnIndirect(const void* lprect) {
-  (void)lprect;
-  return trt_CreateRectRgn(0, 0, 0, 0);
+  if (!lprect) return trt_CreateRectRgn(0, 0, 0, 0);
+  const i32* r = (const i32*)lprect;
+  return trt_CreateRectRgn(r[0], r[1], r[2], r[3]);
 }
 void* TRT_GUEST_ABI trt_CreatePolygonRgn(const void* pptl, int cPoint, int iMode) {
   (void)pptl; (void)cPoint; (void)iMode;
@@ -212,7 +530,13 @@ int TRT_GUEST_ABI trt_CombineRgn(void* hrgnDst, void* hrgnSrc1, void* hrgnSrc2, 
   return 2;  // SIMPLEREGION
 }
 int TRT_GUEST_ABI trt_OffsetRgn(void* hrgn, int x, int y) {
-  (void)hrgn; (void)x; (void)y;
+  gdi_obj* o = obj_by_handle((u32)(uintptr_t)hrgn);
+  if (!o || o->type != TRT_GDI_OBJ_REGION) {
+    log_line("gdi32: OffsetRgn(bad handle) -> ERROR");
+    return 0;
+  }
+  o->rg_l += x; o->rg_r += x;
+  o->rg_t += y; o->rg_b += y;
   return 2;
 }
 int TRT_GUEST_ABI trt_PtInRegion(void* hrgn, int x, int y) {
@@ -224,11 +548,16 @@ int TRT_GUEST_ABI trt_RectInRegion(void* hrgn, const void* lprect) {
   return 1;
 }
 int TRT_GUEST_ABI trt_GetRgnBox(void* hrgn, void* lprc) {
-  (void)hrgn;
+  gdi_obj* o = obj_by_handle((u32)(uintptr_t)hrgn);
+  if (!o || o->type != TRT_GDI_OBJ_REGION) {
+    log_line("gdi32: GetRgnBox(bad handle) -> ERROR");
+    return 0;
+  }
   if (lprc) {
     i32* r = (i32*)lprc;
-    r[0] = 0; r[1] = 0; r[2] = 1920; r[3] = 1080;
+    r[0] = o->rg_l; r[1] = o->rg_t; r[2] = o->rg_r; r[3] = o->rg_b;
   }
+  if (o->rg_r <= o->rg_l || o->rg_b <= o->rg_t) return 1;  // NULLREGION
   return 2;
 }
 
@@ -280,16 +609,132 @@ void* TRT_GUEST_ABI trt_CreateDCA(const char* pszDriver, const char* pszDevice,
   return trt_user32_dc_alloc();
 }
 int TRT_GUEST_ABI trt_DeleteDC(void* hdc) {
+  trt_gdi_forget_dc(hdc);
   return trt_user32_dc_release(hdc);
 }
-int TRT_GUEST_ABI trt_SaveDC(void* hdc) {
-  (void)hdc;
-  log_line("gdi32: SaveDC (DC state not saved: fail-visible)");
-  return 1;
+// ---- DC state stack ----------------------------------------------------
+// SaveDC/RestoreDC used to log that nothing was saved while still returning
+// success, so a dialog that set a font, painted, and restored got the wrong
+// font on the next paint. This keeps a real per-DC stack of the selectable
+// objects, text attributes, current position, viewport origin and clip.
+struct dc_saved {
+  void* hdc;
+  void* pen;
+  void* brush;
+  void* font;
+  i32 cur_x, cur_y, vp_x, vp_y;
+  u32 brush_color, pen_color;
+  trt_dc_text_state ts;
+  i32 clip[4];
+  bool has_clip;
+  int level;
+};
+std::vector<dc_saved> g_saved;
+std::mutex g_saved_mu;
+
+void dc_saved_forget(void* hdc) {
+  std::lock_guard<std::mutex> lk(g_saved_mu);
+  for (size_t i = g_saved.size(); i-- > 0;)
+    if (g_saved[i].hdc == hdc) g_saved.erase(g_saved.begin() + (long)i);
 }
+
+int TRT_GUEST_ABI trt_SaveDC(void* hdc) {
+  if (!trt_user32_dc_is_valid(hdc)) {
+    log_line("gdi32: SaveDC -> 0 (not a user32 DC)");
+    return 0;
+  }
+  dc_saved f{};
+  f.hdc = hdc;
+  {
+    std::lock_guard<std::mutex> lk(g_sel_mu);
+    dc_selection* s = dc_sel(hdc, true);
+    if (!s) return 0;
+    f.pen = s->pen;
+    f.brush = s->brush;
+    f.font = s->font;
+    f.cur_x = s->cur_x;
+    f.cur_y = s->cur_y;
+    f.vp_x = s->vp_x;
+    f.vp_y = s->vp_y;
+    f.brush_color = s->brush_color;
+    f.pen_color = s->pen_color;
+  }
+  trt_dc_text_state ts;
+  if (!dc_text_state(hdc, &ts)) return 0;
+  f.ts = ts;
+  f.has_clip = trt_raster::clip_box(hdc, &f.clip[0], &f.clip[1], &f.clip[2],
+                                    &f.clip[3]);
+  std::lock_guard<std::mutex> lk(g_saved_mu);
+  int level = 1;
+  for (const dc_saved& e : g_saved)
+    if (e.hdc == hdc && e.level >= level) level = e.level + 1;
+  f.level = level;
+  g_saved.push_back(f);
+  char line[96];
+  snprintf(line, sizeof(line), "gdi32: SaveDC -> level %d", level);
+  log_line(line);
+  return level;
+}
+
 int TRT_GUEST_ABI trt_RestoreDC(void* hdc, int nSavedDC) {
-  (void)hdc; (void)nSavedDC;
-  log_line("gdi32: RestoreDC (no saved state to restore: fail-visible)");
+  if (!trt_user32_dc_is_valid(hdc)) {
+    log_line("gdi32: RestoreDC -> FALSE (not a user32 DC)");
+    return 0;
+  }
+  dc_saved f{};
+  bool found = false;
+  {
+    std::lock_guard<std::mutex> lk(g_saved_mu);
+    if (nSavedDC < 0) {  // most recent state for this DC
+      for (size_t i = g_saved.size(); i-- > 0;) {
+        if (g_saved[i].hdc == hdc) {
+          f = g_saved[i];
+          g_saved.erase(g_saved.begin() + (long)i);
+          found = true;
+          break;
+        }
+      }
+    } else {
+      for (size_t i = g_saved.size(); i-- > 0;) {
+        if (g_saved[i].hdc == hdc && g_saved[i].level == nSavedDC) {
+          f = g_saved[i];
+          g_saved.erase(g_saved.begin() + (long)i, g_saved.end());
+          found = true;
+          break;
+        }
+      }
+    }
+  }
+  if (!found) {
+    char line[112];
+    snprintf(line, sizeof(line),
+             "gdi32: RestoreDC(%d) -> FALSE (no saved state at that level)",
+             nSavedDC);
+    log_line(line);
+    return 0;
+  }
+  {
+    std::lock_guard<std::mutex> lk(g_sel_mu);
+    dc_selection* s = dc_sel(hdc, true);
+    if (s) {
+      s->pen = f.pen;
+      s->brush = f.brush;
+      s->font = f.font;
+      s->cur_x = f.cur_x;
+      s->cur_y = f.cur_y;
+      s->vp_x = f.vp_x;
+      s->vp_y = f.vp_y;
+      s->brush_color = f.brush_color;
+      s->pen_color = f.pen_color;
+    }
+  }
+  trt_user32_dc_set_text_state(hdc, &f.ts);
+  if (f.has_clip)
+    trt_raster::set_clip(hdc, f.clip[0], f.clip[1], f.clip[2], f.clip[3]);
+  char line[96];
+  snprintf(line, sizeof(line), "gdi32: RestoreDC(level %d) restored",
+           f.level);
+  log_line(line);
   return 1;
 }
 
@@ -386,14 +831,24 @@ int TRT_GUEST_ABI trt_SetDIBitsToDevice(void* hdc, int xDest, int yDest, u32 w,
                                         u32 h, int xSrc, int ySrc, u32 StartScan,
                                         u32 cLines, const void* lpvBits,
                                         const void* lpbmi, u32 ColorUse) {
-  (void)hdc; (void)xSrc; (void)StartScan; (void)lpvBits; (void)lpbmi;
-  (void)ColorUse;
-  char line[144];
-  snprintf(line, sizeof(line),
-           "gdi32: SetDIBitsToDevice %ux%u @(%d,%d) "
-           "(DIB blit not drawn: fail-visible)", w, h, xDest, yDest);
-  log_line(line);
-  return (int)cLines;
+  if (!trt_user32_dc_is_valid(hdc)) {
+    log_line("gdi32: SetDIBitsToDevice -> 0 (not a user32 DC)");
+    return 0;
+  }
+  const i32 lines = h ? (i32)h : (i32)cLines;
+  // StartScan is the first DIB scan line the call covers; fold it into the
+  // source origin, which is what it means for a single-band blit like this.
+  const i32 sy = ySrc + (i32)StartScan;
+  if (!trt_raster::dib(hdc, xDest, yDest, (i32)w, lines, lpvBits, lpbmi,
+                       ColorUse, xSrc, sy, (i32)w, lines, 0x00CC0020u)) {
+    char line[176];
+    snprintf(line, sizeof(line),
+             "gdi32: SetDIBitsToDevice %ux%u @(%d,%d) -> 0 (DIB format "
+             "not decoded: fail-visible)", w, h, xDest, yDest);
+    log_line(line);
+    return 0;
+  }
+  return (int)(cLines ? cLines : h);
 }
 
 int TRT_GUEST_ABI trt_StretchDIBits(void* hdc, int xDest, int yDest,
@@ -401,37 +856,92 @@ int TRT_GUEST_ABI trt_StretchDIBits(void* hdc, int xDest, int yDest,
                                     int ySrc, int SrcWidth, int SrcHeight,
                                     const void* lpBits, const void* lpbmi,
                                     u32 iUsage, u32 rop) {
-  (void)hdc; (void)xSrc; (void)ySrc; (void)lpBits; (void)lpbmi;
-  (void)iUsage; (void)rop;
-  char line[160];
-  snprintf(line, sizeof(line),
-           "gdi32: StretchDIBits %dx%d -> %dx%d @(%d,%d) "
-           "(DIB blit not drawn: fail-visible)",
-           SrcWidth, SrcHeight, DestWidth, DestHeight, xDest, yDest);
-  log_line(line);
+  if (!trt_user32_dc_is_valid(hdc)) {
+    log_line("gdi32: StretchDIBits -> 0 (not a user32 DC)");
+    return 0;
+  }
+  if (!trt_raster::dib(hdc, xDest, yDest, DestWidth, DestHeight, lpBits, lpbmi,
+                       iUsage, xSrc, ySrc, SrcWidth, SrcHeight, rop)) {
+    char line[176];
+    snprintf(line, sizeof(line),
+             "gdi32: StretchDIBits %dx%d -> %dx%d @(%d,%d) -> 0 (DIB format "
+             "or ROP 0x%x not decoded: fail-visible)",
+             SrcWidth, SrcHeight, DestWidth, DestHeight, xDest, yDest, rop);
+    log_line(line);
+    return 0;
+  }
   return SrcHeight;
+}
+
+// Current brush/pen colour for a DC (stock objects included). DC_BRUSH and
+// DC_PEN resolve to the per-DC colour SetDCBrushColor/SetDCPenColor set.
+static u32 dc_brush_color(void* hdc) {
+  std::lock_guard<std::mutex> lk(g_sel_mu);
+  dc_selection* s = dc_sel(hdc, true);
+  if (!s) return 0x00FFFFFFu;
+  if ((u32)(uintptr_t)s->brush == 0x80000022u) return s->brush_color;  // DC_BRUSH
+  return obj_color(s->brush, s->brush_color);
+}
+static u32 dc_pen_color(void* hdc) {
+  std::lock_guard<std::mutex> lk(g_sel_mu);
+  dc_selection* s = dc_sel(hdc, true);
+  if (!s) return 0x00000000u;
+  if ((u32)(uintptr_t)s->pen == 0x80000023u) return s->pen_color;  // DC_PEN
+  return obj_color(s->pen, s->pen_color);
+}
+static bool dc_brush_is_null(void* hdc) {
+  std::lock_guard<std::mutex> lk(g_sel_mu);
+  dc_selection* s = dc_sel(hdc, true);
+  return s && (u32)(uintptr_t)s->brush == 0x80000005u;  // NULL_BRUSH
+}
+static bool dc_pen_is_null(void* hdc) {
+  std::lock_guard<std::mutex> lk(g_sel_mu);
+  dc_selection* s = dc_sel(hdc, true);
+  return s && (u32)(uintptr_t)s->pen == 0x80000018u;  // NULL_PEN
 }
 
 int TRT_GUEST_ABI trt_BitBlt(void* hdc, int x, int y, int cx, int cy,
                              void* hdcSrc, int x1, int y1, u32 rop) {
-  (void)hdc; (void)hdcSrc; (void)x1; (void)y1;
-  char line[128];
-  snprintf(line, sizeof(line),
-           "gdi32: BitBlt %dx%d @(%d,%d) rop=0x%x (blit not drawn: fail-visible)",
-           cx, cy, x, y, rop);
-  log_line(line);
+  if (!trt_user32_dc_is_valid(hdc) || !trt_user32_dc_is_valid(hdcSrc)) {
+    log_line("gdi32: BitBlt -> FALSE (destination or source is not a DC)");
+    return 0;
+  }
+  if (!trt_raster::blit(hdc, x, y, cx, cy, hdcSrc, x1, y1, rop,
+                        dc_brush_color(hdc))) {
+    char line[144];
+    snprintf(line, sizeof(line),
+             "gdi32: BitBlt -> FALSE (ROP 0x%x not implemented by the "
+             "raster surface)", rop);
+    log_line(line);
+    return 0;
+  }
+  char done[144];
+  snprintf(done, sizeof(done),
+           "gdi32: BitBlt %dx%d @(%d,%d) rop=0x%x (drawn)", cx, cy, x, y, rop);
+  log_line(done);
   return 1;
 }
 int TRT_GUEST_ABI trt_StretchBlt(void* hdcDest, int xDest, int yDest, int wDest,
                                  int hDest, void* hdcSrc, int xSrc, int ySrc,
                                  int wSrc, int hSrc, u32 rop) {
-  (void)hdcDest; (void)hdcSrc; (void)xSrc; (void)ySrc;
-  char line[160];
-  snprintf(line, sizeof(line),
-           "gdi32: StretchBlt %dx%d -> %dx%d @(%d,%d) rop=0x%x "
-           "(blit not drawn: fail-visible)",
+  if (!trt_user32_dc_is_valid(hdcDest) || !trt_user32_dc_is_valid(hdcSrc)) {
+    log_line("gdi32: StretchBlt -> FALSE (destination or source is not a DC)");
+    return 0;
+  }
+  if (!trt_raster::stretch(hdcDest, xDest, yDest, wDest, hDest, hdcSrc, xSrc,
+                           ySrc, wSrc, hSrc, rop, dc_brush_color(hdcDest))) {
+    char line[160];
+    snprintf(line, sizeof(line),
+             "gdi32: StretchBlt -> FALSE (ROP 0x%x or a zero-size source "
+             "not implemented by the raster surface)", rop);
+    log_line(line);
+    return 0;
+  }
+  char done[176];
+  snprintf(done, sizeof(done),
+           "gdi32: StretchBlt %dx%d -> %dx%d @(%d,%d) rop=0x%x (drawn)",
            wSrc, hSrc, wDest, hDest, xDest, yDest, rop);
-  log_line(line);
+  log_line(done);
   return 1;
 }
 // ---- stretch-blit mode (per-DC GDI state) ----
@@ -496,20 +1006,57 @@ i32 TRT_GUEST_ABI trt_GetStretchBltMode(void* hdc) {
 }
 
 int TRT_GUEST_ABI trt_PatBlt(void* hdc, int x, int y, int w, int h, u32 rop) {
-  (void)hdc;
-  char line[128];
-  snprintf(line, sizeof(line),
-           "gdi32: PatBlt %dx%d @(%d,%d) rop=0x%x (blit not drawn: fail-visible)",
-           w, h, x, y, rop);
-  log_line(line);
-  return 1;
+  if (!trt_user32_dc_is_valid(hdc)) {
+    log_line("gdi32: PatBlt -> FALSE (not a user32 DC)");
+    return 0;
+  }
+  switch (rop) {
+    case 0x00F00021u:  // PATCOPY
+      trt_raster::fill(hdc, x, y, x + w, y + h, dc_brush_color(hdc));
+      return 1;
+    case 0x00000042u:  // BLACKNESS
+      trt_raster::fill(hdc, x, y, x + w, y + h, 0x00000000u);
+      return 1;
+    case 0x00FF0062u:  // WHITENESS
+      trt_raster::fill(hdc, x, y, x + w, y + h, 0x00FFFFFFu);
+      return 1;
+    case 0x00550009u:  // DSTINVERT
+      return trt_raster::blit(hdc, x, y, w, h, hdc, x, y, rop, 0) ? 1 : 0;
+    case 0x005A0049u:  // PATINVERT
+      return trt_raster::blit(hdc, x, y, w, h, hdc, x, y, rop,
+                              dc_brush_color(hdc)) ? 1 : 0;
+    default: {
+      char line[144];
+      snprintf(line, sizeof(line),
+               "gdi32: PatBlt -> FALSE (ROP 0x%x not implemented by the "
+               "raster surface)", rop);
+      log_line(line);
+      return 0;
+    }
+  }
 }
 u32 TRT_GUEST_ABI trt_GetPixel(void* hdc, int x, int y) {
-  (void)hdc; (void)x; (void)y;
-  return 0;
+  bool ok = false;
+  const u32 c = trt_raster::get_pixel(hdc, x, y, &ok);
+  if (!ok) {
+    char line[112];
+    snprintf(line, sizeof(line),
+             "gdi32: GetPixel(%d,%d) -> CLR_INVALID (no surface or outside)",
+             x, y);
+    log_line(line);
+    return 0xFFFFFFFFu;
+  }
+  return c;
 }
 u32 TRT_GUEST_ABI trt_SetPixel(void* hdc, int x, int y, u32 color) {
-  (void)hdc; (void)x; (void)y;
+  if (!trt_raster::set_pixel(hdc, x, y, color)) {
+    char line[112];
+    snprintf(line, sizeof(line),
+             "gdi32: SetPixel(%d,%d) -> CLR_INVALID (no surface or outside)",
+             x, y);
+    log_line(line);
+    return 0xFFFFFFFFu;
+  }
   return color;
 }
 
@@ -525,15 +1072,34 @@ void* TRT_GUEST_ABI trt_SelectObject(void* hdc, void* hobj) {
   }
   const u32 h = (u32)(uintptr_t)hobj;
   const bool is_stock = (h & 0xFFFF0000u) == 0x80000000u;
-  if (!is_stock && !obj_by_handle(h)) {
+  gdi_obj* o = is_stock ? nullptr : obj_by_handle(h);
+  if (!is_stock && !o) {
     char line[128];
     snprintf(line, sizeof(line),
              "gdi32: SelectObject bad object handle 0x%x -> NULL", h);
     log_line(line);
     return nullptr;
   }
-  void* prev = trt_user32_dc_selected(hdc);
-  if (!prev) prev = (void*)(uintptr_t)0x8000001Eu;  // default stock font handle
+  // Object type: from the record, or from the stock ordinal.
+  u32 type = o ? o->type : 0;
+  if (!o) {
+    const u32 ord = h & 0xFFFFu;
+    if (ord >= 0x10u && ord <= 0x14u) type = TRT_GDI_OBJ_BRUSH;
+    else if (ord == 6u || ord == 0x17u || ord == 0x18u) type = TRT_GDI_OBJ_PEN;
+    else if (ord >= 0x19u && ord <= 0x21u) type = TRT_GDI_OBJ_FONT;
+  }
+  std::lock_guard<std::mutex> lk(g_sel_mu);
+  dc_selection* s = dc_sel(hdc, true);
+  if (!s) return nullptr;
+  void* prev = nullptr;
+  switch (type) {
+    case TRT_GDI_OBJ_PEN: prev = s->pen; s->pen = hobj; break;
+    case TRT_GDI_OBJ_BRUSH: prev = s->brush; s->brush = hobj; break;
+    case TRT_GDI_OBJ_BITMAP: prev = s->bitmap; s->bitmap = hobj; break;
+    case TRT_GDI_OBJ_PALETTE: prev = s->palette; s->palette = hobj; break;
+    default: prev = s->font; s->font = hobj; break;
+  }
+  // The user32 DC record keeps the most recent selection for compatibility.
   trt_user32_dc_set_selected(hdc, hobj);
   return prev;
 }
@@ -562,42 +1128,284 @@ int TRT_GUEST_ABI trt_DeleteObject(void* hobj) {
 
 // ---- state setters & text / drawing ----
 
-int TRT_GUEST_ABI trt_SetBkMode(void* hdc, i32 mode) {
-  if (!trt_user32_dc_is_valid(hdc)) return 0;
-  char line[96];
-  snprintf(line, sizeof(line), "gdi32: SetBkMode mode=%d (recorded)", mode);
+// ---- per-DC text state (real GDI semantics) ----
+// The mode/colour/alignment values live in the user32 DC record, so they
+// survive across GetDC/ReleaseDC reuse correctly (a fresh DC is OPAQUE,
+// black-on-white, TA_LEFT|TA_TOP) and SelectObject(hdc, font) is what the
+// metrics below read. Before this the setters logged and returned constants:
+// apps that read back a mode got a lie, and every font measured 8x16.
+bool dc_text_state(void* hdc, trt_dc_text_state* st) {
+  return trt_user32_dc_get_text_state(hdc, st) != 0;
+}
+
+// GDI cell metrics model. No font file is decoded offline, so the only font
+// data is the selected LOGFONTW record: lfHeight/lfWidth define the cell and
+// everything else scales from it. This replaces the old fixed 8x16 answer.
+struct gdi_font_metrics {
+  i32 height;
+  i32 ascent;
+  i32 descent;
+  i32 ave_w;
+  i32 max_w;
+  u32 charset;
+  bool italic;
+  bool underline;
+  bool strikeout;
+};
+
+// The font a DC measures/draws with is the FONT selection, never whatever
+// object was selected most recently (a brush selection must not change text).
+void* dc_font(void* hdc) {
+  std::lock_guard<std::mutex> lk(g_sel_mu);
+  dc_selection* s = dc_sel(hdc, true);
+  return s ? s->font : nullptr;
+}
+
+static void gdi_metrics(void* hdc, gdi_font_metrics* m) {
+  i32 lf_height = 0, lf_width = 0;
+  u32 charset = 0;
+  bool italic = false, underline = false, strikeout = false;
+  gdi_obj* o = obj_by_handle((u32)(uintptr_t)dc_font(hdc));
+  if (o && o->type == TRT_GDI_OBJ_FONT) {
+    memcpy(&lf_height, o->data, 4);
+    memcpy(&lf_width, o->data + 4, 4);
+    charset = o->data[23];  // lfCharSet
+    italic = o->data[20] != 0;
+    underline = o->data[21] != 0;
+    strikeout = o->data[22] != 0;
+  }
+  i32 h = lf_height < 0 ? -lf_height : lf_height;
+  if (h <= 0) h = 16;         // stock SYSTEM_FONT cell
+  if (h > 4096) h = 4096;     // reject absurd requests rather than overflow
+  m->height = h;
+  m->ascent = (h * 13) / 16;
+  m->descent = h - m->ascent;
+  m->ave_w = lf_width > 0 ? lf_width : (h + 1) / 2;
+  m->max_w = m->ave_w * 2;
+  m->charset = charset;
+  m->italic = italic;
+  m->underline = underline;
+  m->strikeout = strikeout;
+}
+
+// Fill the raster's text attributes from the DC: colour/bk/alignment come from
+// the DC record, the cell from the selected LOGFONTW.
+static void fill_text_style(void* hdc, trt_raster::text_style* st) {
+  trt_dc_text_state ts;
+  if (!dc_text_state(hdc, &ts)) {
+    ts.bk_mode = 2;
+    ts.text_color = 0;
+    ts.bk_color = 0x00FFFFFFu;
+    ts.text_align = 0;
+  }
+  gdi_font_metrics m;
+  gdi_metrics(hdc, &m);
+  st->fg = ts.text_color;
+  st->bg = ts.bk_color;
+  st->bk_mode = ts.bk_mode;
+  st->align = ts.text_align;
+  st->height = m.height;
+  st->advance = m.ave_w;
+  st->ascent = m.ascent;
+  st->italic = m.italic;
+  st->underline = m.underline;
+  st->strikeout = m.strikeout;
+  st->dx = nullptr;
+}
+
+int trt_gdi_draw_text(void* hdc, const u16* text, int count, void* rect,
+                      u32 format) {
+  constexpr u32 DT_CENTER_ = 0x0001u, DT_RIGHT_ = 0x0002u;
+  constexpr u32 DT_VCENTER_ = 0x0004u, DT_BOTTOM_ = 0x0008u;
+  constexpr u32 DT_WORDBREAK_ = 0x0010u, DT_SINGLELINE_ = 0x0020u;
+  constexpr u32 DT_EXPANDTABS_ = 0x0040u, DT_CALCRECT_ = 0x0400u;
+  constexpr u32 DT_NOPREFIX_ = 0x0800u;
+  if (!trt_user32_dc_is_valid(hdc) || !text || count < 0 || !rect) {
+    log_line("user32: DrawText -> 0 (bad DC, text or rect)");
+    return 0;
+  }
+  i32* rc = (i32*)rect;
+  gdi_font_metrics m;
+  gdi_metrics(hdc, &m);
+  trt_raster::text_style st;
+  fill_text_style(hdc, &st);
+
+  // Build the text the caller asked for: drop '&' accelerators unless
+  // DT_NOPREFIX, expand tabs, and keep explicit newlines as breaks.
+  std::vector<u16> cleaned;
+  cleaned.reserve((size_t)count);
+  for (int i = 0; i < count; ++i) {
+    const u16 ch = text[i];
+    if (ch == '&' && (format & DT_NOPREFIX_) == 0) continue;
+    if (ch == '\t' && (format & DT_EXPANDTABS_)) {
+      for (int k = 0; k < 4; ++k) cleaned.push_back(' ');
+      continue;
+    }
+    cleaned.push_back(ch);
+  }
+
+  const i32 width = rc[2] - rc[0];
+  const bool wrap = (format & DT_SINGLELINE_) == 0 &&
+                    (format & DT_WORDBREAK_) != 0 && width > 0;
+  const i32 max_chars = m.ave_w > 0 ? width / m.ave_w : 0;
+
+  std::vector<std::pair<int, int>> lines;  // (start, length)
+  int start = 0;
+  for (int i = 0; i <= (int)cleaned.size(); ++i) {
+    const bool eol = i == (int)cleaned.size() || cleaned[(size_t)i] == '\n';
+    if (!eol) {
+      if (wrap && max_chars > 0 && i - start >= max_chars) {
+        // break at the last space if there is one, else at the limit
+        int brk = i;
+        for (int k = i; k > start; --k)
+          if (cleaned[(size_t)k - 1] == ' ') { brk = k - 1; break; }
+        lines.push_back({start, brk - start});
+        start = brk;
+        while (start < i && cleaned[(size_t)start] == ' ') ++start;
+      }
+      continue;
+    }
+    lines.push_back({start, i - start});
+    start = i + 1;
+  }
+  if (lines.empty()) lines.push_back({0, 0});
+
+  i32 widest = 0;
+  for (const auto& l : lines) {
+    const i32 w = l.second * m.ave_w;
+    if (w > widest) widest = w;
+  }
+  const i32 total_h = (i32)lines.size() * m.height;
+
+  if (format & DT_CALCRECT_) {
+    rc[2] = rc[0] + widest;
+    rc[3] = rc[1] + total_h;
+    char line[128];
+    snprintf(line, sizeof(line),
+             "user32: DrawText CALCRECT -> %dx%d (%zu line(s))", widest,
+             total_h, lines.size());
+    log_line(line);
+    return total_h;
+  }
+
+  i32 y = rc[1];
+  if ((format & DT_BOTTOM_) && (format & DT_SINGLELINE_))
+    y = rc[3] - m.height;
+  else if ((format & DT_VCENTER_) && (format & DT_SINGLELINE_))
+    y = rc[1] + (rc[3] - rc[1] - m.height) / 2;
+
+  int drawn = 0;
+  for (const auto& l : lines) {
+    i32 x = rc[0];
+    const i32 w = l.second * m.ave_w;
+    if (format & DT_CENTER_) x = rc[0] + (width - w) / 2;
+    else if (format & DT_RIGHT_) x = rc[2] - w;
+    if (l.second > 0)
+      trt_raster::text(hdc, x, y, cleaned.data() + l.first, l.second, st);
+    y += m.height;
+    drawn += l.second;
+  }
+  char line[144];
+  snprintf(line, sizeof(line),
+           "user32: DrawText fmt=0x%x -> %d char(s), %zu line(s), %d px tall",
+           format, drawn, lines.size(), total_h);
   log_line(line);
-  return 1;
+  return total_h;
+}
+
+
+int TRT_GUEST_ABI trt_SetBkMode(void* hdc, i32 mode) {
+  trt_dc_text_state st;
+  if (!dc_text_state(hdc, &st)) return 0;
+  if (mode != 1 && mode != 2) {
+    log_line("gdi32: SetBkMode -> 0 (mode must be TRANSPARENT(1) or OPAQUE(2))");
+    return 0;
+  }
+  const i32 prev = st.bk_mode;
+  st.bk_mode = mode;
+  trt_user32_dc_set_text_state(hdc, &st);
+  char line[96];
+  snprintf(line, sizeof(line), "gdi32: SetBkMode mode=%d (prev=%d)", mode, prev);
+  log_line(line);
+  return prev;
+}
+
+int TRT_GUEST_ABI trt_GetBkMode(void* hdc) {
+  trt_dc_text_state st;
+  if (!dc_text_state(hdc, &st)) return 0;
+  return st.bk_mode;
 }
 
 u32 TRT_GUEST_ABI trt_SetTextColor(void* hdc, u32 color) {
-  if (!trt_user32_dc_is_valid(hdc)) return (u32)-1;
+  trt_dc_text_state st;
+  if (!dc_text_state(hdc, &st)) return (u32)-1;  // CLR_INVALID
+  const u32 prev = st.text_color;
+  st.text_color = color & 0x00FFFFFFu;
+  trt_user32_dc_set_text_state(hdc, &st);
   char line[96];
-  snprintf(line, sizeof(line), "gdi32: SetTextColor color=0x%x (recorded)",
-           color);
+  snprintf(line, sizeof(line), "gdi32: SetTextColor color=0x%06x (prev=0x%06x)",
+           color & 0xFFFFFFu, prev);
   log_line(line);
-  return 0;
+  return prev;
 }
 
 u32 TRT_GUEST_ABI trt_SetBkColor(void* hdc, u32 color) {
-  if (!trt_user32_dc_is_valid(hdc)) return (u32)-1;
+  trt_dc_text_state st;
+  if (!dc_text_state(hdc, &st)) return (u32)-1;  // CLR_INVALID
+  const u32 prev = st.bk_color;
+  st.bk_color = color & 0x00FFFFFFu;
+  trt_user32_dc_set_text_state(hdc, &st);
   char line[96];
-  snprintf(line, sizeof(line), "gdi32: SetBkColor color=0x%x (recorded)",
-           color);
+  snprintf(line, sizeof(line), "gdi32: SetBkColor color=0x%06x (prev=0x%06x)",
+           color & 0xFFFFFFu, prev);
   log_line(line);
-  return 0xFFFFFF;
+  return prev;
 }
 
-int TRT_GUEST_ABI trt_BeginPath(void* hdc) {
-  if (!trt_user32_dc_is_valid(hdc)) return 0;
-  log_line("gdi32: BeginPath (path recording not implemented: fail-visible)");
-  return 1;
+// TA_* flags a DC can hold. Anything outside this set is GDI_ERROR in real
+// GDI, and a caller that trusted a stored bad value draws in the wrong place.
+constexpr u32 GDI_TA_VALID = 0x000001FFu;
+
+u32 TRT_GUEST_ABI trt_SetTextAlign(void* hdc, u32 flags) {
+  trt_dc_text_state st;
+  if (!dc_text_state(hdc, &st)) return (u32)-1;  // GDI_ERROR
+  if (flags & ~GDI_TA_VALID) {
+    char line[112];
+    snprintf(line, sizeof(line),
+             "gdi32: SetTextAlign flags=0x%x -> GDI_ERROR (unknown TA_ bit)",
+             flags);
+    log_line(line);
+    return (u32)-1;
+  }
+  const u32 prev = st.text_align;
+  st.text_align = flags;
+  trt_user32_dc_set_text_state(hdc, &st);
+  return prev;
 }
 
-int TRT_GUEST_ABI trt_EndPath(void* hdc) {
-  if (!trt_user32_dc_is_valid(hdc)) return 0;
-  log_line("gdi32: EndPath (no recorded path: fail-visible)");
-  return 1;
+u32 TRT_GUEST_ABI trt_GetTextAlign(void* hdc) {
+  trt_dc_text_state st;
+  if (!dc_text_state(hdc, &st)) return (u32)-1;  // GDI_ERROR
+  return st.text_align;
+}
+
+// OBJ_* selectors GetCurrentObject accepts, answered from the real per-type
+// selection (OBJ_PEN=1, OBJ_BRUSH=2, OBJ_PAL=5, OBJ_FONT=6, OBJ_BITMAP=7).
+void* TRT_GUEST_ABI trt_GetCurrentObject(void* hdc, u32 type) {
+  if (!trt_user32_dc_is_valid(hdc)) return nullptr;
+  std::lock_guard<std::mutex> lk(g_sel_mu);
+  dc_selection* s = dc_sel(hdc, true);
+  if (!s) return nullptr;
+  switch (type) {
+    case 1: return s->pen;
+    case 2: return s->brush;
+    case 5: return s->palette;
+    case 6: return s->font;
+    case 7: return s->bitmap;
+    default:
+      log_line("gdi32: GetCurrentObject -> NULL (type outside OBJ_PEN..OBJ_PAL)");
+      return nullptr;
+  }
 }
 
 int TRT_GUEST_ABI trt_GetObjectW(void* handle, int cap, void* out) {
@@ -633,78 +1441,451 @@ int TRT_GUEST_ABI trt_GetObjectW(void* handle, int cap, void* out) {
   return 0;
 }
 
+// GetObjectA: ANSI callers ask for LOGFONTA (60 bytes: the same 28-byte fixed
+// part, lfFaceName[32] as bytes). Putty queries its font this way and a
+// fail-visible 0 makes it fall back to bogus metrics.
 int TRT_GUEST_ABI trt_GetObjectA(void* handle, int cap, void* out) {
   gdi_obj* o = obj_by_handle((u32)(uintptr_t)handle);
   if (o && o->type == TRT_GDI_OBJ_BITMAP) return trt_GetObjectW(handle, cap, out);
+  if (o && o->type == TRT_GDI_OBJ_FONT) {
+    constexpr int k_logfonta_bytes = 60;
+    if (!out) return k_logfonta_bytes;
+    if (cap < k_logfonta_bytes) return 0;
+    u8* d = (u8*)out;
+    memset(d, 0, k_logfonta_bytes);
+    memcpy(d, o->data, 28);
+    const u16* face = (const u16*)(o->data + 28);
+    for (int i = 0; i < 31 && face[i]; ++i) d[28 + i] = (u8)(face[i] & 0xFF);
+    return k_logfonta_bytes;
+  }
   log_line("gdi32: GetObjectA -> 0 (object query not implemented: fail-visible)");
   return 0;
 }
 
+// Measured from the selected font (see gdi_metrics): a 16 px cell is 8 px per
+// character, a 32 px cell is 16, and a font created with lfWidth uses it.
+static void gdi_size_text(void* hdc, int c, void* psizl) {
+  gdi_font_metrics m;
+  gdi_metrics(hdc, &m);
+  i32* sz = (i32*)psizl;
+  sz[0] = c * m.ave_w;
+  sz[1] = m.height;
+}
+
 int TRT_GUEST_ABI trt_GetTextExtentPoint32W(void* hdc, const u16* lpString,
                                             int c, void* psizl) {
-  (void)hdc; (void)lpString;
+  (void)lpString;
   if (!psizl) return 0;
-  i32* sz = (i32*)psizl;
-  sz[0] = (c > 0 ? c : 1) * 8;
-  sz[1] = 16;
+  gdi_size_text(hdc, c, psizl);
   return 1;
 }
 int TRT_GUEST_ABI trt_GetTextExtentPoint32A(void* hdc, const char* lpString,
                                             int c, void* psizl) {
-  (void)hdc; (void)lpString;
+  (void)lpString;
   if (!psizl) return 0;
-  i32* sz = (i32*)psizl;
-  sz[0] = (c > 0 ? c : 1) * 8;
-  sz[1] = 16;
+  gdi_size_text(hdc, c, psizl);
   return 1;
 }
-int TRT_GUEST_ABI trt_GetTextMetricsW(void* hdc, void* lptm) {
-  (void)hdc;
-  if (!lptm) return 0;
-  memset(lptm, 0, 60);  // TEXTMETRICW is 60 bytes
+int TRT_GUEST_ABI trt_GetTextExtentPointW(void* hdc, const u16* lpString, int c,
+                                          void* psizl) {
+  (void)lpString;
+  if (!psizl) return 0;
+  gdi_size_text(hdc, c, psizl);
+  return 1;
+}
+int TRT_GUEST_ABI trt_GetTextExtentPointA(void* hdc, const char* lpString, int c,
+                                          void* psizl) {
+  (void)lpString;
+  if (!psizl) return 0;
+  gdi_size_text(hdc, c, psizl);
+  return 1;
+}
+
+// GetTextExtentExPoint*: fills the per-character extent array, the count that
+// fits inside maxExtent, and the FULL string extent in psizl (real GDI leaves
+// psizl unclipped, which is what apps use to size the scroll area).
+static int gdi_extent_ex(void* hdc, int c, i32 max_extent, i32* fit,
+                         i32* dx, void* psizl) {
+  gdi_font_metrics m;
+  gdi_metrics(hdc, &m);
+  int n_fit = 0;
+  for (int i = 0; i < c; ++i) {
+    const i32 upto = (i + 1) * m.ave_w;
+    if (dx) dx[i] = upto;
+    if (upto <= max_extent) n_fit = i + 1;
+  }
+  if (fit) *fit = n_fit;
+  if (psizl) {
+    i32* sz = (i32*)psizl;
+    sz[0] = c * m.ave_w;
+    sz[1] = m.height;
+  }
+  return 1;
+}
+
+int TRT_GUEST_ABI trt_GetTextExtentExPointW(void* hdc, const u16* lpString, int c,
+                                            i32 max_extent, i32* lpnFit,
+                                            i32* lpnDx, void* psizl) {
+  (void)lpString;
+  return gdi_extent_ex(hdc, c, max_extent, lpnFit, lpnDx, psizl);
+}
+int TRT_GUEST_ABI trt_GetTextExtentExPointA(void* hdc, const char* lpString, int c,
+                                            i32 max_extent, i32* lpnFit,
+                                            i32* lpnDx, void* psizl) {
+  (void)lpString;
+  return gdi_extent_ex(hdc, c, max_extent, lpnFit, lpnDx, psizl);
+}
+
+// GetCharWidth*: one advance per character in [first, last].
+static int gdi_char_widths(void* hdc, u32 first, u32 last, i32* buf) {
+  if (!buf) return 0;
+  if (last < first) return 0;
+  gdi_font_metrics m;
+  gdi_metrics(hdc, &m);
+  for (u32 ch = first; ch <= last; ++ch) buf[ch - first] = m.ave_w;
+  return 1;
+}
+int TRT_GUEST_ABI trt_GetCharWidth32W(void* hdc, u32 first, u32 last,
+                                      i32* buf) {
+  return gdi_char_widths(hdc, first, last, buf);
+}
+int TRT_GUEST_ABI trt_GetCharWidth32A(void* hdc, u32 first, u32 last,
+                                      i32* buf) {
+  return gdi_char_widths(hdc, first, last, buf);
+}
+int TRT_GUEST_ABI trt_GetCharWidthW(void* hdc, u32 first, u32 last, i32* buf) {
+  return gdi_char_widths(hdc, first, last, buf);
+}
+int TRT_GUEST_ABI trt_GetCharWidthA(void* hdc, u32 first, u32 last, i32* buf) {
+  return gdi_char_widths(hdc, first, last, buf);
+}
+
+// GetCharABCWidthsFloat*: ABCFLOAT is three floats (a, b, c) per character.
+// The model font has no side bearings, so a and c are zero and b is the advance.
+static int gdi_abc_float(void* hdc, u32 first, u32 last, float* out) {
+  if (!out) return 0;
+  if (last < first) return 0;
+  gdi_font_metrics m;
+  gdi_metrics(hdc, &m);
+  for (u32 ch = first; ch <= last; ++ch) {
+    out[(ch - first) * 3 + 0] = 0.0f;
+    out[(ch - first) * 3 + 1] = (float)m.ave_w;
+    out[(ch - first) * 3 + 2] = 0.0f;
+  }
+  return 1;
+}
+int TRT_GUEST_ABI trt_GetCharABCWidthsFloatW(void* hdc, u32 first, u32 last,
+                                             void* out) {
+  return gdi_abc_float(hdc, first, last, (float*)out);
+}
+int TRT_GUEST_ABI trt_GetCharABCWidthsFloatA(void* hdc, u32 first, u32 last,
+                                             void* out) {
+  return gdi_abc_float(hdc, first, last, (float*)out);
+}
+
+// GetTextMetrics*: TEXTMETRICW is 60 bytes, TEXTMETRICA 56. The leading
+// i32 fields are identical; tmCharSet is the last byte.
+static void gdi_fill_text_metrics(void* hdc, void* lptm, size_t bytes,
+                                  size_t charset_off) {
+  gdi_font_metrics m;
+  gdi_metrics(hdc, &m);
+  memset(lptm, 0, bytes);
   i32* tm = (i32*)lptm;
-  tm[0] = 16;  // tmHeight
-  tm[1] = 13;  // tmAscent
-  tm[2] = 3;   // tmDescent
-  tm[5] = 8;   // tmAveCharWidth
-  tm[6] = 16;  // tmMaxCharWidth
+  tm[0] = m.height;       // tmHeight
+  tm[1] = m.ascent;       // tmAscent
+  tm[2] = m.descent;      // tmDescent
+  tm[3] = 0;              // tmInternalLeading
+  tm[4] = 0;              // tmExternalLeading
+  tm[5] = m.ave_w;        // tmAveCharWidth
+  tm[6] = m.max_w;        // tmMaxCharWidth
+  ((u8*)lptm)[charset_off] = (u8)m.charset;  // tmCharSet
+}
+
+int TRT_GUEST_ABI trt_GetTextMetricsW(void* hdc, void* lptm) {
+  if (!lptm) return 0;
+  gdi_fill_text_metrics(hdc, lptm, 60, 59);
   return 1;
 }
 int TRT_GUEST_ABI trt_GetTextMetricsA(void* hdc, void* lptm) {
-  (void)hdc;
   if (!lptm) return 0;
-  memset(lptm, 0, 56);  // TEXTMETRICA is 56 bytes
-  i32* tm = (i32*)lptm;
-  tm[0] = 16; tm[1] = 13; tm[2] = 3; tm[5] = 8; tm[6] = 16;
+  gdi_fill_text_metrics(hdc, lptm, 56, 55);
   return 1;
 }
+
+// GetCharacterPlacementW: fills GCP_RESULTSW fields the caller provided.
+// Layout (x64, 64 bytes): lStructSize(4+4 pad), lpOutString, lpOrder, lpDx,
+// lpCaretPos, lpClass, lpGlyphs, nGlyphs(4), nMaxFit(4).
+int TRT_GUEST_ABI trt_GetCharacterPlacementW(void* hdc, const u16* lpString,
+                                             int nCount, int nMaxExtent,
+                                             void* lpResults, u32 flags) {
+  (void)lpString; (void)flags;
+  if (!lpResults) return 0;
+  gdi_font_metrics m;
+  gdi_metrics(hdc, &m);
+  u8* r = (u8*)lpResults;
+  void* lp_dx = *(void**)(r + 24);
+  void* lp_caret = *(void**)(r + 32);
+  if (lp_dx) {
+    for (int i = 0; i < nCount; ++i) ((i32*)lp_dx)[i] = (i + 1) * m.ave_w;
+  }
+  if (lp_caret) {
+    for (int i = 0; i < nCount; ++i) ((i32*)lp_caret)[i] = i * m.ave_w;
+  }
+  int fit = 0;
+  while (fit < nCount && (fit + 1) * m.ave_w <= nMaxExtent) ++fit;
+  *(u32*)(r + 56) = (u32)nCount;  // nGlyphs
+  *(i32*)(r + 60) = fit;          // nMaxFit
+  return nCount * m.ave_w;
+}
+
+// TranslateCharsetInfo: real charset <-> codepage table. Unknown input is a
+// named FALSE, never a guessed codepage.
+struct charset_cp {
+  u32 charset;
+  u32 codepage;
+};
+static const charset_cp k_charset_cp[] = {
+    {0, 1252},    // ANSI_CHARSET
+    {2, 1252},    // SYMBOL_CHARSET (no distinct ACP; Windows maps to 1252)
+    {128, 932},   // SHIFTJIS_CHARSET
+    {129, 949},   // HANGUL_CHARSET
+    {134, 936},   // GB2312_CHARSET
+    {136, 950},   // CHINESEBIG5_CHARSET
+    {161, 1253},  // GREEK_CHARSET
+    {162, 1254},  // TURKISH_CHARSET
+    {163, 1258},  // VIETNAMESE_CHARSET
+    {177, 1255},  // HEBREW_CHARSET
+    {178, 1256},  // ARABIC_CHARSET
+    {186, 1257},  // BALTIC_CHARSET
+    {204, 1251},  // RUSSIAN_CHARSET
+    {222, 874},   // THAI_CHARSET
+    {238, 1250},  // EASTEUROPE_CHARSET
+    {255, 437},   // OEM_CHARSET
+};
+
+int TRT_GUEST_ABI trt_TranslateCharsetInfo(void* lpSrc, void* lpCs,
+                                           u32 dwFlags) {
+  if (!lpCs) return 0;
+  const u32 src = (u32)(uintptr_t)lpSrc;  // value, not a pointer, for TCI_SRC*
+  u32 charset = 0, codepage = 0;
+  bool found = false;
+  if (dwFlags == 1) {  // TCI_SRCCHARSET
+    charset = src & 0xFFu;
+    for (const charset_cp& e : k_charset_cp)
+      if (e.charset == charset) { codepage = e.codepage; found = true; break; }
+  } else if (dwFlags == 2) {  // TCI_SRCCODEPAGE
+    for (const charset_cp& e : k_charset_cp)
+      if (e.codepage == (src & 0xFFFFu)) {
+        charset = e.charset;
+        codepage = e.codepage;
+        found = true;
+        break;
+      }
+  } else {
+    log_line("gdi32: TranslateCharsetInfo -> FALSE (only TCI_SRCCHARSET/"
+             "TCI_SRCCODEPAGE are implemented)");
+    return 0;
+  }
+  if (!found) {
+    char line[128];
+    snprintf(line, sizeof(line),
+             "gdi32: TranslateCharsetInfo -> FALSE (no codepage for %s 0x%x)",
+             dwFlags == 1 ? "charset" : "codepage", src);
+    log_line(line);
+    return 0;
+  }
+  // CHARSETINFO (32 bytes on x64): ciCharset, ciACP, FONTSIGNATURE fs.
+  memset(lpCs, 0, 32);
+  u32* ci = (u32*)lpCs;
+  ci[0] = charset;
+  ci[1] = codepage;
+  return 1;
+}
+
+// Clip rectangles: these now govern the DC's raster surface, so drawing
+// outside the clip really is discarded.
+int TRT_GUEST_ABI trt_IntersectClipRect(void* hdc, i32 l, i32 t, i32 r,
+                                        i32 b) {
+  if (!trt_user32_dc_is_valid(hdc)) return 0;  // ERROR
+  bool empty = (r <= l || b <= t);
+  if (!empty) trt_raster::intersect_clip(hdc, l, t, r, b, &empty);
+  char line[128];
+  snprintf(line, sizeof(line),
+           "gdi32: IntersectClipRect (%d,%d)-(%d,%d) -> %s", l, t, r, b,
+           empty ? "NULLREGION" : "SIMPLEREGION");
+  log_line(line);
+  return empty ? 1 : 2;  // NULLREGION / SIMPLEREGION
+}
+
+int TRT_GUEST_ABI trt_ExcludeClipRect(void* hdc, i32 l, i32 t, i32 r, i32 b) {
+  if (!trt_user32_dc_is_valid(hdc)) return 0;  // ERROR
+  i32 cl = 0, ct = 0, cr = 0, cb = 0;
+  bool empty = false;
+  if (trt_raster::clip_box(hdc, &cl, &ct, &cr, &cb)) {
+    empty = trt_raster::exclude_clip(hdc, l, t, r, b);
+  }
+  char line[160];
+  snprintf(line, sizeof(line),
+           "gdi32: ExcludeClipRect (%d,%d)-(%d,%d) -> %s", l, t, r, b,
+           empty ? "NULLREGION"
+                 : "SIMPLEREGION (clip kept: single-rect model)");
+  log_line(line);
+  return empty ? 1 : 2;
+}
+
+int TRT_GUEST_ABI trt_UnrealizeObject(void* hobj) {
+  const u32 h = (u32)(uintptr_t)hobj;
+  if ((h & 0xFFFF0000u) == 0x80000000u) return 1;  // stock objects: TRUE
+  log_line("gdi32: UnrealizeObject(non-stock) -> FALSE (no realized palettes)");
+  return 0;
+}
+
+int TRT_GUEST_ABI trt_UpdateColors(void* hdc) {
+  if (!trt_user32_dc_is_valid(hdc)) return 0;
+  return 1;  // palette entries already resolved at blend time; nothing pending
+}
+// ---- text: rasterized into the DC surface -------------------------------
+// ANSI strings widen 1:1 to UTF-16 code units (CP1252 range) and share the W
+// path, so both surfaces paint identical pixels.
+static int textout_w(void* hdc, int x, int y, const u16* lpString, int c) {
+  if (!trt_user32_dc_is_valid(hdc) || !lpString) {
+    log_line("gdi32: TextOutW -> FALSE (not a user32 DC, or NULL string)");
+    return 0;
+  }
+  if (c < 0) {  // -1 means NUL-terminated, per the GDI contract
+    c = 0;
+    while (lpString[c]) ++c;
+  }
+  if (c == 0) return 1;  // empty string: TRUE, nothing to draw
+  trt_raster::text_style st;
+  fill_text_style(hdc, &st);
+  const int n = trt_raster::text(hdc, x, y, lpString, c, st);
+  if (n < 0) {
+    log_line("gdi32: TextOutW -> FALSE (no raster surface for this DC)");
+    return 0;
+  }
+  char line[176];
+  snprintf(line, sizeof(line),
+           "gdi32: TextOutW c=%d cell=%dx%d bg=%s at (%d,%d) -> "
+           "%d px drawn",
+           c, st.advance, st.height, st.bk_mode == 2 ? "opaque" : "transparent",
+           x, y, n * st.advance * st.height);
+  log_line(line);
+  return 1;
+}
+
 int TRT_GUEST_ABI trt_TextOutW(void* hdc, int x, int y, const u16* lpString, int c) {
-  (void)hdc; (void)x; (void)y; (void)lpString;
-  char line[96];
-  snprintf(line, sizeof(line),
-           "gdi32: TextOutW c=%d (glyphs not drawn: fail-visible)", c);
-  log_line(line);
-  return 1;
+  return textout_w(hdc, x, y, lpString, c);
 }
+
 int TRT_GUEST_ABI trt_TextOutA(void* hdc, int x, int y, const char* lpString, int c) {
-  (void)hdc; (void)x; (void)y; (void)lpString;
-  char line[96];
-  snprintf(line, sizeof(line),
-           "gdi32: TextOutA c=%d (glyphs not drawn: fail-visible)", c);
-  log_line(line);
-  return 1;
+  if (!lpString) {
+    log_line("gdi32: TextOutA -> FALSE (NULL string)");
+    return 0;
+  }
+  if (c < 0) {
+    c = 0;
+    while (lpString[c]) ++c;
+  }
+  if (c > 4096) c = 4096;
+  u16 stack_buf[256];
+  u16* wide = c <= 256 ? stack_buf : (u16*)malloc(sizeof(u16) * ((size_t)c + 1));
+  if (!wide) return 0;
+  for (int i = 0; i < c; ++i) wide[i] = (u16)(u8)lpString[i];
+  const int rc = textout_w(hdc, x, y, wide, c);
+  if (wide != stack_buf) free(wide);
+  return rc;
 }
+
 int TRT_GUEST_ABI trt_ExtTextOutW(void* hdc, int x, int y, u32 options,
                                   const void* lprect, const u16* lpString,
                                   u32 c, const int* lpDx) {
-  (void)hdc; (void)x; (void)y; (void)options; (void)lprect;
-  (void)lpString; (void)lpDx;
-  char line[96];
+  if (!trt_user32_dc_is_valid(hdc) || !lpString) {
+    log_line("gdi32: ExtTextOutW -> FALSE (not a user32 DC, or NULL string)");
+    return 0;
+  }
+  if (c == (u32)-1) {
+    c = 0;
+    while (lpString[c]) ++c;
+  }
+  if (c > 4096) c = 4096;
+  constexpr u32 k_ETO_OPAQUE = 0x0002u;
+  constexpr u32 k_ETO_CLIPPED = 0x0004u;
+  trt_raster::text_style st;
+  fill_text_style(hdc, &st);
+
+  // k_ETO_OPAQUE fills the lprect with the background colour before the text,
+  // which is how controls repaint a label cell.
+  if ((options & k_ETO_OPAQUE) && lprect) {
+    const i32* r = (const i32*)lprect;
+    trt_raster::fill(hdc, r[0], r[1], r[2], r[3], st.bg);
+  }
+
+  // lpDx carries per-character advances; the raster takes cumulative pen
+  // positions, so accumulate a bounded copy.
+  std::vector<i32> cum;
+  if (lpDx && c) {
+    cum.resize(c);
+    i32 acc = 0;
+    for (u32 i = 0; i < c; ++i) {
+      acc += lpDx[i];
+      cum[i] = acc;
+    }
+    st.dx = cum.data();
+  }
+
+  // k_ETO_CLIPPED confines drawing to lprect for this call only.
+  i32 saved[4] = {0, 0, 0, 0};
+  const bool have_clip = trt_raster::clip_box(hdc, &saved[0], &saved[1],
+                                             &saved[2], &saved[3]);
+  if ((options & k_ETO_CLIPPED) && lprect) {
+    const i32* r = (const i32*)lprect;
+    bool empty = false;
+    if (have_clip) trt_raster::intersect_clip(hdc, r[0], r[1], r[2], r[3], &empty);
+  }
+
+  const int n = trt_raster::text(hdc, x, y, lpString, (int)c, st);
+
+  if ((options & k_ETO_CLIPPED) && lprect && have_clip)
+    trt_raster::set_clip(hdc, saved[0], saved[1], saved[2], saved[3]);
+
+  if (n < 0) {
+    log_line("gdi32: ExtTextOutW -> FALSE (no raster surface for this DC)");
+    return 0;
+  }
+  char line[176];
   snprintf(line, sizeof(line),
-           "gdi32: ExtTextOutW c=%u (glyphs not drawn: fail-visible)", c);
+           "gdi32: ExtTextOutW c=%u opts=0x%x cell=%dx%d at (%d,%d) -> "
+           "%d px drawn",
+           c, options, st.advance, st.height, x, y,
+           n * st.advance * st.height);
   log_line(line);
   return 1;
 }
+
+int TRT_GUEST_ABI trt_ExtTextOutA(void* hdc, int x, int y, u32 options,
+                                  const void* lprect, const char* lpString,
+                                  u32 c, const int* lpDx) {
+  if (!lpString) return 0;
+  if (c == (u32)-1) {
+    c = 0;
+    while (lpString[c]) ++c;
+  }
+  if (c > 4096) c = 4096;
+  u16 stack_buf[256];
+  u16* wide = c <= 256 ? stack_buf : (u16*)malloc(sizeof(u16) * ((size_t)c + 1));
+  if (!wide) return 0;
+  for (u32 i = 0; i < c; ++i) wide[i] = (u16)(u8)lpString[i];
+  const int rc = trt_ExtTextOutW(hdc, x, y, options, lprect, wide, c, lpDx);
+  if (wide != stack_buf) free(wide);
+  return rc;
+}
+
+// GetOutlineTextMetricsA: OUTLINETEXTMETRICA is byte-compatible with the W
+// struct for every field the model font fills, so this is the W path.
+int TRT_GUEST_ABI trt_GetOutlineTextMetricsA(void* hdc, u32 cb_size,
+                                             void* otm);
+
 int TRT_GUEST_ABI trt_AddFontResourceExW(const u16* name, u32 fl, void* res) {
   (void)name; (void)fl; (void)res;
   return 1;
@@ -720,19 +1901,50 @@ int TRT_GUEST_ABI trt_EnumFontFamiliesExW(void* hdc, void* lpLogfont,
 }
 
 int TRT_GUEST_ABI trt_SelectClipRgn(void* hdc, void* hrgn) {
-  (void)hdc; (void)hrgn;
-  return 2;  // SIMPLEREGION
-}
-int TRT_GUEST_ABI trt_ExtSelectClipRgn(void* hdc, void* hrgn, int mode) {
-  (void)hdc; (void)hrgn; (void)mode;
+  if (!trt_user32_dc_is_valid(hdc)) return 0;  // ERROR
+  if (!hrgn) {  // NULL region = select the whole surface
+    const i32 w = trt_raster::width(hdc), h = trt_raster::height(hdc);
+    trt_raster::set_clip(hdc, 0, 0, w, h);
+    trt_raster::clear_mask(hdc);  // ...and drop any SelectClipPath mask
+    return 2;
+  }
+  gdi_obj* o = obj_by_handle((u32)(uintptr_t)hrgn);
+  if (!o || o->type != TRT_GDI_OBJ_REGION) {
+    log_line("gdi32: SelectClipRgn(bad region handle) -> ERROR");
+    return 0;
+  }
+  trt_raster::set_clip(hdc, o->rg_l, o->rg_t, o->rg_r, o->rg_b);
+  char line[128];
+  trt_raster::clear_mask(hdc);  // a region replaces any SelectClipPath mask
+  snprintf(line, sizeof(line), "gdi32: SelectClipRgn (%d,%d)-(%d,%d)", o->rg_l,
+           o->rg_t, o->rg_r, o->rg_b);
+  log_line(line);
   return 2;
 }
-int TRT_GUEST_ABI trt_GetClipBox(void* hdc, void* lprect) {
-  (void)hdc;
-  if (lprect) {
-    i32* r = (i32*)lprect;
-    r[0] = 0; r[1] = 0; r[2] = 1920; r[3] = 1080;
+int TRT_GUEST_ABI trt_ExtSelectClipRgn(void* hdc, void* hrgn, int mode) {
+  constexpr int k_RGN_AND = 1, k_RGN_DIFF = 4;
+  if (!trt_user32_dc_is_valid(hdc)) return 0;  // ERROR
+  if (mode == k_RGN_AND) return trt_SelectClipRgn(hdc, hrgn);
+  if (mode == k_RGN_DIFF) {
+    log_line("gdi32: ExtSelectClipRgn(k_RGN_DIFF) -> clip unchanged "
+             "(single-rect model: named)");
+    return 2;
   }
+  return trt_SelectClipRgn(hdc, hrgn);
+}
+int TRT_GUEST_ABI trt_GetClipBox(void* hdc, void* lprect) {
+  if (!trt_user32_dc_is_valid(hdc)) return 0;  // ERROR
+  i32 l = 0, t = 0, r = 1920, b = 1080;
+  if (!trt_raster::clip_box(hdc, &l, &t, &r, &b)) {
+    const i32 w = trt_raster::width(hdc), h = trt_raster::height(hdc);
+    (void)w;
+    (void)h;
+  }
+  if (lprect) {
+    i32* rc = (i32*)lprect;
+    rc[0] = l; rc[1] = t; rc[2] = r; rc[3] = b;
+  }
+  if (r <= l || b <= t) return 1;  // NULLREGION
   return 2;
 }
 int TRT_GUEST_ABI trt_SetMapMode(void* hdc, int iMode) {
@@ -748,9 +1960,31 @@ int TRT_GUEST_ABI trt_GetMapMode(void* hdc) {
   (void)hdc;
   return 1;
 }
+// Viewport origin: real GDI adds it to every logical coordinate, which is how
+// a scrolling window reuses one set of drawing coordinates.
+static void dc_translate(void* hdc, int* x, int* y) {
+  std::lock_guard<std::mutex> lk(g_sel_mu);
+  dc_selection* s = dc_sel(hdc, true);
+  if (!s) return;
+  *x += s->vp_x;
+  *y += s->vp_y;
+}
+
 int TRT_GUEST_ABI trt_SetViewportOrgEx(void* hdc, int x, int y, void* lppt) {
-  (void)hdc; (void)x; (void)y;
-  if (lppt) memset(lppt, 0, 8);
+  if (!trt_user32_dc_is_valid(hdc)) {
+    log_line("gdi32: SetViewportOrgEx -> FALSE (not a user32 DC)");
+    return 0;
+  }
+  std::lock_guard<std::mutex> lk(g_sel_mu);
+  dc_selection* s = dc_sel(hdc, true);
+  if (!s) return 0;
+  if (lppt) {  // previous origin, as a POINT
+    i32* p = (i32*)lppt;
+    p[0] = s->vp_x;
+    p[1] = s->vp_y;
+  }
+  s->vp_x = x;
+  s->vp_y = y;
   return 1;
 }
 int TRT_GUEST_ABI trt_SetWindowOrgEx(void* hdc, int x, int y, void* lppt) {
@@ -758,34 +1992,564 @@ int TRT_GUEST_ABI trt_SetWindowOrgEx(void* hdc, int x, int y, void* lppt) {
   if (lppt) memset(lppt, 0, 8);
   return 1;
 }
+// Defined further down (Polyline) and just above it (dc_argb); the path
+// replay needs both.
+int TRT_GUEST_ABI trt_Polyline(void* hdc, const void* apt, int cpt);
+static inline u32 dc_argb(u32 colorref);
+
+// Flatten a recorded path into (x,y) pairs plus per-subpath vertex counts, in
+// device units (the viewport origin is applied here, once).
+static void path_collect(path_rec* p, void* hdc, std::vector<i32>& xy,
+                         std::vector<int>& counts) {
+  xy.clear();
+  counts.clear();
+  if (!p) return;
+  int cur = -1;
+  for (const path_vertex& v : p->v) {
+    if (v.flags & PATH_START) {
+      counts.push_back(0);
+      cur = (int)counts.size() - 1;
+    }
+    if (cur < 0) continue;
+    i32 x = v.x, y = v.y;
+    dc_translate(hdc, &x, &y);
+    xy.push_back(x);
+    xy.push_back(y);
+    counts[(size_t)cur]++;
+  }
+}
+
+static bool path_has_close(const path_rec* p) {
+  for (const path_vertex& v : p->v)
+    if (v.flags & PATH_CLOSE) return true;
+  return false;
+}
+
+// ---- BeginPath: record geometry instead of painting it --------------------
+int TRT_GUEST_ABI trt_BeginPath(void* hdc) {
+  if (!trt_user32_dc_is_valid(hdc)) {
+    log_line("gdi32: BeginPath -> 0 (not a user32 DC)");
+    return 0;
+  }
+  path_rec* p = path_find(hdc, true);
+  if (!p) return 0;
+  p->v.clear();
+  p->open = true;
+  p->closed = false;
+  char line[128];
+  snprintf(line, sizeof(line), "gdi32: BeginPath on DC %p (recording)", hdc);
+  log_line(line);
+  return 1;
+}
+
+int TRT_GUEST_ABI trt_EndPath(void* hdc) {
+  if (!trt_user32_dc_is_valid(hdc)) return 0;
+  path_rec* p = path_find(hdc, false);
+  if (!p || !p->open) {
+    log_line("gdi32: EndPath -> 0 (no BeginPath on this DC)");
+    return 0;
+  }
+  p->open = false;
+  p->closed = !p->v.empty();
+  if (!p->closed) {
+    log_line("gdi32: EndPath recorded an empty path -> 0");
+    return 0;
+  }
+  size_t subs = 0;
+  for (const path_vertex& v : p->v)
+    if (v.flags & PATH_START) ++subs;
+  char line[160];
+  snprintf(line, sizeof(line),
+           "gdi32: EndPath recorded %zu vertices in %zu subpath(s)", p->v.size(),
+           subs);
+  log_line(line);
+  return 1;
+}
+
+int TRT_GUEST_ABI trt_AbortPath(void* hdc) {
+  if (!trt_user32_dc_is_valid(hdc)) return 0;
+  path_rec* p = path_find(hdc, false);
+  if (p) {
+    p->v.clear();
+    p->open = false;
+    p->closed = false;
+  }
+  log_line("gdi32: AbortPath discarded the recorded path");
+  return 1;
+}
+
+int TRT_GUEST_ABI trt_CloseFigure(void* hdc) {
+  if (!trt_user32_dc_is_valid(hdc)) return 0;
+  path_rec* p = path_find(hdc, false);
+  if (!p || !p->open || p->v.empty()) {
+    log_line("gdi32: CloseFigure -> 0 (no open path)");
+    return 0;
+  }
+  path_close(p);
+  return 1;
+}
+
+// GetPath returns logical POINTs and the parallel PBYTE type array; the caller
+// passes both buffers. GDI returns the vertex count, -1 when no path is
+// selected into the DC.
+int TRT_GUEST_ABI trt_GetPath(void* hdc, void* ppt, void* ptypes, int n) {
+  if (!trt_user32_dc_is_valid(hdc)) return -1;
+  path_rec* p = path_find(hdc, false);
+  if (!p || !p->closed) {
+    log_line("gdi32: GetPath -> -1 (no path selected into the DC)");
+    return -1;
+  }
+  const int count = (int)p->v.size();
+  if (!ppt || !ptypes || n < count) {
+    char line[128];
+    snprintf(line, sizeof(line),
+             "gdi32: GetPath needs %d vertices, caller offered %d", count, n);
+    log_line(line);
+    return -1;
+  }
+  i32* pts = (i32*)ppt;
+  u8* types = (u8*)ptypes;
+  for (int i = 0; i < count; ++i) {
+    pts[i * 2] = p->v[(size_t)i].x;
+    pts[i * 2 + 1] = p->v[(size_t)i].y;
+    u8 t = (p->v[(size_t)i].flags & PATH_START) ? 6 : 2;  // PT_MOVETO/PT_LINETO
+    if (p->v[(size_t)i].flags & PATH_CLOSE) t |= 1;       // PT_CLOSEFIGURE
+    types[i] = t;
+  }
+  return count;
+}
+
+int TRT_GUEST_ABI trt_FlattenPath(void* hdc) {
+  if (!trt_user32_dc_is_valid(hdc)) return 0;
+  path_rec* p = path_find(hdc, false);
+  if (!p || !p->closed) {
+    log_line("gdi32: FlattenPath -> 0 (no path selected into the DC)");
+    return 0;
+  }
+  // Curves were recorded as polylines already, so there is nothing to flatten.
+  return 1;
+}
+
+int TRT_GUEST_ABI trt_WidenPath(void* hdc) {
+  if (!trt_user32_dc_is_valid(hdc)) return 0;
+  log_line("gdi32: WidenPath -> 0 (pen-outline conversion not implemented: "
+           "fail-visible)");
+  return 0;
+}
+
+int TRT_GUEST_ABI trt_StrokePath(void* hdc) {
+  if (!trt_user32_dc_is_valid(hdc)) return 0;
+  path_rec* p = path_find(hdc, false);
+  if (!p || !p->closed) {
+    log_line("gdi32: StrokePath -> 0 (no path selected into the DC)");
+    return 0;
+  }
+  if (dc_pen_is_null(hdc)) return 1;  // NULL_PEN: path is consumed, nothing paints
+  std::vector<i32> xy;
+  std::vector<int> counts;
+  path_collect(p, hdc, xy, counts);
+  if (counts.empty()) return 0;
+  trt_raster::stroke_path(hdc, xy.data(), counts.data(), (int)counts.size(),
+                          dc_argb(dc_pen_color(hdc)), 1, path_has_close(p));
+  return 1;
+}
+
+int TRT_GUEST_ABI trt_FillPath(void* hdc) {
+  if (!trt_user32_dc_is_valid(hdc)) return 0;
+  path_rec* p = path_find(hdc, false);
+  if (!p || !p->closed) {
+    log_line("gdi32: FillPath -> 0 (no path selected into the DC)");
+    return 0;
+  }
+  if (dc_brush_is_null(hdc)) return 1;
+  std::vector<i32> xy;
+  std::vector<int> counts;
+  path_collect(p, hdc, xy, counts);
+  if (counts.empty()) return 0;
+  trt_raster::fill_path(hdc, xy.data(), counts.data(), (int)counts.size(),
+                        dc_argb(dc_brush_color(hdc)), p->fill_mode);
+  return 1;
+}
+
+int TRT_GUEST_ABI trt_StrokeAndFillPath(void* hdc) {
+  if (!trt_user32_dc_is_valid(hdc)) return 0;
+  // GDI strokes first, then fills inside the stroke so the fill never covers
+  // the outline.
+  if (!trt_StrokePath(hdc)) return 0;
+  return trt_FillPath(hdc);
+}
+
+// SelectClipPath: RGN_AND (1) intersects, RGN_COPY (5) replaces. OR/XOR/DIFF
+// would need region algebra on a per-pixel mask; they are named, not guessed.
+int TRT_GUEST_ABI trt_SelectClipPath(void* hdc, int mode) {
+  if (!trt_user32_dc_is_valid(hdc)) return 0;
+  path_rec* p = path_find(hdc, false);
+  if (!p || !p->closed) {
+    log_line("gdi32: SelectClipPath -> 0 (no path selected into the DC)");
+    return 0;
+  }
+  const int kAnd = 1, kCopy = 5;
+  if (mode != kAnd && mode != kCopy) {
+    char line[144];
+    snprintf(line, sizeof(line),
+             "gdi32: SelectClipPath mode=%d -> 0 (only RGN_AND/RGN_COPY "
+             "implemented on the raster clip)",
+             mode);
+    log_line(line);
+    return 0;
+  }
+  std::vector<i32> xy;
+  std::vector<int> counts;
+  path_collect(p, hdc, xy, counts);
+  if (counts.empty()) return 0;
+  if (!trt_raster::clip_path(hdc, xy.data(), counts.data(), (int)counts.size(),
+                             p->fill_mode, mode == kAnd)) {
+    log_line("gdi32: SelectClipPath -> 0 (raster surface rejected the mask)");
+    return 0;
+  }
+  return 1;
+}
+
+int TRT_GUEST_ABI trt_SetPolyFillMode(void* hdc, int mode) {
+  if (!trt_user32_dc_is_valid(hdc)) return 0;
+  path_rec* p = path_find(hdc, true);
+  if (!p) return 0;
+  const int prev = p->fill_mode;
+  p->fill_mode = (mode == 2) ? 2 : 1;  // WINDING vs ALTERNATE
+  return prev;
+}
+
+int TRT_GUEST_ABI trt_GetPolyFillMode(void* hdc) {
+  if (!trt_user32_dc_is_valid(hdc)) return 0;
+  path_rec* p = path_find(hdc, false);
+  return p ? p->fill_mode : 1;
+}
+
+// PathToRegion answers with the path's bounding box: a real but coarse region,
+// named here so a caller that relies on the exact outline is visible.
+int TRT_GUEST_ABI trt_PathToRegion(void* hdc) {
+  if (!trt_user32_dc_is_valid(hdc)) return 0;
+  path_rec* p = path_find(hdc, false);
+  if (!p || !p->closed) {
+    log_line("gdi32: PathToRegion -> NULL (no path selected into the DC)");
+    return 0;
+  }
+  std::vector<i32> xy;
+  std::vector<int> counts;
+  path_collect(p, hdc, xy, counts);
+  if (xy.empty()) return 0;
+  i32 l = xy[0], t = xy[1], r = xy[0], b = xy[1];
+  for (size_t i = 0; i + 1 < xy.size(); i += 2) {
+    if (xy[i] < l) l = xy[i];
+    if (xy[i] > r) r = xy[i];
+    if (xy[i + 1] < t) t = xy[i + 1];
+    if (xy[i + 1] > b) b = xy[i + 1];
+  }
+  char line[160];
+  snprintf(line, sizeof(line),
+           "gdi32: PathToRegion -> bounding box (%d,%d)-(%d,%d) (outline "
+           "region not implemented)",
+           l, t, r, b);
+  log_line(line);
+  return (int)(intptr_t)trt_CreateRectRgn(l, t, r + 1, b + 1);
+}
+
+// PolylineTo continues the current position inside an open path.
+int TRT_GUEST_ABI trt_PolylineTo(void* hdc, const void* apt, int cpt) {
+  if (!trt_user32_dc_is_valid(hdc) || !apt || cpt < 1) {
+    log_line("gdi32: PolylineTo -> FALSE (bad DC, NULL points or <1 point)");
+    return 0;
+  }
+  path_rec* p = path_find(hdc, false);
+  if (!p || !p->open) return trt_Polyline(hdc, apt, cpt);
+  const i32* pt = (const i32*)apt;
+  for (int i = 0; i < cpt; ++i) path_to(p, pt[i * 2], pt[i * 2 + 1]);
+  return 1;
+}
+
+// Cubic Beziers are recorded flattened (16 segments per curve).
+static void path_add_bezier(path_rec* p, const i32* pt, int segs) {
+  if (!p || !pt) return;
+  float x0 = (float)p->cur_x, y0 = (float)p->cur_y;
+  for (int s = 0; s < segs; ++s) {
+    const float x1 = (float)pt[s * 6 + 0], y1 = (float)pt[s * 6 + 1];
+    const float x2 = (float)pt[s * 6 + 2], y2 = (float)pt[s * 6 + 3];
+    const float x3 = (float)pt[s * 6 + 4], y3 = (float)pt[s * 6 + 5];
+    const int steps = 16;
+    for (int i = 1; i <= steps; ++i) {
+      const float t = (float)i / (float)steps, u = 1.0f - t;
+      const float bx = u * u * u * x0 + 3.0f * u * u * t * x1 +
+                     3.0f * u * t * t * x2 + t * t * t * x3;
+      const float by = u * u * u * y0 + 3.0f * u * u * t * y1 +
+                     3.0f * u * t * t * y2 + t * t * t * y3;
+      path_to(p, (i32)(bx + 0.5f), (i32)(by + 0.5f));
+    }
+    x0 = x3;
+    y0 = y3;
+  }
+}
+
+int TRT_GUEST_ABI trt_PolyBezier(void* hdc, const void* apt, u32 cpt) {
+  if (!trt_user32_dc_is_valid(hdc) || !apt || cpt < 4 || (cpt - 1) % 3 != 0) {
+    log_line("gdi32: PolyBezier -> FALSE (needs 1 + 3n points)");
+    return 0;
+  }
+  const i32* pt = (const i32*)apt;
+  path_rec* p = path_find(hdc, true);
+  const bool rec = p && p->open;
+  const int segs = (int)((cpt - 1) / 3);
+  if (rec) {
+    path_start(p, pt[0], pt[1]);
+    path_add_bezier(p, pt + 2, segs);
+    return 1;
+  }
+  // Not recording: draw the flattened curve straight onto the surface.
+  if (dc_pen_is_null(hdc)) return 1;
+  std::vector<i32> flat;
+  flat.push_back(pt[0]);
+  flat.push_back(pt[1]);
+  for (int s = 0; s < segs; ++s) {
+    const float x0 = (float)flat[flat.size() - 2], y0 = (float)flat[flat.size() - 1];
+    const float x1 = (float)pt[2 + s * 6 + 0], y1 = (float)pt[2 + s * 6 + 1];
+    const float x2 = (float)pt[2 + s * 6 + 2], y2 = (float)pt[2 + s * 6 + 3];
+    const float x3 = (float)pt[2 + s * 6 + 4], y3 = (float)pt[2 + s * 6 + 5];
+    const int steps = 16;
+    for (int i = 1; i <= steps; ++i) {
+      const float t = (float)i / (float)steps, u = 1.0f - t;
+      flat.push_back((i32)(u * u * u * x0 + 3.0f * u * u * t * x1 +
+                           3.0f * u * t * t * x2 + t * t * t * x3));
+      flat.push_back((i32)(u * u * u * y0 + 3.0f * u * u * t * y1 +
+                           3.0f * u * t * t * y2 + t * t * t * y3));
+    }
+  }
+  const u32 col = dc_pen_color(hdc);
+  for (size_t i = 0; i + 3 < flat.size(); i += 2) {
+    int ax = flat[i], ay = flat[i + 1], bx = flat[i + 2], by = flat[i + 3];
+    dc_translate(hdc, &ax, &ay);
+    dc_translate(hdc, &bx, &by);
+    trt_raster::line(hdc, ax, ay, bx, by, col, 1);
+  }
+  return 1;
+}
+
+int TRT_GUEST_ABI trt_PolyBezierTo(void* hdc, const void* apt, u32 cpt) {
+  if (!trt_user32_dc_is_valid(hdc) || !apt || cpt < 3 || cpt % 3 != 0) {
+    log_line("gdi32: PolyBezierTo -> FALSE (needs 3n points)");
+    return 0;
+  }
+  path_rec* p = path_find(hdc, false);
+  if (!p || !p->open) {
+    log_line("gdi32: PolyBezierTo -> FALSE (no open path)");
+    return 0;
+  }
+  path_add_bezier(p, (const i32*)apt, (int)(cpt / 3));
+  return 1;
+}
+
 int TRT_GUEST_ABI trt_MoveToEx(void* hdc, int x, int y, void* lppt) {
-  (void)hdc; (void)x; (void)y;
-  if (lppt) memset(lppt, 0, 8);
+  if (!trt_user32_dc_is_valid(hdc)) {
+    log_line("gdi32: MoveToEx -> FALSE (not a user32 DC)");
+    return 0;
+  }
+  std::lock_guard<std::mutex> lk(g_sel_mu);
+  dc_selection* s = dc_sel(hdc, true);
+  if (!s) return 0;
+  if (lppt) {
+    i32* p = (i32*)lppt;
+    p[0] = s->cur_x;
+    p[1] = s->cur_y;
+  }
+  s->cur_x = x;
+  s->cur_y = y;
+  path_rec* pr = path_find(hdc, false);
+  if (pr && pr->open) path_start(pr, x, y);  // BeginPath: subpath start
   return 1;
 }
 int TRT_GUEST_ABI trt_LineTo(void* hdc, int x, int y) {
-  (void)hdc; (void)x; (void)y;
+  if (!trt_user32_dc_is_valid(hdc)) {
+    log_line("gdi32: LineTo -> FALSE (not a user32 DC)");
+    return 0;
+  }
+  i32 x0 = 0, y0 = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_sel_mu);
+    dc_selection* s = dc_sel(hdc, true);
+    if (!s) return 0;
+    x0 = s->cur_x;
+    y0 = s->cur_y;
+    s->cur_x = x;
+    s->cur_y = y;
+  }
+  if (path_recording(hdc)) {  // BeginPath: line goes into the path
+    path_to(path_find(hdc, false), x, y);
+    return 1;
+  }
+  if (dc_pen_is_null(hdc)) return 1;  // NULL_PEN: position moves, nothing paints
+  int dx0 = x0, dy0 = y0, dx1 = x, dy1 = y;
+  dc_translate(hdc, &dx0, &dy0);
+  dc_translate(hdc, &dx1, &dy1);
+  trt_raster::line(hdc, dx0, dy0, dx1, dy1, dc_pen_color(hdc), 1);
   return 1;
 }
 int TRT_GUEST_ABI trt_Rectangle(void* hdc, int l, int t, int r, int b) {
-  (void)hdc; (void)l; (void)t; (void)r; (void)b;
+  if (!trt_user32_dc_is_valid(hdc)) {
+    log_line("gdi32: Rectangle -> FALSE (not a user32 DC)");
+    return 0;
+  }
+  if (path_recording(hdc)) {  // BeginPath: the rect becomes a closed subpath
+    path_record_rect(path_find(hdc, false), l, t, r, b);
+    return 1;
+  }
+  dc_translate(hdc, &l, &t);
+  dc_translate(hdc, &r, &b);
+  if (!dc_brush_is_null(hdc)) trt_raster::fill(hdc, l, t, r, b, dc_brush_color(hdc));
+  if (!dc_pen_is_null(hdc)) trt_raster::frame(hdc, l, t, r, b, dc_pen_color(hdc), 1);
   return 1;
 }
 int TRT_GUEST_ABI trt_Ellipse(void* hdc, int l, int t, int r, int b) {
-  (void)hdc; (void)l; (void)t; (void)r; (void)b;
+  if (!trt_user32_dc_is_valid(hdc)) {
+    log_line("gdi32: Ellipse -> FALSE (not a user32 DC)");
+    return 0;
+  }
+  if (path_recording(hdc)) {
+    path_record_ellipse(path_find(hdc, false), l, t, r, b);
+    return 1;
+  }
+  dc_translate(hdc, &l, &t);
+  dc_translate(hdc, &r, &b);
+  if (dc_brush_is_null(hdc) && dc_pen_is_null(hdc)) return 1;
+  const bool filled = !dc_brush_is_null(hdc);
+  trt_raster::ellipse(hdc, l, t, r, b,
+                      filled ? dc_brush_color(hdc) : dc_pen_color(hdc),
+                      filled && !dc_pen_is_null(hdc) ? 2 : 1, filled);
+  if (filled && !dc_pen_is_null(hdc))
+    trt_raster::ellipse(hdc, l, t, r, b, dc_pen_color(hdc), 1, false);
   return 1;
 }
 int TRT_GUEST_ABI trt_Polygon(void* hdc, const void* apt, int cpt) {
-  (void)hdc; (void)apt; (void)cpt;
+  if (!trt_user32_dc_is_valid(hdc) || !apt || cpt < 2) {
+    log_line("gdi32: Polygon -> FALSE (bad DC, NULL points or <2 points)");
+    return 0;
+  }
+  const i32* pt = (const i32*)apt;  // POINT { LONG x, y }
+  if (path_recording(hdc)) {
+    path_rec* pr = path_find(hdc, false);
+    path_start(pr, pt[0], pt[1]);
+    for (int i = 1; i < cpt; ++i) path_to(pr, pt[i * 2], pt[i * 2 + 1]);
+    path_close(pr);
+    return 1;
+  }
+  std::vector<i32> xy((size_t)cpt * 2);
+  for (int i = 0; i < cpt; ++i) {
+    xy[(size_t)i * 2] = pt[i * 2];
+    xy[(size_t)i * 2 + 1] = pt[i * 2 + 1];
+    dc_translate(hdc, &xy[(size_t)i * 2], &xy[(size_t)i * 2 + 1]);
+  }
+  if (!dc_brush_is_null(hdc))
+    trt_raster::polygon(hdc, xy.data(), cpt, dc_brush_color(hdc), 1, true);
+  if (!dc_pen_is_null(hdc))
+    trt_raster::polygon(hdc, xy.data(), cpt, dc_pen_color(hdc), 1, false);
   return 1;
 }
 int TRT_GUEST_ABI trt_Polyline(void* hdc, const void* apt, int cpt) {
-  (void)hdc; (void)apt; (void)cpt;
+  if (!trt_user32_dc_is_valid(hdc) || !apt || cpt < 2) {
+    log_line("gdi32: Polyline -> FALSE (bad DC, NULL points or <2 points)");
+    return 0;
+  }
+  if (path_recording(hdc)) {
+    path_rec* pr = path_find(hdc, false);
+    const i32* rp = (const i32*)apt;
+    for (int i = 0; i < cpt; ++i) path_to(pr, rp[i * 2], rp[i * 2 + 1]);
+    return 1;
+  }
+  if (dc_pen_is_null(hdc)) return 1;
+  const i32* pt = (const i32*)apt;
+  const u32 col = dc_pen_color(hdc);
+  for (int i = 0; i + 1 < cpt; ++i) {
+    int x0 = pt[i * 2], y0 = pt[i * 2 + 1];
+    int x1 = pt[(i + 1) * 2], y1 = pt[(i + 1) * 2 + 1];
+    dc_translate(hdc, &x0, &y0);
+    dc_translate(hdc, &x1, &y1);
+    trt_raster::line(hdc, x0, y0, x1, y1, col, 1);
+  }
   return 1;
 }
-int TRT_GUEST_ABI trt_RoundRect(void* hdc, int l, int t, int r, int b, int w, int h) {
-  (void)hdc; (void)l; (void)t; (void)r; (void)b; (void)w; (void)h;
+// COLORREF 0x00BBGGRR -> 0xAARRGGBB for the raster's alpha-aware primitives.
+static inline u32 dc_argb(u32 colorref) {
+  return 0xFF000000u | ((colorref & 0xFFu) << 16) | (colorref & 0x00FF00u) |
+         ((colorref >> 16) & 0xFFu);
+}
+
+int TRT_GUEST_ABI trt_RoundRect(void* hdc, int l, int t, int r, int b, int w,
+                                int h) {
+  if (!trt_user32_dc_is_valid(hdc)) {
+    log_line("gdi32: RoundRect -> FALSE (not a user32 DC)");
+    return 0;
+  }
+  if (path_recording(hdc)) {
+    path_record_round_rect(path_find(hdc, false), l, t, r, b, w, h);
+    return 1;
+  }
+  dc_translate(hdc, &l, &t);
+  dc_translate(hdc, &r, &b);
+  if (dc_brush_is_null(hdc) && dc_pen_is_null(hdc)) return 1;
+  // Real elliptical corners: the corner ellipse is w x h, centered on the
+  // rectangle corner (GDI semantics).
+  const i32 ew = w > 0 ? w : 1;
+  const i32 eh = h > 0 ? h : 1;
+  const bool filled = !dc_brush_is_null(hdc);
+  if (filled)
+    trt_raster::round_rect(hdc, l, t, r, b, ew, eh,
+                           dc_argb(dc_brush_color(hdc)), 1, true);
+  if (!dc_pen_is_null(hdc))
+    trt_raster::round_rect(hdc, l, t, r, b, ew, eh, dc_argb(dc_pen_color(hdc)),
+                           1, false);
   return 1;
+}
+// ---- arcs -----------------------------------------------------------------
+// GDI Arc/Pie/Chord take two radial points on the bounding ellipse. mode:
+// 0 = Arc (outline), 1 = Pie (filled wedge), 2 = Chord (filled segment).
+static int arc_common(void* hdc, int l, int t, int r, int b, int sx, int sy,
+                      int ex, int ey, int mode) {
+  if (!trt_user32_dc_is_valid(hdc)) {
+    log_line("gdi32: Arc/Pie/Chord -> FALSE (not a user32 DC)");
+    return 0;
+  }
+  if (path_recording(hdc)) {
+    path_record_arc(path_find(hdc, false), l, t, r, b, sx, sy, ex, ey, mode);
+    return 1;
+  }
+  dc_translate(hdc, &l, &t);
+  dc_translate(hdc, &r, &b);
+  dc_translate(hdc, &sx, &sy);
+  dc_translate(hdc, &ex, &ey);
+  if (dc_brush_is_null(hdc) && dc_pen_is_null(hdc)) return 1;
+  // Arc is an outline only; Pie/Chord fill with the brush and then outline the
+  // curved edge with the pen.
+  if (mode == 0 || dc_brush_is_null(hdc)) {
+    const u32 pen = dc_pen_is_null(hdc) ? dc_brush_color(hdc) : dc_pen_color(hdc);
+    trt_raster::arc(hdc, l, t, r, b, sx, sy, ex, ey, dc_argb(pen), 1,
+                    mode == 0 ? 0 : mode);
+  } else {
+    trt_raster::arc(hdc, l, t, r, b, sx, sy, ex, ey,
+                    dc_argb(dc_brush_color(hdc)), 1, mode);
+  }
+  if (mode != 0 && !dc_pen_is_null(hdc))
+    trt_raster::arc(hdc, l, t, r, b, sx, sy, ex, ey, dc_argb(dc_pen_color(hdc)),
+                    1, 0);
+  return 1;
+}
+int TRT_GUEST_ABI trt_Arc(void* hdc, int l, int t, int r, int b, int sx, int sy,
+                          int ex, int ey) {
+  return arc_common(hdc, l, t, r, b, sx, sy, ex, ey, 0);
+}
+int TRT_GUEST_ABI trt_Pie(void* hdc, int l, int t, int r, int b, int sx, int sy,
+                          int ex, int ey) {
+  return arc_common(hdc, l, t, r, b, sx, sy, ex, ey, 1);
+}
+int TRT_GUEST_ABI trt_Chord(void* hdc, int l, int t, int r, int b, int sx,
+                            int sy, int ex, int ey) {
+  return arc_common(hdc, l, t, r, b, sx, sy, ex, ey, 2);
 }
 int TRT_GUEST_ABI trt_GdiFlush(void) { return 1; }
 
@@ -820,13 +2584,23 @@ int TRT_GUEST_ABI trt_DescribePixelFormat(void* hdc, int iPixelFormat,
   return 1;
 }
 u32 TRT_GUEST_ABI trt_SetDCBrushColor(void* hdc, u32 color) {
-  (void)hdc;
-  char line[96];
-  snprintf(line, sizeof(line),
-           "gdi32: SetDCBrushColor(%06x) -> 000000 (no DC brush state)",
-           color & 0xFFFFFFu);
-  log_line(line);
-  return 0;  // previous color: black (no state tracked)
+  if (!trt_user32_dc_is_valid(hdc)) return 0xFFFFFFFFu;  // CLR_INVALID
+  std::lock_guard<std::mutex> lk(g_sel_mu);
+  dc_selection* s = dc_sel(hdc, true);
+  if (!s) return 0xFFFFFFFFu;
+  const u32 prev = s->brush_color;
+  s->brush_color = color & 0x00FFFFFFu;
+  return prev;
+}
+
+u32 TRT_GUEST_ABI trt_SetDCPenColor(void* hdc, u32 color) {
+  if (!trt_user32_dc_is_valid(hdc)) return 0xFFFFFFFFu;  // CLR_INVALID
+  std::lock_guard<std::mutex> lk(g_sel_mu);
+  dc_selection* s = dc_sel(hdc, true);
+  if (!s) return 0xFFFFFFFFu;
+  const u32 prev = s->pen_color;
+  s->pen_color = color & 0x00FFFFFFu;
+  return prev;
 }
 int TRT_GUEST_ABI trt_GetPixelFormat(void* hdc) {
   (void)hdc;
@@ -1131,6 +2905,11 @@ u32 TRT_GUEST_ABI trt_GetOutlineTextMetricsW(void* hdc, u32 cb_size, void* otm) 
   return to_write;
 }
 
+int TRT_GUEST_ABI trt_GetOutlineTextMetricsA(void* hdc, u32 cb_size,
+                                             void* otm) {
+  return trt_GetOutlineTextMetricsW(hdc, cb_size, otm);
+}
+
 int trt_bridge_register_gdi(void) {
   static const trt_named_fn k_gdi32_fns[] = {
       {"GetICMProfileW", (void*)&gdi_GetICMProfileW},
@@ -1184,10 +2963,46 @@ int trt_bridge_register_gdi(void) {
       {"SelectObject", (void*)&trt_SelectObject},
       {"DeleteObject", (void*)&trt_DeleteObject},
       {"SetBkMode", (void*)&trt_SetBkMode},
+      {"GetBkMode", (void*)&trt_GetBkMode},
       {"SetTextColor", (void*)&trt_SetTextColor},
       {"SetBkColor", (void*)&trt_SetBkColor},
+      {"SetTextAlign", (void*)&trt_SetTextAlign},
+      {"GetTextAlign", (void*)&trt_GetTextAlign},
+      {"GetCurrentObject", (void*)&trt_GetCurrentObject},
+      {"GetTextExtentPointA", (void*)&trt_GetTextExtentPointA},
+      {"GetTextExtentPointW", (void*)&trt_GetTextExtentPointW},
+      {"GetTextExtentExPointA", (void*)&trt_GetTextExtentExPointA},
+      {"GetTextExtentExPointW", (void*)&trt_GetTextExtentExPointW},
+      {"GetCharWidth32A", (void*)&trt_GetCharWidth32A},
+      {"GetCharWidth32W", (void*)&trt_GetCharWidth32W},
+      {"GetCharWidthA", (void*)&trt_GetCharWidthA},
+      {"GetCharWidthW", (void*)&trt_GetCharWidthW},
+      {"GetCharABCWidthsFloatA", (void*)&trt_GetCharABCWidthsFloatA},
+      {"GetCharABCWidthsFloatW", (void*)&trt_GetCharABCWidthsFloatW},
+      {"GetCharacterPlacementW", (void*)&trt_GetCharacterPlacementW},
+      {"TranslateCharsetInfo", (void*)&trt_TranslateCharsetInfo},
+      {"IntersectClipRect", (void*)&trt_IntersectClipRect},
+      {"ExcludeClipRect", (void*)&trt_ExcludeClipRect},
+      {"UnrealizeObject", (void*)&trt_UnrealizeObject},
+      {"UpdateColors", (void*)&trt_UpdateColors},
+      {"GetOutlineTextMetricsA", (void*)&trt_GetOutlineTextMetricsA},
       {"BeginPath", (void*)&trt_BeginPath},
       {"EndPath", (void*)&trt_EndPath},
+      {"AbortPath", (void*)&trt_AbortPath},
+      {"CloseFigure", (void*)&trt_CloseFigure},
+      {"GetPath", (void*)&trt_GetPath},
+      {"FlattenPath", (void*)&trt_FlattenPath},
+      {"WidenPath", (void*)&trt_WidenPath},
+      {"StrokePath", (void*)&trt_StrokePath},
+      {"FillPath", (void*)&trt_FillPath},
+      {"StrokeAndFillPath", (void*)&trt_StrokeAndFillPath},
+      {"SelectClipPath", (void*)&trt_SelectClipPath},
+      {"SetPolyFillMode", (void*)&trt_SetPolyFillMode},
+      {"GetPolyFillMode", (void*)&trt_GetPolyFillMode},
+      {"PathToRegion", (void*)&trt_PathToRegion},
+      {"PolylineTo", (void*)&trt_PolylineTo},
+      {"PolyBezier", (void*)&trt_PolyBezier},
+      {"PolyBezierTo", (void*)&trt_PolyBezierTo},
       {"GetObjectW", (void*)&trt_GetObjectW},
       {"GetObjectA", (void*)&trt_GetObjectA},
       {"GetTextExtentPoint32W", (void*)&trt_GetTextExtentPoint32W},
@@ -1197,6 +3012,7 @@ int trt_bridge_register_gdi(void) {
       {"TextOutW", (void*)&trt_TextOutW},
       {"TextOutA", (void*)&trt_TextOutA},
       {"ExtTextOutW", (void*)&trt_ExtTextOutW},
+      {"ExtTextOutA", (void*)&trt_ExtTextOutA},
       {"ExtEscape", (void*)&trt_ExtEscape},
       {"GetGlyphOutlineW", (void*)&trt_GetGlyphOutlineW},
       {"GetKerningPairsW", (void*)&trt_GetKerningPairsW},
@@ -1227,12 +3043,16 @@ int trt_bridge_register_gdi(void) {
       {"Polygon", (void*)&trt_Polygon},
       {"Polyline", (void*)&trt_Polyline},
       {"RoundRect", (void*)&trt_RoundRect},
+      {"Arc", (void*)&trt_Arc},
+      {"Pie", (void*)&trt_Pie},
+      {"Chord", (void*)&trt_Chord},
       {"GdiFlush", (void*)&trt_GdiFlush},
       {"ChoosePixelFormat", (void*)&trt_ChoosePixelFormat},
       {"DescribePixelFormat", (void*)&trt_DescribePixelFormat},
       {"SetPixelFormat", (void*)&trt_SetPixelFormat},
       {"GetPixelFormat", (void*)&trt_GetPixelFormat},
       {"SetDCBrushColor", (void*)&trt_SetDCBrushColor},
+      {"SetDCPenColor", (void*)&trt_SetDCPenColor},
       {"SwapBuffers", (void*)&trt_SwapBuffers},
       {"SetDeviceGammaRamp", (void*)&trt_SetDeviceGammaRamp},
       {"GetDeviceGammaRamp", (void*)&trt_GetDeviceGammaRamp},

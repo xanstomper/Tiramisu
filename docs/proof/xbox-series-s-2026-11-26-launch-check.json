@@ -1,0 +1,577 @@
+{
+  "date": "2026-11-26",
+  "console": "Xbox Series S, Dev Mode",
+  "entry_point": "Play",
+  "cuphead": {
+    "architecture": "PE32+ x64",
+    "renderer": "D3D11",
+    "runs": [
+      {
+        "package": "0.2.4.18",
+        "guest_code_and_asset_open": true,
+        "screenshot": "Black with cursor"
+      },
+      {
+        "package": "0.2.4.19",
+        "successful_presents": 2948,
+        "screenshot": "Black with cursor"
+      },
+      {
+        "package": "0.2.4.21",
+        "device_calls": 1,
+        "swapchains": 1,
+        "successful_presents": 2631,
+        "input_vertices_in_first_nonempty_draw_sample": 24,
+        "pixel_shader_invocations_in_first_nonempty_draw_sample": 307200,
+        "screenshot": "Black with cursor"
+      },
+      {
+        "package": "0.2.4.22",
+        "get_buffer_calls": 2,
+        "successful_presents_at_probe_read": 1779,
+        "last_present_hresult": 0,
+        "surface_probe_hresult": 0,
+        "sampled_frame_pairs": 15,
+        "sample_points_per_surface_per_frame": 16,
+        "max_lit_guest_sample_points": 0,
+        "max_lit_host_sample_points_before_cursor": 0,
+        "screenshot_at_65_seconds": "Black with cursor"
+      },
+      {
+        "package": "0.2.4.24",
+        "device_calls": 1,
+        "swapchains": 1,
+        "initial_guest_backbuffer": [
+          1920,
+          1080
+        ],
+        "guest_backbuffer_at_65_seconds": [
+          320,
+          240
+        ],
+        "successful_presents_at_65_seconds": 2389,
+        "pixel_shader_invocations_in_first_nonempty_draw_sample": 307200,
+        "sampled_frame_pairs": 20,
+        "sample_points_per_surface_per_frame": 16,
+        "max_lit_guest_sample_points": 0,
+        "max_lit_host_sample_points_before_cursor": 0,
+        "lit_pixels_in_480x270_capture_at_65_seconds": 136,
+        "menu_observed": false,
+        "remote_keyboard_visible_response": false
+      },
+      {
+        "package": "0.2.4.25",
+        "successful_presents_at_65_seconds": 2351,
+        "guest_backbuffer_at_65_seconds": [
+          320,
+          240
+        ],
+        "pixel_shader_invocations_in_first_nonempty_draw_sample": 307200,
+        "sampled_frame_pairs": 19,
+        "max_lit_guest_sample_points": 0,
+        "max_lit_host_sample_points_before_cursor": 0,
+        "lit_pixels_in_480x270_capture_at_65_seconds": 136,
+        "menu_observed": false
+      },
+      {
+        "package": "0.2.4.26",
+        "successful_presents_at_65_seconds": 2366,
+        "guest_backbuffer_at_65_seconds": [
+          320,
+          240
+        ],
+        "pixel_shader_invocations_in_first_nonempty_draw_sample": 307200,
+        "sampled_frame_pairs": 20,
+        "max_lit_guest_sample_points": 0,
+        "max_lit_host_sample_points_before_cursor": 0,
+        "lit_pixels_in_480x270_capture_at_65_seconds": 136,
+        "menu_observed": false
+      },
+      {
+        "package": "0.2.4.27",
+        "successful_presents_at_65_seconds": 2263,
+        "guest_backbuffer_at_65_seconds": [
+          320,
+          240
+        ],
+        "pixel_shader_invocations_in_first_nonempty_draw_sample": 307200,
+        "sampled_frame_pairs": 19,
+        "max_lit_guest_sample_points": 0,
+        "max_lit_host_sample_points_before_cursor": 0,
+        "menu_observed": false
+      },
+      {
+        "package": "0.2.4.28",
+        "successful_presents_at_65_seconds": 2258,
+        "guest_backbuffer_at_65_seconds": [
+          320,
+          240
+        ],
+        "pipeline_samples": 19,
+        "nonempty_draw_samples": 19,
+        "present_slot_zero_guest_backbuffer_observations": 0,
+        "present_slot_zero_other_resource_observations": 19,
+        "sampled_frame_pairs": 19,
+        "max_lit_guest_sample_points": 0,
+        "max_lit_host_sample_points_before_cursor": 0,
+        "menu_observed": false
+      },
+      {
+        "package": "0.2.4.29",
+        "successful_presents_at_65_seconds": 2255,
+        "guest_backbuffer_at_65_seconds": [
+          320,
+          240
+        ],
+        "pipeline_samples": 19,
+        "nonempty_draw_samples": 19,
+        "menu_observed": false,
+        "present_slot_zero_other_resource_observations": 19,
+        "other_surface_size": [
+          320,
+          240
+        ],
+        "other_surface_dxgi_format": 27,
+        "other_surface_samples": 19,
+        "max_lit_other_sample_points": 0,
+        "max_lit_guest_sample_points": 0,
+        "max_lit_host_sample_points_before_cursor": 0
+      },
+      {
+        "package": "0.2.4.30",
+        "successful_presents_at_65_seconds": 2320,
+        "guest_backbuffer_at_65_seconds": [
+          320,
+          240
+        ],
+        "pipeline_samples": 19,
+        "nonempty_draw_samples": 19,
+        "input_vertices_in_first_nonempty_draw_sample": 24,
+        "pixel_shader_invocations_in_first_nonempty_draw_sample": 307200,
+        "present_slot_zero_other_resource_observations": 19,
+        "other_surface_size": [
+          320,
+          240
+        ],
+        "other_surface_dxgi_format": 27,
+        "other_surface_samples": 19,
+        "max_lit_other_sample_points": 0,
+        "max_lit_guest_sample_points": 0,
+        "max_lit_host_sample_points_before_cursor": 0,
+        "menu_observed": false,
+        "visible_response_to_remote_keyboard": false
+      },
+      {
+        "package": "0.2.4.31",
+        "successful_presents_at_65_seconds": 2321,
+        "guest_backbuffer_at_65_seconds": [
+          320,
+          240
+        ],
+        "pipeline_samples": 19,
+        "nonempty_draw_samples": 19,
+        "input_vertices_in_first_nonempty_draw_sample": 24,
+        "pixel_shader_invocations_in_first_nonempty_draw_sample": 307200,
+        "present_slot_zero_other_resource_observations": 19,
+        "other_surface_size": [
+          320,
+          240
+        ],
+        "other_surface_dxgi_format": 27,
+        "other_surface_samples": 19,
+        "max_lit_other_sample_points": 0,
+        "max_lit_guest_sample_points": 0,
+        "max_lit_host_sample_points_before_cursor": 0,
+        "menu_observed": false,
+        "visible_response_to_remote_keyboard": false
+      },
+      {
+        "package": "0.2.4.32",
+        "successful_presents_at_65_seconds": 2305,
+        "guest_backbuffer_at_65_seconds": [
+          320,
+          240
+        ],
+        "pipeline_samples": 19,
+        "nonempty_draw_samples": 19,
+        "max_lit_other_sample_points": 0,
+        "max_lit_guest_sample_points": 0,
+        "max_lit_host_sample_points_before_cursor": 0,
+        "menu_observed": false,
+        "visible_response_to_remote_keyboard": false
+      },
+      {
+        "package": "0.2.4.33",
+        "successful_presents_at_65_seconds": 2292,
+        "guest_backbuffer_at_65_seconds": [
+          320,
+          240
+        ],
+        "pipeline_samples": 19,
+        "nonempty_draw_samples": 19,
+        "max_lit_other_sample_points": 0,
+        "max_lit_guest_sample_points": 0,
+        "max_lit_host_sample_points_before_cursor": 0,
+        "instrumented_api_calls_at_65_seconds": 183039,
+        "menu_observed": false,
+        "visible_response_to_remote_keyboard": false
+      },
+      {
+        "package": "0.2.4.34",
+        "mode": "fresh writable C drive",
+        "successful_presents_at_65_seconds": 2310,
+        "guest_backbuffer_at_65_seconds": [
+          320,
+          240
+        ],
+        "pipeline_samples": 19,
+        "nonempty_draw_samples": 19,
+        "max_lit_guest_sample_points": 0,
+        "max_lit_host_sample_points_before_cursor": 0,
+        "menu_observed": false,
+        "visible_response_to_remote_keyboard": false,
+        "sample_at_10_seconds": {
+          "d3d11_swapchains": 1,
+          "d3d11_get_buffer_calls": 1,
+          "d3d11_width": 1920,
+          "d3d11_height": 1080,
+          "d3d11_successful_presents": 0
+        },
+        "sample_at_24_seconds": {
+          "d3d11_swapchains": 1,
+          "d3d11_get_buffer_calls": 2,
+          "d3d11_width": 320,
+          "d3d11_height": 240,
+          "d3d11_successful_presents": 122
+        }
+      },
+      {
+        "package": "0.2.4.35",
+        "mode": "fresh writable C drive and initial 1280x720 zero-size DXGI creation",
+        "successful_presents_at_65_seconds": 2375,
+        "guest_backbuffer_at_65_seconds": [
+          320,
+          240
+        ],
+        "pipeline_samples": 20,
+        "nonempty_draw_samples": 20,
+        "max_lit_guest_sample_points": 0,
+        "max_lit_host_sample_points_before_cursor": 0,
+        "menu_observed": false,
+        "visible_response_to_remote_keyboard": false,
+        "sample_at_10_seconds": {
+          "d3d11_swapchains": 1,
+          "d3d11_get_buffer_calls": 1,
+          "d3d11_width": 1280,
+          "d3d11_height": 720,
+          "d3d11_successful_presents": 0
+        },
+        "sample_at_24_seconds": {
+          "d3d11_swapchains": 1,
+          "d3d11_get_buffer_calls": 2,
+          "d3d11_width": 320,
+          "d3d11_height": 240,
+          "d3d11_successful_presents": 120
+        }
+      },
+      {
+        "package": "0.2.4.37",
+        "mode": "standard",
+        "successful_presents_at_65_seconds": 2297,
+        "guest_backbuffer_at_65_seconds": [
+          320,
+          240
+        ],
+        "pipeline_samples": 19,
+        "nonempty_draw_samples": 19,
+        "max_lit_guest_sample_points": 0,
+        "max_lit_host_sample_points_before_cursor": 0,
+        "menu_observed": false,
+        "visible_response_to_remote_keyboard": false
+      },
+      {
+        "package": "0.2.4.38",
+        "mode": "standard",
+        "window_activation_fix": true,
+        "successful_presents_at_65_seconds": 2306,
+        "guest_backbuffer_at_65_seconds": [
+          320,
+          240
+        ],
+        "draw_samples": 19,
+        "max_lit_guest_sample_points": 0,
+        "max_lit_host_sample_points_before_cursor": 0,
+        "menu_observed": false,
+        "visible_response_to_remote_keyboard": false
+      },
+      {
+        "package": "0.2.4.39",
+        "mode": "standard",
+        "successful_presents_at_65_seconds": 2299,
+        "guest_backbuffer_at_65_seconds": [
+          320,
+          240
+        ],
+        "guest_lit_sample_points": 0,
+        "host_lit_sample_points_before_cursor": 0,
+        "resize_target_calls": 1,
+        "last_resize_target_request": [
+          0,
+          0
+        ],
+        "last_resize_target_result": "0x887a0001",
+        "last_resize_buffers_request": [
+          320,
+          240
+        ],
+        "successful_presents_at_last_buffer_resize": 0,
+        "menu_observed": false
+      },
+      {
+        "package": "0.2.4.40",
+        "mode": "standard",
+        "successful_presents_at_65_seconds": 2291,
+        "guest_backbuffer_at_65_seconds": [
+          320,
+          240
+        ],
+        "guest_lit_sample_points": 0,
+        "host_lit_sample_points_before_cursor": 0,
+        "resize_target_calls": 1,
+        "last_resize_target_request": [
+          0,
+          0
+        ],
+        "last_resize_target_result": "0x887a0001",
+        "last_resize_buffers_request": [
+          320,
+          240
+        ],
+        "successful_presents_at_last_buffer_resize": 0,
+        "menu_observed": false
+      }
+    ],
+    "visible_menu_verified": false,
+    "gamepad_response_verified": false
+  },
+  "celeste": [
+    {
+      "package": "0.2.4.21",
+      "visible_menu_verified": true,
+      "input_method": "Remote keyboard Down",
+      "visible_response": "Selection moved from Climb to Options",
+      "physical_controller_retested": false
+    },
+    {
+      "package": "0.2.4.22",
+      "visible_menu_verified": true,
+      "input_method": "Remote keyboard Down",
+      "visible_response": "Selection moved from Climb to Options",
+      "physical_controller_retested": false
+    },
+    {
+      "package": "0.2.4.24",
+      "visible_menu_verified": true,
+      "input_method": "Remote keyboard Down",
+      "visible_response": "Options became highlighted",
+      "physical_controller_retested": false
+    },
+    {
+      "package": "0.2.4.26",
+      "visible_menu_verified": true,
+      "input_method": "Remote keyboard C",
+      "visible_response": "Title screen advanced to menu with Climb and Options",
+      "physical_controller_retested": false
+    },
+    {
+      "package": "0.2.4.27",
+      "visible_menu_verified": true,
+      "input_method": "Remote keyboard C",
+      "visible_response": "Title screen advanced to menu with Climb and Options",
+      "physical_controller_retested": false
+    }
+  ],
+  "sekiro": {
+    "package": "0.2.4.22",
+    "play_request_accepted": true,
+    "d3d11_device_calls_at_last_probe": 0,
+    "screenshot_after_32_seconds": "Xbox Dev Home",
+    "visible_menu_verified": false,
+    "controller_response_verified": false,
+    "additional_runs": [
+      {
+        "package": "0.2.4.24",
+        "guest_marked_active_at_8_seconds": true,
+        "d3d11_device_calls_at_last_probe": 0,
+        "dashboard_status_unavailable_at_19_and_27_seconds": true,
+        "visible_menu_verified": false,
+        "controller_response_verified": false
+      },
+      {
+        "package": "0.2.4.25",
+        "guest_marked_active_at_8_seconds": true,
+        "screen_at_20_seconds": "Xbox Dev Home",
+        "visible_menu_verified": false,
+        "controller_response_verified": false
+      },
+      {
+        "package": "0.2.4.26",
+        "guest_marked_active_at_8_seconds": true,
+        "screen_at_20_seconds": "Xbox Dev Home",
+        "visible_menu_verified": false,
+        "controller_response_verified": false
+      },
+      {
+        "package": "0.2.4.27",
+        "last_persisted_phase": "Native entry invoked",
+        "last_persisted_outcome": "Phase entered without terminal outcome",
+        "production_process_disappeared_after_seconds": 15.3,
+        "device_portal_process_samples": 37,
+        "peak_sampled_total_commit_mib": 4076,
+        "visible_menu_verified": false
+      },
+      {
+        "package": "0.2.4.28",
+        "last_persisted_phase": "Native entry invoked",
+        "last_persisted_outcome": "Phase entered without terminal outcome",
+        "visible_menu_verified": false
+      },
+      {
+        "package": "0.2.4.29",
+        "last_persisted_phase": "Native entry invoked",
+        "last_persisted_outcome": "Phase entered without terminal outcome",
+        "production_process_disappeared_after_seconds": 9.02,
+        "device_portal_process_samples": 21,
+        "peak_sampled_total_commit_mib": 4079,
+        "guest_memory_samples": 26,
+        "peak_sampled_guest_commit_mib": 3868,
+        "reported_guest_commit_budget_mib": 4096,
+        "visible_menu_verified": false
+      },
+      {
+        "package": "0.2.4.30",
+        "last_persisted_phase": "Native entry invoked",
+        "last_persisted_outcome": "Phase entered without terminal outcome",
+        "d3d11_device_calls_at_last_probe": 0,
+        "production_process_disappeared_after_seconds": 15.61,
+        "device_portal_process_samples": 15,
+        "peak_sampled_total_commit_mib": 756,
+        "guest_memory_samples": 15,
+        "peak_sampled_guest_commit_mib": 81,
+        "reported_guest_commit_budget_mib": 4096,
+        "visible_menu_verified": false
+      },
+      {
+        "package": "0.2.4.31",
+        "last_persisted_phase": "Native entry invoked",
+        "last_persisted_outcome": "Phase entered without terminal outcome",
+        "d3d11_device_calls_at_last_probe": 0,
+        "total_commit_mib_at_4_seconds": 756,
+        "dashboard_unavailable_at_8_seconds": true,
+        "visible_menu_verified": false
+      },
+      {
+        "package": "0.2.4.32",
+        "last_persisted_phase": "Native entry invoked",
+        "last_persisted_outcome": "Phase entered without terminal outcome",
+        "d3d11_device_calls_at_last_probe": 0,
+        "total_commit_mib_at_4_seconds": 756,
+        "guest_commit_mib_at_4_seconds": 555,
+        "dashboard_unavailable_at_8_seconds": true,
+        "visible_menu_verified": false
+      },
+      {
+        "package": "0.2.4.33",
+        "last_persisted_phase": "Native entry invoked",
+        "last_persisted_outcome": "Phase entered without terminal outcome",
+        "d3d11_device_calls_at_last_probe": 0,
+        "total_commit_mib_at_4_seconds": 529,
+        "guest_commit_mib_at_4_seconds": 555,
+        "instrumented_api_calls_at_4_seconds": 522,
+        "recent_instrumented_apis_at_4_seconds": [
+          "WaitForSingleObject",
+          "SetEvent"
+        ],
+        "dashboard_unavailable_at_8_seconds": true,
+        "visible_menu_verified": false,
+        "high_cadence_replay": {
+          "api_samples": 27,
+          "last_live_api_sample_at_seconds": 7.46,
+          "instrumented_calls_in_last_sample": 508,
+          "newest_api_names": [
+            "WaitForSingleObject",
+            "SetEvent"
+          ],
+          "peak_sampled_guest_commit_mib": 556,
+          "reported_guest_commit_budget_mib": 4096,
+          "process_exit_time_confirmed_by_portal": false,
+          "checkpoint_after_reopening": "Native entry invoked, no terminal outcome"
+        }
+      },
+      {
+        "package": "0.2.4.34",
+        "mode": "fresh writable C drive",
+        "last_persisted_phase": "Native entry invoked",
+        "last_persisted_outcome": "Phase entered without terminal outcome",
+        "d3d11_device_calls_at_last_live_probe": 0,
+        "last_live_probe_at_seconds": 8,
+        "newest_instrumented_apis_at_last_live_probe": [
+          "GetProcAddress",
+          "LoadLibraryExW",
+          "SetEvent",
+          "WaitForSingleObject",
+          "QueryPerformanceCounter",
+          "GetModuleHandleW"
+        ],
+        "visible_menu_verified": false
+      },
+      {
+        "package": "0.2.4.37",
+        "mode": "standard",
+        "last_persisted_phase": "Native entry invoked",
+        "last_persisted_outcome": "Phase entered without terminal outcome",
+        "d3d11_device_calls_at_last_live_probe": 0,
+        "last_live_probe_at_seconds": 4,
+        "newest_instrumented_apis_at_last_live_probe": [
+          "WaitForSingleObject",
+          "SetEvent"
+        ],
+        "visible_menu_verified": false
+      },
+      {
+        "package": "0.2.4.38",
+        "mode": "standard",
+        "last_persisted_phase": "Native entry invoked",
+        "last_persisted_outcome": "Phase entered without terminal outcome",
+        "d3d11_device_calls_at_last_live_probe": 0,
+        "last_live_probe_at_seconds": 4,
+        "dashboard_unavailable_at_8_seconds": true,
+        "visible_menu_verified": false
+      },
+      {
+        "package": "0.2.4.39",
+        "mode": "standard",
+        "last_persisted_phase": "Native entry invoked",
+        "last_persisted_outcome": "Phase entered without terminal outcome",
+        "d3d11_device_calls_at_4_seconds": 0,
+        "visible_menu_verified": false
+      },
+      {
+        "package": "0.2.4.40",
+        "mode": "standard",
+        "last_persisted_phase": "Native entry invoked",
+        "last_persisted_outcome": "Phase entered without terminal outcome",
+        "d3d11_device_calls_at_4_seconds": 0,
+        "visible_menu_verified": false,
+        "synchronization_at_4_seconds": {
+          "wait_completed": 131,
+          "wait_timeout": 0,
+          "wait_failed": 0,
+          "setevent_signaled": 52,
+          "setevent_failed": 0
+        }
+      }
+    ],
+    "architecture": "PE32+ x64"
+  }
+}

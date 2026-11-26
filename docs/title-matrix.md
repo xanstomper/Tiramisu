@@ -23,6 +23,8 @@ thinking).
 |---|---|---|---|---|---|---|---|---|
 | RACCOIN | Unity 6 IL2CPP, D3D11, Steam | PE32+ x64 | yes | yes | not measured | on-console pad | **yes** — menu + a full run (Round 8/15) | `docs/proof/raccoin-main-menu.png`, `docs/proof/raccoin-gameplay.png`, `docs/proof/raccoin-gameplay.mp4` |
 | Celeste v1.4.0.0 | XNA/Mono (FNA3D), managed .NET | PE32+ x64 + embedded Mono | yes | yes | **silent** — FSB5 Vorbis decode is disabled on console after it heap-corrupted | on-console pad | **yes** — title, menu, Chapter 1 gameplay | `docs/proof/celeste-title.jpg`, `docs/proof/celeste-menu.jpg`, `docs/proof/celeste-gameplay.mp4` |
+| Cuphead | Unity, D3D11 | PE32+ x64 | yes — guest GPU work verified | **no visible game frame** — dark guest framebuffer on 0.2.4.38 | not measured | game response unverified | **no** — menu unreached | `docs/proof/xbox-series-s-2026-11-26-launch-check.json` |
+| Sekiro | Windows PC | PE32+ x64 | guest entry invoked on 0.2.4.38 | **no** — process exits before D3D11 initialization | not measured | not reached | **no** — menu unreached | `docs/proof/xbox-series-s-2026-11-26-launch-check.json` |
 | God of War (PC) | AAA in-house engine, D3D11 | PE32+ x64 | yes | **yes** — opening forest across four boots | not measured | not reached | **no** — renders, does not yet reach gameplay | `docs/proof/gow-forest-01.webp`, `docs/proof/gow-forest-02.webp`, `docs/proof/gow-forest-03.webp`, `docs/proof/gow-forest-04.webp` |
 <!-- title-matrix:measured:end -->
 
@@ -36,7 +38,7 @@ not quote the clip rate as the game's.
 | Title | Why it is here | Blocker |
 |---|---|---|
 | Factorio 2.0 (x64, D3D11) | The reference title another loader runs at 60 UPS with audio — the bar to match | Untested here. Needs `game-stage.py` + `console.py proof` |
-| Any pre-2015 x86-32 title | Most of the PC catalogue | **W1**: Tiramisu executes PE32+ only. `game-stage.py` refuses to stage a PE32 game rather than upload 1.5 GB that cannot run |
+| Any pre-2015 x86-32 title | Most of the PC catalogue | **W1**: PE32 execution is experimental via the in-tree x86-32 JIT; no 32-bit title has a console completion artifact yet |
 | Xbox GDK / GameOS console builds | Often x64, but they import `xgameruntime`/`gamingservices` and ship `MicrosoftGame.Config` + `gameos.xvd`; they are console packages, not Win32 desktop games | **Not a target.** The dashboard now flags them `Xbox GDK / GameOS build (Unsupported)`; Tiramisu does not bypass platform or DRM checks |
 
 ## Adding a row
@@ -70,8 +72,9 @@ the table stays a claim someone else can check.
 Ranked by how much of the catalogue each one gates (from
 `docs/04-support-roadmap.md`):
 
-1. **x86-32 execution** — blocks most pre-2015 PC games. The single biggest
-   support gap, and it is an interpreter/JIT project, not a patch.
+1. **x86-32 execution** — blocks most pre-2015 PC games. The x86-32 JIT is in
+   the tree and gated, but PE32 remains experimental until a real title has a
+   console completion artifact.
 2. **Console audio decode** — Celeste's FSB5 Vorbis path is disabled because it
    corrupted the heap on a Series S. The offline decode is real and tested, and
    the corrupt-header shapes that could reach the heap are now refused by name
@@ -81,7 +84,8 @@ Ranked by how much of the catalogue each one gates (from
    for one title) enables the hardened path for a run: when that run has a
    `proof.json` with audio checked by ear, this line changes. Until then a
    playable title can still be silent, and it is written down that way.
-3. **D3D12 execution** — recorded, not executed; DX12-only titles render
-   nothing.
+3. **D3D12 execution** — the offline triangle fixture exercises draw
+   submission and Present. A real DX12-only game still needs an Xbox run
+   that verifies its visible menu and controller response.
 4. **Video decode** — no frames; cutscene-driven titles stall or skip.
-5. **Wwise** — no bridge at all; Wwise titles lose all audio.
+5. **Wwise** — the built-in fallback is a stub (no bank decode); a game-shipped native `AkSoundEngine.dll` is preferred, but without it Wwise titles lose all audio.

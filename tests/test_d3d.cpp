@@ -24,8 +24,12 @@
 #include <unistd.h>
 
 extern "C" {
+int TRT_STDCALL trt_GetClientRect(void* hwnd, void* rect);
 int trt_bridge_register_kernel32(void);
 int trt_bridge_register_user32(void);
+void* TRT_STDCALL trt_CreateWindowExW(u32, const wchar_t*, const wchar_t*, u32,
+                                      int, int, int, int, void*, void*, void*, void*);
+int TRT_STDCALL trt_SetWindowPos(void*, void*, i32, i32, i32, i32, u32);
 int TRT_GUEST_ABI trt_D3D11CreateDevice(void* adapter, u32 driver_type, void* software,
                                         u32 flags, const void* feature_levels,
                                         u32 feature_level_count, u32 sdk_version,
@@ -74,7 +78,7 @@ void* linux_alloc(size_t bytes, u64 preferred_base) {
 #endif
     if (preferred_base)
       p = mmap((void*)(uintptr_t)preferred_base, bytes, PROT_READ | PROT_WRITE,
-               MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+               MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   }
   if (!p || p == MAP_FAILED)
     p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
@@ -145,8 +149,10 @@ extern "C" void* g_fake_adapter;
 // generic stub: every SDK slot returns S_OK; the interesting ones are below
 extern "C" TRT_GUEST_ABI int fake_generic_hr(void*, void*, void*, void*) { return 0; }
 
+static u32 g_requested_width, g_requested_height;
 static u32 g_requested_swapchain_format;
 static u32 g_requested_swapchain_buffers;
+static u32 g_requested_swap_effect;
 static unsigned g_prepare_presents;
 static int TRT_GUEST_ABI get_alternate_backbuffer(u32 index, const void*, void** out) {
   if (!out || index != 0) return (int)0x887a0001u;
@@ -157,9 +163,13 @@ static void TRT_GUEST_ABI prepare_present() {
   ++g_prepare_presents;
 }
 static int g_swapchain_format_result;
-static int TRT_GUEST_ABI set_swapchain_format(u32 format, u32 buffer_count) {
+static int TRT_GUEST_ABI set_swapchain_format(u32 width, u32 height, u32 format,
+                                              u32 buffer_count, u32 swap_effect) {
+  g_requested_width = width;
+  g_requested_height = height;
   g_requested_swapchain_format = format;
   g_requested_swapchain_buffers = buffer_count;
+  g_requested_swap_effect = swap_effect;
   return g_swapchain_format_result;
 }
 
@@ -451,17 +461,93 @@ int main(int argc, char** argv) {
   CHECK(log_contains("d3d: FL contract -> 0xA100 (requested 2 levels)"),
         "final pick logged as the contract line");
 
-  // AndSwapChain: {11_1, 11_0} -> 11_0 + host swapchain
+  // Readback accounting ignores texture pitch padding and alpha-only black.
+  const u8 pixels[24] = {
+      0, 0, 0, 255, 120, 0, 0, 0, 255, 255, 255, 255,
+      0, 0, 200, 255, 12, 12, 12, 255, 255, 255, 255, 255
+  };
+  CHECK(trt_gpu_count_lit_rgb32(pixels, 2, 2, 12) == 2,
+        "surface probe counts RGB content and excludes alpha and row padding");
+  CHECK(trt_gpu_count_lit_rgb32(pixels, 4, 2, 12) == 0,
+        "surface probe refuses an invalid row pitch");
+
+  // Combined creation must deliver the same desktop compatibility proxy
+  // as the factory, including the virtual backbuffer and present hooks.
   void* sc = nullptr;
   const u32 req_asc[] = {0xb100, 0xb000};
+  u32 desc[18] = {};
+  desc[0] = 1024;
+  desc[1] = 576;
+  desc[4] = 29;  // DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+  desc[10] = 2;
+  desc[15] = 0;   // DXGI_SWAP_EFFECT_DISCARD
+  hooks.configure_d3d11_swapchain = &set_swapchain_format;
+  hooks.get_d3d11_backbuffer = &get_alternate_backbuffer;
+  hooks.prepare_d3d11_present = &prepare_present;
+  trt_gpu_set_hooks(&hooks);
+  trt_gpu_reset_render_stats();
   g_added_refs = 0;
   got_level = 0;
   hr = trt_D3D11CreateDeviceAndSwapChain(nullptr, 1, nullptr, 0, req_asc, 2, 7,
-                                         nullptr, &sc, &dev, &got_level, &ctx);
-  CHECK(hr == 0 && got_level == 0xb000 && sc == g_fake_swapchain,
-        "AndSwapChain {11_1, 11_0} -> S_OK, FL 0xb000, HOST swapchain");
+                                         desc, &sc, &dev, &got_level, &ctx);
+  CHECK(hr == 0 && got_level == 0xb000 && sc && sc != g_fake_swapchain,
+        "combined creation returns the compatibility proxy");
+  CHECK(g_requested_width == 1024 && g_requested_height == 576 &&
+            g_requested_swapchain_format == 29 && g_requested_swapchain_buffers == 2 &&
+            g_requested_swap_effect == 0,
+        "combined creation forwards guest dimensions, format, buffer count and swap effect");
+  CHECK(trt_gpu_d3d11_uses_stable_backbuffer(2, 0) &&
+            !trt_gpu_d3d11_uses_stable_backbuffer(2, 3),
+        "desktop DISCARD gets a stable backbuffer while native flip keeps rotating");
+  CHECK(g_added_refs == 2, "combined creation retains the device and context");
+  if (sc && sc != g_fake_swapchain) {
+    const void** vt = *(const void***)sc;
+    using buffer_fn = int (TRT_GUEST_ABI *)(void*, u32, const void*, void**);
+    using present_fn = int (TRT_GUEST_ABI *)(void*, u32, u32);
+    using get_desc_fn = int (TRT_GUEST_ABI *)(void*, void*);
+    using resize_fn = int (TRT_GUEST_ABI *)(void*, u32, u32, u32, u32, u32);
+    using index_fn = u32 (TRT_GUEST_ABI *)(void*);
+    u32 reported[18]{};
+    CHECK(((get_desc_fn)vt[12])(sc, reported) == 0 &&
+              reported[0] == 1024 && reported[1] == 576 &&
+              reported[4] == 29 && reported[10] == 2 && reported[15] == 0,
+          "GetDesc describes the guest sRGB desktop chain");
+    CHECK(((index_fn)vt[36])(sc) == 0, "stable backbuffer stays at index zero");
+    CHECK(((resize_fn)vt[13])(sc, 0, 1280, 720, 0, 0) == 0 &&
+              g_requested_width == 1280 && g_requested_height == 720 &&
+              g_requested_swapchain_buffers == 2 && g_requested_swap_effect == 0,
+          "ResizeBuffers retains the guest count and swap effect for zero count");
+    void* buffer = nullptr;
+    CHECK(((buffer_fn)vt[9])(sc, 0, nullptr, &buffer) == 0 && buffer == g_fake_rtv,
+          "combined swapchain exposes the virtual guest backbuffer");
+    CHECK(((present_fn)vt[8])(sc, 0, 1u) == 0 && g_prepare_presents == 0,
+          "combined swapchain skips preparation for a test present");
+    CHECK(((present_fn)vt[8])(sc, 0, 0) == 0 && g_prepare_presents == 1,
+          "combined swapchain copies the virtual surface for a real present");
+  }
+  trt_gpu_render_stats stats{};
+  trt_gpu_get_render_stats(&stats);
+  CHECK(stats.d3d11_device_calls == 1 && stats.d3d11_swapchains == 1 &&
+            stats.d3d11_get_buffer_calls == 1 && stats.d3d11_present_calls == 1 &&
+            stats.d3d11_successful_presents == 1 &&
+            stats.d3d11_stable_backbuffer == 1 && stats.d3d11_buffer_count == 2,
+        "render counters exclude test presents and report the virtual surface");
+  CHECK(stats.d3d11_width == 1280 && stats.d3d11_height == 720,
+        "render counters report the last successful guest size");
 
-  CHECK(g_added_refs == 3, "AndSwapChain retains all returned COM objects");
+  g_swapchain_format_result = (int)0x80070057u;
+  g_added_refs = 0;
+  hr = trt_D3D11CreateDeviceAndSwapChain(nullptr, 1, nullptr, 0, req_asc, 2, 7,
+                                         desc, &sc, &dev, nullptr, &ctx);
+  CHECK(hr == g_swapchain_format_result && !sc && !dev && !ctx && g_added_refs == 0,
+        "failed combined creation clears outputs and does not retain COM objects");
+  g_swapchain_format_result = 0;
+  g_prepare_presents = 0;
+  g_presented = 1;  // Restore the count from the guest frame above.
+  hooks.configure_d3d11_swapchain = nullptr;
+  hooks.get_d3d11_backbuffer = nullptr;
+  hooks.prepare_d3d11_present = nullptr;
+  trt_gpu_set_hooks(&hooks);
 
   // AndSwapChain: {9_1} -> 9_1
   const u32 req_91[] = {0x9100};
@@ -480,6 +566,7 @@ int main(int argc, char** argv) {
     const void** fvt = *(const void***)dxgi_fac;
     using enum_t = int (TRT_GUEST_ABI *)(void*, u32, void**);
     using csc_t = int (TRT_GUEST_ABI *)(void*, void*, void*, void**);
+    using hwnd_sc_fn = int (TRT_GUEST_ABI *)(void*, void*, void*, void*, void*, void*, void**);
     void* adp = nullptr;
     const int ehr = ((enum_t)fvt[7])(dxgi_fac, 0, &adp);
     CHECK(ehr == 0 && adp == g_fake_adapter && g_enumerated_adapter == 2,
@@ -491,6 +578,16 @@ int main(int argc, char** argv) {
           "IDXGIFactory::CreateSwapChain (4-arg) yields proxy swapchain");
     if (proxy_sc) {
       const void** svt = *(const void***)proxy_sc;
+      struct { u32 fields[5]; u32 guard[2]; } fullscreen{
+          {9, 9, 9, 9, 9}, {0xababababu, 0xcdcdcdcdu}};
+      using fullscreen_desc_t = int (TRT_GUEST_ABI *)(void*, void*);
+      CHECK(((fullscreen_desc_t)svt[19])(proxy_sc, fullscreen.fields) == 0 &&
+                fullscreen.fields[0] == 0 && fullscreen.fields[1] == 0 &&
+                fullscreen.fields[2] == 0 && fullscreen.fields[3] == 0 &&
+                fullscreen.fields[4] == 1,
+            "GetFullscreenDesc writes Windowed at the Win32 ABI offset");
+      CHECK(fullscreen.guard[0] == 0xababababu && fullscreen.guard[1] == 0xcdcdcdcdu,
+            "GetFullscreenDesc stays within the 20-byte structure");
       using fs_t = int (TRT_GUEST_ABI *)(void*, int, void*);
       using rb_t = int (TRT_GUEST_ABI *)(void*, u32, u32, u32, u32, u32);
       using pres_t = int (TRT_GUEST_ABI *)(void*, u32, u32);
@@ -523,6 +620,55 @@ int main(int argc, char** argv) {
       CHECK(((rb_t)svt[13])(proxy_sc, 2, 1920, 1080, rgba_srgb, 0) ==
                 g_swapchain_format_result,
             "D3D11 ResizeBuffers preserves a host format error");
+      g_swapchain_format_result = 0;
+      void* window = trt_CreateWindowExW(0, nullptr, nullptr, 0, 0, 0, 800, 600,
+                                           nullptr, nullptr, nullptr, nullptr);
+      u32 window_desc[12]{};
+      window_desc[2] = 87;
+      window_desc[7] = 1;
+      void* window_chain = nullptr;
+      const int window_hr = ((hwnd_sc_fn)fvt[15])(dxgi_fac, hooks.device, window,
+          window_desc, nullptr, nullptr, &window_chain);
+      CHECK(window_hr == 0 && window_chain && g_requested_width == 800 &&
+                g_requested_height == 600,
+            "zero-sized HWND swap chain uses the guest window client dimensions");
+      if (window_chain) {
+        const auto* window_vt = *static_cast<const void***>(window_chain);
+        using get_hwnd_fn = int (TRT_GUEST_ABI *)(void*, void**);
+        void* reported_window = nullptr;
+        CHECK(((get_hwnd_fn)window_vt[20])(window_chain, &reported_window) == 0 &&
+                  reported_window == window,
+              "GetHwnd returns the HWND associated with the guest swap chain");
+        using resize_target_fn = int (TRT_GUEST_ABI *)(void*, const void*);
+        const u32 mode[7]{640, 360, 60, 1, 87, 0, 0};
+        CHECK(((resize_target_fn)window_vt[14])(window_chain, mode) == 0 &&
+                  g_requested_width == 800 && g_requested_height == 600,
+              "windowed ResizeTarget leaves the backbuffer alone until ResizeBuffers");
+        CHECK(((resize_target_fn)window_vt[14])(window_chain, nullptr) ==
+                  static_cast<int>(0x887a0001u),
+              "ResizeTarget rejects a null target mode");
+        CHECK(((rb_t)window_vt[13])(window_chain, 0, 0, 0, 0, 0) == 0 &&
+                  g_requested_width == 640 && g_requested_height == 360,
+              "zero-sized ResizeBuffers follows the resized guest window");
+        trt_gpu_resize_stats resize{};
+        trt_gpu_get_resize_stats(&resize);
+        CHECK(resize.target_calls == 2 && resize.buffer_calls >= 1 &&
+                  resize.buffer_requested_width == 0 && resize.buffer_requested_height == 0 &&
+                  resize.buffer_client_width == 640 && resize.buffer_client_height == 360 &&
+                  resize.buffer_result == 0,
+              "resize diagnostics report the zero request and resolved window geometry");
+
+        const u32 empty_mode[7]{};
+        i32 client[4]{};
+        CHECK(((resize_target_fn)window_vt[14])(window_chain, empty_mode) == 0 &&
+                  trt_GetClientRect(window, client) &&
+                  client[2] == 0 && client[3] == 0 &&
+                  g_requested_width == 640 && g_requested_height == 360,
+              "windowed ResizeTarget accepts an empty mode without replacing buffers");
+        CHECK(((rb_t)window_vt[13])(window_chain, 0, 0, 0, 0, 0) == 0 &&
+                  g_requested_width == 640 && g_requested_height == 360,
+              "an empty guest window retains the last usable swap-chain size");
+      }
       hooks.configure_d3d11_swapchain = nullptr;
       hooks.get_d3d11_backbuffer = nullptr;
       hooks.prepare_d3d11_present = nullptr;

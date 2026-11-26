@@ -19,11 +19,17 @@
 //   POST /api/config/<name>                     -> Save exe / appid / args / input preset
 //   DELETE /api/game/<name> | POST /api/delete/<name> -> Delete game directory
 #include "webxfer.h"
+#include "crash_report.h"
 #include "web_controls_page.h"
 #include "host_log.h"
 #include "settings.h"
 #ifdef TIRAMISU_UWP_HOST
   #include "cover_art.h"
+  #include "../trt/bridge_d3d.h"
+  #include "swapchain.h"
+  #include "../trt/iso.h"
+  #include <memory>
+  #include <stdexcept>
   #include "steam_client.h"
   #include "vendor/qrcodegen.h"
   #include <winrt/base.h>
@@ -139,6 +145,12 @@ struct inflight_guard {
   inflight_guard(const inflight_guard&) = delete;
   inflight_guard& operator=(const inflight_guard&) = delete;
 };
+std::mutex g_external_storage_mu;
+std::vector<webxfer_storage_volume> g_external_storage;
+std::string g_storage_broker_status = "checking";
+std::atomic<bool> g_url_active{false};
+std::atomic<uint64_t> g_url_received{0}, g_url_expected{0};
+std::string g_url_phase;  // guarded by g_mu
 std::atomic<bool> g_stop{false};
 std::atomic<int> g_workers{0};
 sock_t g_listener = kBadSock;
@@ -183,6 +195,9 @@ void reset_web_controls() {
 
 std::string g_local_state_dir;
 std::string g_games_dir;
+std::string g_package_games_dir;
+std::string g_network_games_dir;
+std::mutex g_network_root_mu;
 std::string g_incoming;
 
 void mkdirs(const std::string& p);  // defined just below (used by autopilot)
@@ -438,6 +453,34 @@ void list_dir_entries(const std::string& dir, std::vector<dir_ent>* out) {
 #endif
 }
 
+std::vector<std::string> game_roots() {
+  std::vector<std::string> roots;
+  if (!g_games_dir.empty()) roots.push_back(g_games_dir);
+  if (!g_package_games_dir.empty() && g_package_games_dir != g_games_dir)
+    roots.push_back(g_package_games_dir);
+  std::lock_guard<std::mutex> network_lock(g_network_root_mu);
+  if (!g_network_games_dir.empty() &&
+      g_network_games_dir != g_games_dir &&
+      g_network_games_dir != g_package_games_dir)
+    roots.push_back(g_network_games_dir);
+  return roots;
+}
+
+std::string find_game_dir(const std::string& name) {
+  const std::string sep(1, XFER_SEP);
+  for (const auto& root : game_roots()) {
+    const std::string direct = root + sep + name;
+    if (dir_exists(direct)) return direct;
+    std::vector<dir_ent> entries;
+    list_dir_entries(root, &entries);
+    for (const auto& entry : entries) {
+      if (entry.is_dir && xfer_ieq(entry.name, name))
+        return root + sep + entry.name;
+    }
+  }
+  return {};
+}
+
 bool remove_tree(const std::string& dir) {
   if (!dir_exists(dir)) return false;
   std::vector<dir_ent> ents;
@@ -550,16 +593,25 @@ std::string query_param(const std::string& query, const std::string& key) {
   return {};
 }
 
+bool valid_path_component(const std::string& name) {
+  if (name.empty() || name.back() == '.' || name.back() == ' ') return false;
+  for (unsigned char c : name) {
+    if (c < 0x20 || c == '/' || c == '\\' || c == ':' || c == '<' ||
+        c == '>' || c == '"' || c == '|' || c == '?' || c == '*') return false;
+  }
+  const std::string stem = xfer_lower(trim_ws(name.substr(0, name.find('.'))));
+  if (stem == "con" || stem == "prn" || stem == "aux" || stem == "nul" ||
+      stem == "conin$" || stem == "conout$") return false;
+  if (stem.size() == 4 && (stem.starts_with("com") || stem.starts_with("lpt")) &&
+      stem[3] >= '0' && stem[3] <= '9') return false;
+  return true;
+}
+
 bool sanitize_game_name(const std::string& raw, std::string* out) {
   std::string s = trim_ws(raw);
   if (s.empty() || s.size() > 160 || s == "." || s == "..") return false;
   if (s.find("..") != std::string::npos) return false;
-  for (unsigned char c : s) {
-    if (c < 0x20 || c == '/' || c == '\\' || c == ':' || c == '\0' ||
-        c == '<' || c == '>' || c == '"' || c == '|' || c == '?' || c == '*') {
-      return false;
-    }
-  }
+  if (!valid_path_component(s)) return false;
   *out = s;
   return true;
 }
@@ -574,9 +626,7 @@ bool sanitize_rel_path(const std::string& raw, char sep, std::string* out) {
         if (cur == "." || cur == ".." || cur.find("..") != std::string::npos) {
           return false;
         }
-        for (unsigned char c : cur) {
-          if (c < 0x20 || c == ':') return false;
-        }
+        if (!valid_path_component(cur)) return false;
         parts.push_back(cur);
         cur.clear();
       }
@@ -698,7 +748,7 @@ void collect_files_rec(const std::string& base_dir, const std::string& rel_dir,
 
 // ---------- zip extraction (miniz, smart single-folder unwrap) ----------
 bool extract_zip(const std::string& zip_path, const std::string& dest,
-                 std::string* note) {
+                 std::string* note, bool require_complete = false) {
   mz_zip_archive zip{};
   memset(&zip, 0, sizeof(zip));
   if (!mz_zip_reader_init_file(&zip, zip_path.c_str(), 0)) {
@@ -706,6 +756,22 @@ bool extract_zip(const std::string& zip_path, const std::string& dest,
     return false;
   }
   const int n = (int)mz_zip_reader_get_num_files(&zip);
+#ifdef _WIN32
+  ULARGE_INTEGER available{};
+  if (require_complete && GetDiskFreeSpaceExA(dest.c_str(), &available, nullptr, nullptr)) {
+    uint64_t remaining = available.QuadPart;
+    for (int i = 0; i < n; ++i) {
+      mz_zip_archive_file_stat st{};
+      if (!mz_zip_reader_file_stat(&zip, i, &st) ||
+          (!st.m_is_directory && st.m_uncomp_size > remaining)) {
+        mz_zip_reader_end(&zip);
+        *note = "archive does not fit in available storage or contains an unreadable entry";
+        return false;
+      }
+      if (!st.m_is_directory) remaining -= st.m_uncomp_size;
+    }
+  }
+#endif
   // Detect if every real file lives inside a single top-level wrapper dir
   // (e.g. "MyGame/MyGame.exe"), and unwrap it so it lands at games\MyGame\MyGame.exe
   // rather than games\MyGame\MyGame\MyGame.exe.
@@ -738,11 +804,13 @@ bool extract_zip(const std::string& zip_path, const std::string& dest,
   }
 
   int extracted = 0;
+  int failed = 0;
   for (int i = 0; i < n; ++i) {
     mz_zip_archive_file_stat st{};
-    if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
+    if (!mz_zip_reader_file_stat(&zip, i, &st)) { ++failed; continue; }
     if (st.m_is_directory) continue;
     std::string rel_raw = st.m_filename;
+    if (rel_raw.rfind("__MACOSX/", 0) == 0) continue;
     if (can_unwrap) {
       std::string norm;
       if (sanitize_rel_path(rel_raw, '/', &norm) &&
@@ -753,20 +821,150 @@ bool extract_zip(const std::string& zip_path, const std::string& dest,
       }
     }
     std::string rel;
-    if (!sanitize_rel_path(rel_raw, XFER_SEP, &rel)) continue;
+    if (!sanitize_rel_path(rel_raw, XFER_SEP, &rel)) { ++failed; continue; }
     const std::string out_path = dest + std::string(1, XFER_SEP) + rel;
     const size_t slash = out_path.rfind(XFER_SEP);
     if (slash != std::string::npos) mkdirs(out_path.substr(0, slash));
     if (mz_zip_reader_extract_to_file(&zip, i, out_path.c_str(), 0)) {
       ++extracted;
+    } else {
+      ++failed;
     }
+    if (require_complete && failed) break;
   }
   mz_zip_reader_end(&zip);
+  if (require_complete && failed) {
+    *note = "archive contains an unreadable or unsupported entry";
+    return false;
+  }
   char tmp[128];
   snprintf(tmp, sizeof(tmp), "%d files", extracted);
   *note = tmp;
   return extracted > 0;
 }
+
+#ifdef TIRAMISU_UWP_HOST
+void finish_url_download(const std::string& name, const std::string& error) {
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_url_phase.clear();
+    if (error.empty()) {
+      g.last_upload = name + " installed";
+      g.last_error.clear();
+      g.rescan_requested = true;
+      g.rescan_game = name;
+    } else {
+      g.last_error = error;
+    }
+  }
+  g_url_received = 0;
+  g_url_expected = 0;
+  g_url_active = false;
+}
+
+void download_game_url(std::string url, std::string name, std::string extension,
+                       std::string incoming, std::string games) {
+  std::string error;
+  std::string stage;
+  auto set_phase = [](const char* phase) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_url_phase = phase;
+  };
+  const bool zip = extension == ".zip";
+  const std::string destination = games + "\\" + name + (zip ? "" : extension);
+  try {
+    winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    struct apartment_guard { ~apartment_guard() { winrt::uninit_apartment(); } } apartment;
+    using namespace winrt::Windows::Web::Http;
+    using namespace winrt::Windows::Storage::Streams;
+    if (GetFileAttributesA(destination.c_str()) != INVALID_FILE_ATTRIBUTES) {
+      throw std::runtime_error("Game is already installed; choose a different name");
+    }
+    // Create a private directory on the same volume as the library. Only
+    // rename the verified payload into the library after a complete transfer.
+    const std::string candidate = incoming + "\\url-" + std::to_string(GetTickCount64());
+    if (!CreateDirectoryA(candidate.c_str(), nullptr))
+      throw std::runtime_error("Cannot create download staging folder");
+    stage = candidate;
+    const std::string payload = stage + "\\payload" + extension;
+    HttpClient http;
+    const auto response = http.GetAsync(winrt::Windows::Foundation::Uri(winrt::to_hstring(url)),
+                                        HttpCompletionOption::ResponseHeadersRead).get();
+    if (!response.IsSuccessStatusCode())
+      throw std::runtime_error("Download HTTP " + std::to_string((int)response.StatusCode()));
+    uint64_t expected = 0;
+    if (const auto length = response.Content().Headers().ContentLength()) expected = length.Value();
+    ULARGE_INTEGER available{};
+    if (expected && GetDiskFreeSpaceExA(incoming.c_str(), &available, nullptr, nullptr) &&
+        expected > available.QuadPart)
+      throw std::runtime_error("Insufficient storage for download");
+    g_url_expected = expected;
+    set_phase("Downloading");
+    auto stream = response.Content().ReadAsInputStreamAsync().get();
+    Buffer buffer(65536);
+    std::vector<uint8_t> bytes(65536);
+    std::unique_ptr<FILE, decltype(&fclose)> output(fopen(payload.c_str(), "wb"), fclose);
+    if (!output) throw std::runtime_error("Cannot open download staging file");
+    uint64_t received = 0;
+    while (!g_stop) {
+      auto chunk = stream.ReadAsync(buffer, buffer.Capacity(), InputStreamOptions::Partial).get();
+      const size_t count = chunk.Length();
+      if (!count) break;
+      auto reader = DataReader::FromBuffer(chunk);
+      reader.ReadBytes(winrt::array_view<uint8_t>(bytes.data(), bytes.data() + count));
+      if (fwrite(bytes.data(), 1, count, output.get()) != count)
+        throw std::runtime_error("Could not write download; check free storage");
+      received += count;
+      g_url_received = received;
+      if (expected && received > expected)
+        throw std::runtime_error("Download exceeded its advertised length");
+    }
+    if (fclose(output.release()) != 0)
+      throw std::runtime_error("Could not finish writing download");
+    if (g_stop) throw std::runtime_error("Download cancelled");
+    if (received == 0 || (expected && received != expected))
+      throw std::runtime_error("Download ended before the full file arrived");
+
+    std::string install_source = payload;
+    if (zip) {
+      set_phase("Extracting");
+      install_source = stage + "\\" + name;
+      if (!CreateDirectoryA(install_source.c_str(), nullptr))
+        throw std::runtime_error("Cannot create extraction folder");
+      std::string note;
+      if (!extract_zip(payload, install_source, &note, true))
+        throw std::runtime_error("Download extraction failed: " + note);
+      std::vector<std::string> exes;
+      std::string exe;
+      scan_game_exes(install_source, name, &exes, &exe);
+      if (exe.empty()) {
+        char image[1024] = {};
+        if (!trt_iso_find_image_in_dir(install_source.c_str(), image, sizeof(image)))
+          throw std::runtime_error("Archive contains no game executable or disc image");
+      }
+    } else {
+      trt_iso* image = trt_iso_open(payload.c_str());
+      if (!image) throw std::runtime_error("Download is not a readable disc image");
+      trt_iso_close(image);
+    }
+    if (g_stop) throw std::runtime_error("Download cancelled");
+    // Windows rename fails if the destination already exists, including when
+    // an upload installed the same game while the download was in progress.
+    if (rename(install_source.c_str(), destination.c_str()) != 0)
+      throw std::runtime_error("Cannot install game; the destination may already exist");
+  } catch (const std::exception& e) {
+    error = e.what();
+  } catch (const winrt::hresult_error& e) {
+    char code[24];
+    snprintf(code, sizeof(code), "0x%08x", static_cast<unsigned>(e.code().value));
+    error = std::string("Xbox download error ") + code;
+  } catch (...) {
+    error = "Xbox download failed";
+  }
+  if (!stage.empty()) remove_tree(stage);
+  finish_url_download(name, error);
+}
+#endif
 
 // ---------- Pre-launch PE compatibility inspection ----------
 struct pe_compat_info {
@@ -1079,40 +1277,131 @@ bool parse_json_str_field(const std::string& json, const char* key, std::string*
   return false;
 }
 
+// One list drives both dashboard reads and writes, so a visible setting
+// cannot quietly disappear from one side of the HTTP API.
+template <typename T>
+struct dashboard_setting {
+  const char* key;
+  T host_settings::*member;
+};
+constexpr dashboard_setting<bool> dashboard_flags[] = {
+    {"pad_vibration", &host_settings::pad_vibration},
+    {"win11_personality", &host_settings::win11_personality},
+    {"write_watch", &host_settings::write_watch},
+    {"steam_auth", &host_settings::steam_auth},
+    {"show_qr", &host_settings::show_qr},
+    {"show_fps", &host_settings::show_fps},
+    {"show_sysinfo", &host_settings::show_sysinfo},
+    {"quick_menu_enabled", &host_settings::quick_menu_enabled},
+    {"vsync", &host_settings::vsync},
+    {"shader_cache", &host_settings::shader_cache},
+    {"fsb_decode", &host_settings::fsb_decode},
+};
+constexpr dashboard_setting<int> dashboard_numbers[] = {
+    {"mouse_speed", &host_settings::mouse_speed},
+    {"wheel_speed", &host_settings::wheel_speed},
+    {"os_major", &host_settings::os_major},
+    {"os_minor", &host_settings::os_minor},
+    {"os_build", &host_settings::os_build},
+    {"log_lines", &host_settings::log_lines},
+    {"frame_rate_cap", &host_settings::frame_rate_cap},
+    {"resolution_scale", &host_settings::resolution_scale},
+    {"memory_budget_mb", &host_settings::memory_budget_mb},
+    {"input_deadzone", &host_settings::input_deadzone},
+    {"audio_buffer_ms", &host_settings::audio_buffer_ms},
+    {"texture_quality", &host_settings::texture_quality},
+};
+constexpr dashboard_setting<std::string> dashboard_text[] = {
+    {"default_input", &host_settings::default_input},
+    {"network_games_root", &host_settings::network_games_root},
+};
+
+std::string dashboard_settings_json(const host_settings& settings) {
+  std::string json = "{";
+  auto add = [&](const char* key, const std::string& encoded) {
+    if (json.size() > 1) json += ',';
+    json += '"';
+    json += key;
+    json += "\":";
+    json += encoded;
+  };
+  for (const auto& entry : dashboard_flags)
+    add(entry.key, settings.*entry.member ? "true" : "false");
+  for (const auto& entry : dashboard_numbers)
+    add(entry.key, std::to_string(settings.*entry.member));
+  for (const auto& entry : dashboard_text)
+    add(entry.key, '"' + json_escape(settings.*entry.member) + '"');
+  return json + '}';
+}
+
+void apply_dashboard_settings(const std::string& body, host_settings& settings) {
+  auto value = [&](const char* key) -> const char* {
+    const std::string name = std::string("\"") + key + '"';
+    const auto pos = body.find(name);
+    if (pos == std::string::npos) return "";
+    const auto colon = body.find_first_not_of(" \t\r\n", pos + name.size());
+    if (colon == std::string::npos || body[colon] != ':') return "";
+    const auto start = body.find_first_not_of(" \t\r\n", colon + 1);
+    return start == std::string::npos ? "" : body.c_str() + start;
+  };
+  auto ends_value = [](char c) {
+    return c == ',' || c == '}' || c == ' ' || c == '\t' || c == '\r' || c == '\n';
+  };
+  for (const auto& entry : dashboard_flags) {
+    const char* raw = value(entry.key);
+    if (strncmp(raw, "true", 4) == 0 && ends_value(raw[4])) settings.*entry.member = true;
+    else if (strncmp(raw, "false", 5) == 0 && ends_value(raw[5])) settings.*entry.member = false;
+  }
+  for (const auto& entry : dashboard_numbers) {
+    const char* raw = value(entry.key);
+    char* end = nullptr;
+    const long parsed = strtol(raw, &end, 10);
+    if (end != raw && ends_value(*end))
+      settings.*entry.member = static_cast<int>(std::clamp(parsed, -100000L, 100000L));
+  }
+  for (const auto& entry : dashboard_text)
+    parse_json_str_field(body, entry.key, &(settings.*entry.member));
+}
+
+
 std::string games_json() {
-  std::vector<dir_ent> ents;
-  list_dir_entries(g_games_dir, &ents);
-  std::sort(ents.begin(), ents.end(), [](const dir_ent& a, const dir_ent& b) {
-    return a.name < b.name;
-  });
+  const auto roots = game_roots();
   const std::string sep(1, XFER_SEP);
+  std::set<std::string> seen;
   std::string j = "[";
   bool first = true;
-  for (const auto& d : ents) {
-    if (!d.is_dir) continue;
-    const std::string gdir = g_games_dir + sep + d.name;
-    std::vector<std::string> exes;
-    std::string exe;
-    scan_game_exes(gdir, d.name, &exes, &exe);
-    if (exe.empty()) continue;
-    const std::string appid = read_small_text(gdir + sep + "steam_appid.txt");
-    const std::string args = read_small_text(gdir + sep + "tiramisu_args.txt");
-    std::string input = read_small_text(gdir + sep + "tiramisu_input.txt");
-    if (input.empty()) input = "auto";
-    const pe_compat_info compat = inspect_pe_compat(gdir, exe);
-    if (!first) j += ",";
-    first = false;
-    j += "{\"name\":\"" + json_escape(d.name) + "\",\"exe\":\"" +
-         json_escape(exe) + "\",\"appid\":\"" + json_escape(appid) +
-         "\",\"args\":\"" + json_escape(args) + "\",\"input\":\"" +
-         json_escape(input) + "\",\"arch\":\"" + json_escape(compat.arch) +
-         "\",\"compat\":\"" + json_escape(compat.badge) + "\",\"compat_ok\":" +
-         (compat.ok ? "true" : "false") + ",\"exes\":[";
-    for (size_t i = 0; i < exes.size(); ++i) {
-      if (i) j += ",";
-      j += "\"" + json_escape(exes[i]) + "\"";
+  for (const auto& root : roots) {
+    std::vector<dir_ent> ents;
+    list_dir_entries(root, &ents);
+    std::sort(ents.begin(), ents.end(), [](const dir_ent& a, const dir_ent& b) {
+      return a.name < b.name;
+    });
+    for (const auto& d : ents) {
+      if (!d.is_dir || !seen.insert(xfer_lower(d.name)).second) continue;
+      const std::string gdir = root + sep + d.name;
+      std::vector<std::string> exes;
+      std::string exe;
+      scan_game_exes(gdir, d.name, &exes, &exe);
+      if (exe.empty()) continue;
+      const std::string appid = read_small_text(gdir + sep + "steam_appid.txt");
+      const std::string args = read_small_text(gdir + sep + "tiramisu_args.txt");
+      std::string input = read_small_text(gdir + sep + "tiramisu_input.txt");
+      if (input.empty()) input = "auto";
+      const pe_compat_info compat = inspect_pe_compat(gdir, exe);
+      if (!first) j += ",";
+      first = false;
+      j += "{\"name\":\"" + json_escape(d.name) + "\",\"exe\":\"" +
+           json_escape(exe) + "\",\"appid\":\"" + json_escape(appid) +
+           "\",\"args\":\"" + json_escape(args) + "\",\"input\":\"" +
+           json_escape(input) + "\",\"arch\":\"" + json_escape(compat.arch) +
+           "\",\"compat\":\"" + json_escape(compat.badge) + "\",\"compat_ok\":" +
+           (compat.ok ? "true" : "false") + ",\"exes\":[";
+      for (size_t i = 0; i < exes.size(); ++i) {
+        if (i) j += ",";
+        j += "\"" + json_escape(exes[i]) + "\"";
+      }
+      j += "]}";
     }
-    j += "]}";
   }
   return j + "]";
 }
@@ -1183,8 +1472,14 @@ const char* k_upload_page =
   "<div class=row style='margin-bottom:6px'>"
   "<input id=dlurl placeholder='Direct .zip URL for Xbox to download itself (https://...)' style='flex:1;min-width:200px'>"
   "<button class='btn btn-sec' onclick=downloadFromUrl()>Download on Xbox</button></div>"
+  "<div id=externalStorage class=conn-sub>Checking external storage...</div>"
   "<div id=bar><div id=fill></div></div>"
   "<div id=log role=status style='font-size:13px;color:#d5cecc;min-height:18px'>Ready over LAN</div></div>"
+  "<dialog id=profileEdit class=card><form method=dialog><h2 id=profileTitle>Game settings</h2>"
+  "<p>Settings in this file apply on the next launch for this game.</p>"
+  "<textarea id=profileText rows=12 cols=46 aria-label='Per-game settings'></textarea>"
+  "<div class=row><button type=button class=btn onclick=saveGameProfile()>Save</button>"
+  "<button class='btn btn-sec'>Close</button></div><p id=profileResult role=status></p></form></dialog>"
   "<div class=card id=games><h2>Installed Games on Xbox</h2><div id=list><span style='color:#9e9699'>loading...</span></div></div>"
   "<div class=card id=steam><div class=game-top><h2 style='margin:0'>Steam Account &amp; Direct Downloads</h2>"
   "<div class=row><button class=btn onclick=startSteamQr()>Sign in with Steam QR</button>"
@@ -1192,6 +1487,8 @@ const char* k_upload_page =
   "<button class='btn btn-danger' onclick=steamSignOut()>Sign Out</button></div></div>"
   "<div id=steaminfo style='margin:10px 0;font-size:13px;color:#d5cecc'>Checking Steam account...</div>"
   "<div id=steamqrwrap style='display:none;margin:10px 0'><img id=steamqrimg style='width:180px;height:180px;background:#fff;padding:8px;border-radius:14px' alt='Steam QR'></div>"
+  "<label for=steamsearch>Find a Steam game</label> "
+  "<input id=steamsearch type=search placeholder=\"Title or AppID\" oninput=\"renderSteam()\">"
   "<div id=steamlist></div></div>"
   "<div class=card id=support><h2>Save Backups &amp; Support Bundle</h2>"
   "<div style='font-size:13px;color:#d5cecc;margin-bottom:10px'>Dev Mode uninstalls wipe <code>LocalState</code>. Back up saves before updating Tiramisu, or download a debug zip for bug reports.</div>"
@@ -1257,8 +1554,9 @@ const char* k_upload_page =
   "async function downloadFromUrl(){const u=(E('dlurl').value||'').trim();if(!u)return;"
   "let g=(E('gname').value||'').trim();"
   "setLog('Starting direct Xbox download...');E('fill').style.width='5%';"
-  "const r=await fetch('/api/download-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:u,game:g})});"
-  "setLog(await r.text());refresh();}"
+  "try{const r=await fetch('/api/download-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:u,game:g})});"
+  "setLog(await r.text());if(r.ok)hadDownload=true;else E('fill').style.width='0%';}"
+  "catch(e){E('fill').style.width='0%';setLog('Could not reach Xbox: '+e.message);}}"
   "function openDirPicker(){"
   "const inp=E('fdir');"
   "const ios=/iPhone|iPad|iPod/i.test(navigator.userAgent);"
@@ -1305,6 +1603,12 @@ const char* k_upload_page =
   "async function stopGame(){setLog('Stopping active game...');await fetch('/api/stop',{method:'POST'});refreshStatus();}"
   "async function rescan(){await fetch('/api/rescan',{method:'POST'});refresh();}"
   "async function delGame(n){if(!confirm('Delete '+n+'?'))return;await fetch('/api/game/'+encodeURIComponent(n),{method:'DELETE'});refresh();}"
+  "let profileGame='';"
+  "async function editGameProfile(name){try{const r=await fetch('/api/game-profile/'+encodeURIComponent(name));"
+  "if(!r.ok)throw Error(await r.text());profileGame=name;E('profileTitle').textContent=name+' settings';"
+  "E('profileText').value=await r.text();E('profileResult').textContent='';E('profileEdit').showModal();}catch(e){setLog(e.message);}}"
+  "async function saveGameProfile(){try{const r=await fetch('/api/game-profile/'+encodeURIComponent(profileGame),{method:'PUT',body:E('profileText').value});"
+  "E('profileResult').textContent=await r.text();}catch(e){E('profileResult').textContent=e.message;}}"
   "async function saveCfg(idx,name){const p={exe:E('exe'+idx).value,input:E('inp'+idx).value,appid:E('app'+idx).value,args:E('arg'+idx).value};"
   "await fetch('/api/config/'+encodeURIComponent(name),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});"
   "setLog('Saved config for '+name);refresh();}"
@@ -1321,26 +1625,46 @@ const char* k_upload_page =
   "+'<button class=btn onclick=\"launch(\\''+esc(x.name)+'\\','+(x.compat_ok!==false)+',\\''+esc(x.compat||'')+'\\')\">Launch ▶</button>'"
   "+'<button class=\"btn btn-sec\" onclick=\"E(\\'cov'+i+'\\').click()\">Cover</button>'"
   "+'<input type=file id=cov'+i+' accept=\"image/*\" style=\"display:none\" onchange=\"uploadCover(\\''+esc(x.name)+'\\',this)\">'"
+  "+'<button class=\"btn btn-sec\" data-game=\"'+esc(x.name)+'\" onclick=\"editGameProfile(this.dataset.game)\">Game settings</button>'"
   "+'<button class=\"btn btn-sec\" onclick=\"saveCfg('+i+',\\''+esc(x.name)+'\\')\">Save</button>'"
   "+'<button class=\"btn btn-danger\" onclick=\"delGame(\\''+esc(x.name)+'\\')\">Delete</button></div></div>'"
   "+'<div class=game-cfg><select id=exe'+i+'>'+opts+'</select><select id=inp'+i+'>'+inps+'</select>'"
   "+'<input id=app'+i+' placeholder=\"Steam AppID (optional)\" value=\"'+esc(x.appid)+'\">'"
   "+'<input id=arg'+i+' placeholder=\"Launch args (e.g. -windowed)\" value=\"'+esc(x.args)+'\"></div></div>';}).join('');}"
+  "async function refreshStorage(){try{const r=await fetch('/api/storage');"
+  "if(!r.ok)throw Error(r.status);const s=await r.json(),v=s.volumes;"
+  "E('externalStorage').textContent=!v.length?(s.broker_status==='checking'?'Checking external storage...':"
+  "s.broker_status==='unavailable'?'Windows removable storage unavailable; no game drive paths found':"
+  "'No external game drives detected'):"
+  "v.map(d=>d.name+(d.game_roots.length?' — '+d.game_roots.join(', '):"
+  "' — no accessible Games or TiramisuGames folder')).join(' · ');"
+  "}catch{E('externalStorage').textContent='External storage status unavailable';}}"
+  "let hadDownload=false;"
   "async function refreshStatus(){try{const r=await fetch('/api/status');if(!r.ok)throw Error(r.status);const s=await r.json();"
   "E('runpill').textContent=s.running_game?('Running: '+s.running_game):'Xbox Connected';"
   "if(s.control_code&&E('ctrlLink'))E('ctrlLink').href='/controls?pin='+encodeURIComponent(s.control_code);"
-  "if(s.upload_total>0&&s.upload_done<s.upload_total){E('fill').style.width=Math.min(99,(s.upload_done/s.upload_total)*100)+'%';}}catch{E('runpill').textContent='Xbox Unavailable';}}"
+  "if(s.download_phase){const pct=s.download_total?Math.min(99,s.download_done/s.download_total*100):5;"
+  "E('fill').style.width=pct+'%';setLog(s.download_phase+' · '+(s.download_done/1048576).toFixed(1)+' MB');}"
+  "else if(hadDownload){E('fill').style.width=s.last_error?'0%':'100%';setLog(s.last_error||s.last_upload||'Download finished');refresh();}"
+  "else if(s.upload_total>0&&s.upload_done<s.upload_total){E('fill').style.width=Math.min(99,(s.upload_done/s.upload_total)*100)+'%';}"
+  "hadDownload=!!s.download_phase;}catch{E('runpill').textContent='Xbox Unavailable';}}"
+  "let steamLibrary=[],steamSignedIn=false;"
   "async function loadSteam(){try{const st=await(await fetch('/api/steam/status')).json();"
   "E('steaminfo').textContent=(st.signed_in?('Signed in as '+(st.persona||st.steamid64)+' · '):'')+(st.status||'Ready');"
   "if(st.qr_url){E('steamqrwrap').style.display='block';E('steamqrimg').src='/api/steam/qr.svg?t='+Date.now();}else{E('steamqrwrap').style.display='none';}"
-  "const items=await(await fetch('/api/steam/library')).json();"
-  "E('steamlist').innerHTML=items.length?items.slice(0,40).map(x=>'<div class=setrow><div><b>'+esc(x.title)+'</b> <span style=\"color:#9e9699;font-size:12px\">(AppID '+x.appid+' · '+esc(x.status||x.size)+')</span></div>'"
-  "+(x.installed?'<span class=pill>Installed</span>':(x.downloading?'<span class=pill>'+Math.round((x.pct||0)*100)+'%</span>':'<button class=\"btn btn-sec\" onclick=\"dlSteam('+x.appid+')\">Download to Xbox</button>'))+'</div>').join(''):'<span style=\"color:#9e9699;font-size:13px\">Sign in with Steam QR above to view your real Steam library &amp; download directly to Xbox.</span>';"
-  "}catch{}}"
+  "steamSignedIn=st.signed_in;steamLibrary=await(await fetch('/api/steam/library')).json();renderSteam();"
+  "}catch{E('steaminfo').textContent='Steam status unavailable';}}"
+  "function renderSteam(){const q=E('steamsearch').value.trim().toLowerCase();"
+  "const items=steamLibrary.filter(x=>x.title.toLowerCase().includes(q)||String(x.appid).includes(q));"
+  "E('steamlist').innerHTML=items.length?items.map(x=>'<div class=setrow><div><b>'+esc(x.title)+'</b> <span style=\"color:#9e9699;font-size:12px\">(AppID '+x.appid+' · '+esc(x.status||x.size)+')</span></div>'"
+  "+(x.installed?'<span class=pill>Installed</span>':(x.downloading||x.queued?'<button class=\"btn btn-sec\" onclick=\"cancelSteam('+x.appid+')\">'+(x.queued?'Queued':'Cancel '+Math.round((x.pct||0)*100)+'%')+'</button>':'<button class=\"btn btn-sec\" onclick=\"dlSteam('+x.appid+')\">Download to Xbox</button>'))+'</div>').join(''):(steamSignedIn?(q?'No matching Steam games.':'No Steam games loaded.'):'Sign in with Steam QR to view your library.');"
+  "}"
   "async function startSteamQr(){await fetch('/api/steam/qr',{method:'POST'});setTimeout(loadSteam,1200);}"
   "async function refreshSteam(){await fetch('/api/steam/refresh',{method:'POST'});setTimeout(loadSteam,1200);}"
   "async function steamSignOut(){await fetch('/api/steam/signout',{method:'POST'});loadSteam();}"
-  "async function dlSteam(id){await fetch('/api/steam/download/'+id,{method:'POST'});setLog('Started native Steam download for AppID '+id);loadSteam();}"
+  "async function steamJob(id,action){try{const r=await fetch('/api/steam/'+action+'/'+id,{method:'POST'});setLog(await r.text());loadSteam();}catch(e){setLog(e.message);}}"
+  "function dlSteam(id){steamJob(id,'download');}"
+  "function cancelSteam(id){steamJob(id,'cancel');}"
   "async function loadLogs(){try{E('logs').textContent=await(await fetch('/api/logs')).text();}catch{}}"
   "const SET_DEFS=["
   "['default_input','Default input mode','choice',['auto','controller','kbm','pad2kbm']],"
@@ -1355,6 +1679,9 @@ const char* k_upload_page =
   "['steam_auth','Steam QR link (own account)','bool',null],"
   "['show_qr','Show QR / LAN link on TV','bool',null],"
   "['show_fps','Show FPS counter','bool',null],"
+  "['show_sysinfo','Show system info','bool',null],"
+  "['quick_menu_enabled','Enable in-game quick menu','bool',null],"
+  "['fsb_decode','Decode FSB audio in the console runtime','bool',null],"
   "['vsync','VSync','bool',null],"
   "['frame_rate_cap','Frame rate cap (0=off, 30, 60, 120)','int',null],"
   "['resolution_scale','Resolution scale % (50-200)','int',null],"
@@ -1362,6 +1689,8 @@ const char* k_upload_page =
   "['input_deadzone','Controller deadzone % (0-50)','int',null],"
   "['audio_buffer_ms','Audio buffer ms (10-50)','int',null],"
   "['shader_cache','Shader compile cache','bool',null],"
+  "['texture_quality','Texture quality (0=Low, 3=Ultra)','int',null],"
+  "['network_games_root','Network games folder','text',null],"
   "['log_lines','Dashboard log tail lines (4-40)','int',null]];"
   "async function loadSettings(){"
   "let s;try{s=await(await fetch('/api/settings')).json();}catch{E('setwrap').innerHTML='<span style=\"color:#a66\">settings unavailable</span>';return;}"
@@ -1370,13 +1699,14 @@ const char* k_upload_page =
   "+'<option value=\"1\"'+(v?' selected':'')+'>ON</option><option value=\"0\"'+(!v?' selected':'')+'>OFF</option></select></div>';"
   "if(ty==='choice')return '<div class=setrow><label>'+lab+'</label><select id=set_'+k+'>'"
   "+chs.map(c=>'<option value=\"'+c+'\"'+(c===v?' selected':'')+'>'+c+'</option>').join('')+'</select></div>';"
-  "return '<div class=setrow><label>'+lab+'</label><input id=set_'+k+' type=number value=\"'+v+'\"></div>';}).join('');}"
+  "return '<div class=setrow><label for=set_'+k+'>'+lab+'</label><input id=set_'+k+' type='+(ty==='int'?'number':'text')+' value=\"'+esc(String(v==null?'':v))+'\"></div>';}).join('');}"
   "async function saveSettings(){const p={};SET_DEFS.forEach(d=>{const k=d[0],ty=d[2];const el=E('set_'+k);if(!el)return;"
-  "if(ty==='bool')p[k]=el.value==='1';else if(ty==='int')p[k]=parseInt(el.value||'0',10);else p[k]=el.value;});"
-  "const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});"
-  "E('setstat').textContent=r.ok?'Saved — active immediately':'Save failed (HTTP '+r.status+')';if(r.ok)setTimeout(()=>E('setstat').textContent='',4000);}"
+  "if(ty==='bool')p[k]=el.value==='1';else if(ty==='int'){if(el.value!=='')p[k]=Number(el.value);}else p[k]=el.value;});"
+  "try{const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});"
+  "E('setstat').textContent=r.ok?'Saved. Launch settings apply to the next game.':'Save failed (HTTP '+r.status+')';if(r.ok)loadSettings();"
+  "}catch(e){E('setstat').textContent='Save failed: '+e.message;}}"
   "E('connurl').textContent=location.href.split('?')[0];"
-  "loadSettings();refresh();refreshStatus();loadSteam();loadLogs();setInterval(refreshStatus,2000);setInterval(loadSteam,4000);setInterval(loadLogs,5000);</script></body></html>";
+  "loadSettings();refresh();refreshStorage();setInterval(refreshStorage,7000);refreshStatus();loadSteam();loadLogs();setInterval(refreshStatus,2000);setInterval(loadSteam,4000);setInterval(loadLogs,5000);</script></body></html>";
 
 bool recv_exact_all(sock_t s, const char* pre, size_t pre_len, uint64_t len,
                     std::string* out) {
@@ -1852,128 +2182,79 @@ void handle_client(sock_t s) {
   }
 
   if (strcmp(method, "POST") == 0 && url_path == "/api/download-url") {
+    const auto get_header = [&](const char* name) {
+      const std::string field = std::string("\r\n") + name + ":";
+      const size_t start = hdrs_low.find(field);
+      if (start == std::string::npos) return std::string{};
+      const size_t value = start + field.size();
+      return trim_ws(hdrs_low.substr(value, hdrs_low.find("\r\n", value) - value));
+    };
+    const std::string origin = get_header("origin");
+    if (!origin.empty() && origin != "http://" + get_header("host")) {
+      respond(s, "403 Forbidden", "text/plain", "Use the Tiramisu dashboard to start downloads");
+      return;
+    }
     std::string body;
-    if (!recv_exact_all(s, pre, pre_len, content_len, &body)) {
-      respond(s, "400 Bad Request", "text/plain", "bad body");
+    if (content_len == 0 || content_len > 16384 ||
+        !recv_exact_all(s, pre, pre_len, content_len, &body)) {
+      respond(s, "400 Bad Request", "text/plain", "Invalid download request");
       return;
     }
-    std::string dl_url, game_v;
-    if (!parse_json_str_field(body, "url", &dl_url) ||
-        (dl_url.rfind("http://", 0) != 0 && dl_url.rfind("https://", 0) != 0)) {
-      respond(s, "400 Bad Request", "text/plain", "provide a valid http(s):// URL");
+    std::string url, name;
+    if (!parse_json_str_field(body, "url", &url) ||
+        (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0)) {
+      respond(s, "400 Bad Request", "text/plain", "Provide an HTTP or HTTPS URL");
       return;
     }
-    parse_json_str_field(body, "game", &game_v);
+    parse_json_str_field(body, "game", &name);
 #ifdef TIRAMISU_UWP_HOST
-    std::string stem = game_v;
-    if (stem.empty()) {
-      size_t sl = dl_url.rfind('/');
-      stem = (sl == std::string::npos) ? "DownloadedGame" : dl_url.substr(sl + 1);
-      size_t qq = stem.find('?');
-      if (qq != std::string::npos) stem.resize(qq);
-      if (stem.size() > 4 && xfer_ieq(stem.substr(stem.size() - 4), ".zip"))
-        stem.resize(stem.size() - 4);
-    }
-    std::string safe_game;
-    if (!sanitize_game_name(stem, &safe_game)) safe_game = "DownloadedGame";
-    std::thread([dl_url, safe_game]() {
-      try {
-        winrt::init_apartment(winrt::apartment_type::multi_threaded);
-        using namespace winrt::Windows::Web::Http;
-        using namespace winrt::Windows::Storage::Streams;
-        set_upload_label("Downloading " + safe_game);
-        HttpClient http;
-        std::wstring wurl(dl_url.begin(), dl_url.end());
-        auto resp = http.GetAsync(winrt::Windows::Foundation::Uri(wurl),
-                                  HttpCompletionOption::ResponseHeadersRead).get();
-        if (!resp.IsSuccessStatusCode()) {
-          std::lock_guard<std::mutex> lk(g_mu);
-          g.last_error = "URL download HTTP " + std::to_string((int)resp.StatusCode());
-          set_upload_label("");
-          return;
-        }
-        uint64_t total_sz = 0;
-        if (auto cl = resp.Content().Headers().ContentLength()) total_sz = cl.Value();
-        g_upload_total = total_sz > 0 ? total_sz : 1048576;
-        g_upload_done = 0;
-        const std::string sep(1, XFER_SEP);
-        mkdirs(g_incoming);
-        mkdirs(g_games_dir);
-        // Support direct disc-image URLs (.iso/.bin/.img) as well as .zip archives
-        std::string url_no_q = dl_url;
-        size_t qpos = url_no_q.find('?');
-        if (qpos != std::string::npos) url_no_q.resize(qpos);
-        std::string direct_ext;
-        for (const char* e : {".iso", ".bin", ".img"}) {
-          const size_t el = strlen(e);
-          if (url_no_q.size() > el &&
-              xfer_ieq(url_no_q.substr(url_no_q.size() - el), e)) {
-            direct_ext = e;
-            break;
-          }
-        }
-        const std::string tmp = direct_ext.empty()
-            ? (g_incoming + sep + safe_game + ".zip")
-            : (g_games_dir + sep + safe_game + direct_ext);
-        FILE* fp = fopen(tmp.c_str(), "wb");
-        if (!fp) {
-          g_upload_total = 0;
-          g_upload_done = 0;
-          set_upload_label("");
-          std::lock_guard<std::mutex> lk(g_mu);
-          g.last_error = "cannot open Xbox storage path: " + tmp;
-          return;
-        }
-        auto stream = resp.Content().ReadAsInputStreamAsync().get();
-        Buffer buf(65536);
-        uint64_t got = 0;
-        while (!g_stop) {
-          auto res = stream.ReadAsync(buf, 65536, InputStreamOptions::Partial).get();
-          uint32_t n = res.Length();
-          if (n == 0) break;
-          DataReader dr = DataReader::FromBuffer(res);
-          std::vector<uint8_t> chunk(n);
-          dr.ReadBytes(chunk);
-          fwrite(chunk.data(), 1, n, fp);
-          got += n;
-          g_upload_done = got;
-          if (got > g_upload_total.load()) g_upload_total = got;
-        }
-        fclose(fp);
-        bool ok = false;
-        std::string note;
-        if (!direct_ext.empty()) {
-          ok = (got > 0);
-          note = std::to_string(got / 1048576) + " MB disc image";
-        } else {
-          set_upload_label("Extracting " + safe_game);
-          const std::string dest = g_games_dir + sep + safe_game;
-          mkdirs(dest);
-          ok = extract_zip(tmp, dest, &note);
-          remove(tmp.c_str());
-        }
-        g_upload_total = 0;
-        g_upload_done = 0;
-        set_upload_label("");
-        std::lock_guard<std::mutex> lk(g_mu);
-        if (ok) {
-          g.last_upload = safe_game + " (" + note + ")";
-          g.last_error.clear();
-          g.rescan_requested = true;
-          g.rescan_game = safe_game;
-        } else {
-          g.last_error = "URL extract failed: " + note;
-        }
-      } catch (...) {
-        g_upload_total = 0;
-        g_upload_done = 0;
-        set_upload_label("");
-        std::lock_guard<std::mutex> lk(g_mu);
-        g.last_error = "URL download failed";
+    std::string extension;
+    try {
+      const winrt::Windows::Foundation::Uri uri(winrt::to_hstring(url));
+      if (uri.Host().empty() || !uri.UserName().empty() || !uri.Password().empty()) {
+        respond(s, "400 Bad Request", "text/plain", "Invalid download URL");
+        return;
       }
-    }).detach();
-    respond(s, "202 Accepted", "text/plain",
-            "Downloading " + safe_game + " directly onto Xbox — watch TV or progress bar!");
+      const std::string path = winrt::to_string(uri.Path());
+      const size_t slash = path.rfind('/');
+      std::string filename = url_decode(path.substr(slash == std::string::npos ? 0 : slash + 1));
+      const size_t dot = filename.rfind('.');
+      if (dot != std::string::npos) {
+        extension = xfer_lower(filename.substr(dot));
+        filename.resize(dot);
+      }
+      if (extension != ".iso" && extension != ".img" && extension != ".bin") {
+        extension = ".zip";
+      }
+      if (trim_ws(name).empty()) name = filename;
+    } catch (...) {
+      respond(s, "400 Bad Request", "text/plain", "Invalid download URL");
+      return;
+    }
+    if (!sanitize_game_name(name, &name) || name.front() == '.' ||
+        name.back() == '.') {
+      respond(s, "400 Bad Request", "text/plain", "Enter a valid game name");
+      return;
+    }
+    if (g_url_active.exchange(true)) {
+      respond(s, "409 Conflict", "text/plain", "Another URL download is active");
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(g_mu);
+      g.last_error.clear();
+      g.last_upload.clear();
+      g_url_phase = "Connecting";
+    }
+    try {
+      std::thread(download_game_url, url, name, extension, g_incoming,
+                  g_games_dir).detach();
+    } catch (...) {
+      finish_url_download({}, "Could not start download worker");
+      respond(s, "503 Service Unavailable", "text/plain", "Could not start download");
+      return;
+    }
+    respond(s, "202 Accepted", "text/plain", "Downloading " + name + " on Xbox");
 #else
     respond(s, "501 Not Implemented", "text/plain", "URL download requires Xbox UWP host");
 #endif
@@ -2105,37 +2386,162 @@ void handle_client(sock_t s) {
     std::string out = "[";
     for (size_t i = 0; i < items.size(); ++i) {
       if (i) out += ",";
-      char b[512];
-      snprintf(b, sizeof(b),
-               "{\"appid\":%u,\"title\":\"%s\",\"size\":\"%s\","
-               "\"installed\":%s,\"downloading\":%s,\"pct\":%.3f,\"status\":\"%s\"}",
-               items[i].app_id, json_escape(items[i].title).c_str(),
-               json_escape(items[i].size_str).c_str(),
-               items[i].installed ? "true" : "false",
-               items[i].downloading ? "true" : "false",
-               items[i].download_pct,
-               json_escape(items[i].status_text).c_str());
-      out += b;
+      const auto& item = items[i];
+      out += "{\"appid\":" + std::to_string(item.app_id) +
+             ",\"title\":\"" + json_escape(item.title) +
+             "\",\"size\":\"" + json_escape(item.size_str) +
+             "\",\"installed\":" + (item.installed ? "true" : "false") +
+             ",\"downloading\":" + (item.downloading ? "true" : "false") +
+             ",\"queued\":" + (item.queued ? "true" : "false") +
+             ",\"pct\":" + std::to_string(item.download_pct) +
+             ",\"status\":\"" + json_escape(item.status_text) + "\"}";
     }
     out += "]";
     respond(s, "200 OK", "application/json", out);
     return;
   }
-  if (strcmp(method, "POST") == 0 && url_path.rfind("/api/steam/download/", 0) == 0) {
-    const uint32_t appid = (uint32_t)strtoul(url_path.substr(20).c_str(), nullptr, 10);
-    if (appid == 0) {
-      respond(s, "400 Bad Request", "text/plain", "bad appid");
+  if (strcmp(method, "POST") == 0 &&
+      (url_path.rfind("/api/steam/download/", 0) == 0 ||
+       url_path.rfind("/api/steam/cancel/", 0) == 0)) {
+    const bool cancel = url_path.rfind("/api/steam/cancel/", 0) == 0;
+    const std::string id = url_path.substr(cancel ? 18 : 20);
+    uint64_t value = 0;
+    if (id.empty() || id.size() > 10) {
+      respond(s, "400 Bad Request", "text/plain", "Invalid Steam App ID");
       return;
     }
-    steam_client_download_app(appid, []() {
-      std::lock_guard<std::mutex> lk(g_mu);
-      g.rescan_requested = true;
-      g.rescan_game.clear();
-    });
-    respond(s, "202 Accepted", "application/json", "{\"ok\":true}");
+    for (const char digit : id) {
+      if (digit < '0' || digit > '9') {
+        respond(s, "400 Bad Request", "text/plain", "Invalid Steam App ID");
+        return;
+      }
+      value = value * 10 + (digit - '0');
+    }
+    if (value == 0 || value > UINT32_MAX) {
+      respond(s, "400 Bad Request", "text/plain", "Invalid Steam App ID");
+      return;
+    }
+    const auto appid = static_cast<uint32_t>(value);
+    const bool accepted = cancel ? steam_client_cancel_download(appid)
+        : steam_client_download_app(appid, []() {
+            std::lock_guard<std::mutex> lock(g_mu);
+            g.rescan_requested = true;
+            g.rescan_game.clear();
+          });
+    respond(s, accepted ? "202 Accepted" : "409 Conflict", "text/plain",
+            accepted ? (cancel ? "Cancellation requested" : "Install requested")
+                     : (cancel ? "No cancellable download" : "Could not queue install"));
     return;
   }
 #endif
+#ifdef TIRAMISU_UWP_HOST
+  if (strcmp(method, "GET") == 0 && url_path == "/api/launch-checkpoint") {
+    launch_checkpoint checkpoint{};
+    if (!launch_checkpoint_read(g_local_state_dir, &checkpoint)) {
+      respond(s, "200 OK", "application/json", "{\"available\":false}");
+      return;
+    }
+    char body[128];
+    snprintf(body, sizeof(body),
+             "{\"available\":true,\"phase\":%u,\"outcome\":%u,\"code\":%u}",
+             static_cast<unsigned>(checkpoint.phase),
+             static_cast<unsigned>(checkpoint.outcome), checkpoint.code);
+    respond(s, "200 OK", "application/json", body);
+    return;
+  }
+  if (strcmp(method, "GET") == 0 && url_path == "/api/launch-api-tail") {
+    trt_launch_api_entry entries[12]{};
+    u64 calls = 0;
+    const u32 count = gap_trace_launch_tail(entries, 12, &calls);
+    std::string body = "{\"observed_calls\":" + std::to_string(calls) + ",\"newest_first\":[";
+    for (u32 i = 0; i < count; ++i) {
+      if (i) body += ',';
+      body += "{\"api\":\"" + json_escape(entries[i].name) +
+              "\",\"repeats\":" + std::to_string(entries[i].repeats) + "}";
+    }
+    body += "]}";
+    respond(s, "200 OK", "application/json", body);
+    return;
+  }
+  if (strcmp(method, "GET") == 0 && url_path == "/api/render-status") {
+    trt_gpu_render_stats stats{};
+    trt_gpu_get_render_stats(&stats);
+    trt_gpu_resize_stats resize{};
+    trt_gpu_get_resize_stats(&resize);
+    trt_sync_launch_stats sync{};
+    trt_sync_get_launch_stats(&sync);
+    const auto draw = swapchain_guest_draw_probe();
+    char buf[2048];
+    snprintf(buf, sizeof(buf),
+             "{\"d3d11_device_calls\":%u,\"d3d11_swapchains\":%u,"
+             "\"d3d11_get_buffer_calls\":%u,\"d3d11_present_calls\":%u,"
+             "\"d3d11_successful_presents\":%u,\"d3d11_last_present_result\":%d,"
+             "\"d3d11_swap_effect\":%u,\"d3d11_buffer_count\":%u,\"d3d11_stable_backbuffer\":%u,"
+             "\"d3d11_width\":%u,\"d3d11_height\":%u,"
+             "\"d3d11_resize_target_calls\":%u,\"d3d11_resize_target_width\":%u,"
+             "\"d3d11_resize_target_height\":%u,\"d3d11_resize_target_result\":%d,"
+             "\"d3d11_resize_buffer_calls\":%u,\"d3d11_resize_buffer_requested_width\":%u,"
+             "\"d3d11_resize_buffer_requested_height\":%u,\"d3d11_resize_buffer_client_width\":%u,"
+             "\"d3d11_resize_buffer_client_height\":%u,\"d3d11_resize_buffer_present_count\":%u,"
+             "\"d3d11_resize_buffer_result\":%d,"
+             "\"draw_probe_state\":%u,\"draw_probe_samples\":%u,\"draw_probe_vertices\":%llu,"
+             "\"draw_probe_pixel_invocations\":%llu,\"draw_probe_result\":%d,"
+             "\"surface_samples\":%u,\"guest_lit_pixels\":%u,\"host_lit_pixels\":%u,"
+             "\"surface_probe_result\":%d,\"draw_probe_nonempty_samples\":%u,"
+             "\"surface_guest_rtv_samples\":%u,\"surface_other_rtv_samples\":%u,"
+             "\"surface_other_samples\":%u,\"surface_other_lit_pixels\":%u,"
+             "\"surface_other_width\":%u,\"surface_other_height\":%u,"
+             "\"surface_other_format\":%u,\"surface_other_result\":%d,"
+             "\"sync_wait_completed\":%u,\"sync_wait_timeout\":%u,\"sync_wait_failed\":%u,"
+             "\"sync_setevent_signaled\":%u,\"sync_setevent_failed\":%u,"
+             "\"guest_commit_mib\":%llu,\"guest_commit_budget_mib\":%u}",
+             stats.d3d11_device_calls, stats.d3d11_swapchains, stats.d3d11_get_buffer_calls,
+             stats.d3d11_present_calls, stats.d3d11_successful_presents,
+             stats.d3d11_last_present_result, stats.d3d11_swap_effect,
+             stats.d3d11_buffer_count, stats.d3d11_stable_backbuffer, stats.d3d11_width,
+             stats.d3d11_height, resize.target_calls, resize.target_width, resize.target_height,
+             resize.target_result, resize.buffer_calls, resize.buffer_requested_width,
+             resize.buffer_requested_height, resize.buffer_client_width,
+             resize.buffer_client_height, resize.buffer_present_count, resize.buffer_result,
+             draw.state, draw.samples,
+             draw.vertices, draw.pixel_invocations, draw.result, draw.surface_samples,
+             draw.guest_lit_pixels, draw.host_lit_pixels, draw.surface_result,
+             draw.nonempty_draw_samples, draw.guest_rtv_samples, draw.other_rtv_samples,
+             draw.other_surface_samples, draw.other_lit_pixels,
+             draw.other_width, draw.other_height, draw.other_format, draw.other_surface_result,
+             sync.wait_completed, sync.wait_timed_out, sync.wait_failed,
+             sync.event_signaled, sync.event_failed,
+             static_cast<unsigned long long>(trt_mem_budget_committed() / 1048576ULL),
+             trt_mem_budget_get_mb());
+    respond(s, "200 OK", "application/json", buf);
+    return;
+  }
+#endif
+  if (strcmp(method, "GET") == 0 && url_path == "/api/storage") {
+    std::vector<webxfer_storage_volume> volumes;
+    std::string broker_status;
+    {
+      std::lock_guard<std::mutex> lock(g_external_storage_mu);
+      volumes = g_external_storage;
+      broker_status = g_storage_broker_status;
+    }
+    std::string json = "{\"broker_status\":\"" + json_escape(broker_status) + "\",\"volumes\":[";
+    bool first = true;
+    for (const auto& volume : volumes) {
+      if (!first) json += ',';
+      first = false;
+      json += "{\"name\":\"" + json_escape(volume.name) + "\",\"path\":\"" +
+              json_escape(volume.path) + "\",\"game_roots\":[";
+      for (size_t i = 0; i < volume.game_roots.size(); ++i) {
+        if (i) json += ',';
+        json += "\"" + json_escape(volume.game_roots[i]) + "\"";
+      }
+      json += "]}";
+    }
+    respond(s, "200 OK", "application/json", json + "]}");
+    return;
+  }
+
   if (strcmp(method, "GET") == 0 && url_path == "/api/status") {
     // .238 FIX: serve /api/status WITHOUT holding g_mu across
     // the response -- the .237 priority fix did NOT cure the
@@ -2151,6 +2557,7 @@ void handle_client(sock_t s) {
     bool running = false;
     std::string running_game, url, last_upload, last_error, launch_name,
         last_launch_result, last_launch_name, ap_game, ap_result;
+    std::string download_phase;
     bool launch_requested = false;
     int ap_attempt = 0;
     unsigned long long upload_done = 0, upload_total = 0;
@@ -2161,6 +2568,7 @@ void handle_client(sock_t s) {
       url = g.url;
       last_upload = g.last_upload;
       last_error = g.last_error;
+      download_phase = g_url_phase;
       launch_requested = g.launch_requested;
       launch_name = g.launch_name;
       last_launch_result = g.last_launch_result;
@@ -2196,7 +2604,7 @@ void handle_client(sock_t s) {
       log_line(hl);
     }
     const std::string ctrl_code = webxfer_control_code();
-    char buf[1024];
+    char buf[4096];
     snprintf(buf, sizeof(buf),
              "{\"running\":%s,\"guest_running\":%s,\"running_game\":\"%s\",\"url\":\"%s\","
              "\"last_upload\":\"%s\",\"last_error\":\"%s\","
@@ -2205,7 +2613,8 @@ void handle_client(sock_t s) {
              "\"autopilot_game\":\"%s\",\"autopilot_attempt\":%d,"
              "\"autopilot_result\":\"%s\","
              "\"control_code\":\"%s\","
-             "\"upload_done\":%llu,\"upload_total\":%llu}",
+             "\"upload_done\":%llu,\"upload_total\":%llu,"
+             "\"download_phase\":\"%s\",\"download_done\":%llu,\"download_total\":%llu}",
              running ? "true" : "false",
              // running = the server is listening; guest_running = a guest is
              // actually launched (running_game is set on launch, cleared on exit)
@@ -2219,7 +2628,10 @@ void handle_client(sock_t s) {
              json_escape(last_launch_name).c_str(),
              json_escape(ap_game).c_str(), ap_attempt, ap_result.c_str(),
              json_escape(ctrl_code).c_str(),
-             upload_done, upload_total);
+             upload_done, upload_total,
+             json_escape(download_phase).c_str(),
+             static_cast<unsigned long long>(g_url_received.load()),
+             static_cast<unsigned long long>(g_url_expected.load()));
     respond(s, "200 OK", "application/json", buf);
     return;
   }
@@ -2353,8 +2765,8 @@ void handle_client(sock_t s) {
       respond(s, "400 Bad Request", "text/plain", "invalid game name");
       return;
     }
-    const std::string gdir = g_games_dir + std::string(1, XFER_SEP) + game;
-    if (!dir_exists(gdir)) {
+    const std::string gdir = find_game_dir(game);
+    if (gdir.empty()) {
       respond(s, "404 Not Found", "text/plain", "game not found");
       return;
     }
@@ -2414,8 +2826,8 @@ void handle_client(sock_t s) {
       respond(s, "400 Bad Request", "text/plain", "invalid game name");
       return;
     }
-    const std::string gdir = g_games_dir + std::string(1, XFER_SEP) + name;
-    if (!dir_exists(gdir)) {
+    const std::string gdir = find_game_dir(name);
+    if (gdir.empty()) {
       respond(s, "404 Not Found", "text/plain", "game not found");
       return;
     }
@@ -2490,6 +2902,35 @@ void handle_client(sock_t s) {
       g.rescan_game = name;  // scoped: only this game's entries vanish
     }
     respond(s, "200 OK", "application/json", "{\"deleted\":true}");
+    return;
+  }
+  if ((strcmp(method, "GET") == 0 || strcmp(method, "PUT") == 0) &&
+      url_path.rfind("/api/game-profile/", 0) == 0) {
+    std::string name;
+    if (!sanitize_game_name(url_decode(url_path.substr(18), false), &name)) {
+      respond(s, "400 Bad Request", "text/plain", "Invalid game name");
+      return;
+    }
+    const auto game = find_game_dir(name);
+    if (game.empty()) {
+      respond(s, "404 Not Found", "text/plain", "Game not found");
+      return;
+    }
+    const auto profile = settings_title_profile_dir(g_local_state_dir, game);
+    if (strcmp(method, "GET") == 0) {
+      respond(s, "200 OK", "text/plain; charset=utf-8", settings_read_user_profile(profile));
+      return;
+    }
+    std::string text;
+    if (content_len > 64 * 1024 || is_chunked ||
+        !recv_exact_all(s, pre, pre_len, content_len, &text) ||
+        text.find('\0') != std::string::npos) {
+      respond(s, "400 Bad Request", "text/plain", "Invalid or oversized settings file");
+      return;
+    }
+    const bool saved = settings_write_user_profile(profile, text);
+    respond(s, saved ? "200 OK" : "500 Server Error", "text/plain",
+            saved ? "Saved. Settings apply on the next launch." : "Could not write game settings");
     return;
   }
   if (strcmp(method, "POST") == 0 && url_path.rfind("/api/config/", 0) == 0) {
@@ -2704,77 +3145,31 @@ void handle_client(sock_t s) {
     g_upload_done = 0;
     return;
   }
-  if (strcmp(method, "GET") == 0 && url_path == "/api/settings") {
-    // settings as JSON for the dashboard editor
-    const auto& s_set = settings_get();
-    std::string j = "{";
-    char sbuf[256];
-    snprintf(sbuf, sizeof(sbuf),
-             "\"default_input\":\"%s\",\"mouse_speed\":%d,"
-             "\"wheel_speed\":%d,\"pad_vibration\":%s,",
-             s_set.default_input.c_str(), s_set.mouse_speed, s_set.wheel_speed,
-             s_set.pad_vibration ? "true" : "false");
-    j += sbuf;
-    snprintf(sbuf, sizeof(sbuf),
-             "\"os_major\":%d,\"os_minor\":%d,\"os_build\":%d,"
-             "\"win11_personality\":%s,",
-             s_set.os_major, s_set.os_minor, s_set.os_build,
-             s_set.win11_personality ? "true" : "false");
-    j += sbuf;
-    snprintf(sbuf, sizeof(sbuf),
-             "\"write_watch\":%s,\"steam_auth\":%s,\"show_qr\":%s,"
-             "\"log_lines\":%d}",
-             s_set.write_watch ? "true" : "false",
-             s_set.steam_auth ? "true" : "false",
-             s_set.show_qr ? "true" : "false", s_set.log_lines);
-    j += sbuf;
-    respond(s, "200 OK", "application/json", j);
+  if (url_path == "/api/settings" && strcmp(method, "GET") == 0) {
+    respond(s, "200 OK", "application/json", dashboard_settings_json(settings_get_global()));
     return;
   }
-  if (strcmp(method, "POST") == 0 && url_path == "/api/settings") {
-    // body: JSON with any subset of the setting keys; unknown keys ignored.
-    // `pre` already holds bytes read with the header — drain exactly.
+  if (url_path == "/api/settings" && strcmp(method, "POST") == 0) {
     std::string body;
-    if (!recv_exact_all(s, pre, pre_len, content_len, &body)) {
-      respond(s, "400 Bad Request", "text/plain", "bad body");
+    if (is_chunked || content_len > 8192 ||
+        !recv_exact_all(s, pre, pre_len, content_len, &body)) {
+      respond(s, "400 Bad Request", "text/plain", "Invalid settings request");
       return;
     }
-    if (body.size() > 1800) {
-      respond(s, "400 Bad Request", "text/plain", "body too large");
+    auto st = settings_get_global();
+    const auto previous_network_root = st.network_games_root;
+    apply_dashboard_settings(body, st);
+    if (!settings_store(st, g_local_state_dir)) {
+      respond(s, "500 Server Error", "text/plain", "Could not save settings");
       return;
     }
-    host_settings st = settings_get();
-    auto get_bool = [&](const char* k, bool* v) {
-      const std::string pt = std::string("\"") + k + "\":true";
-      const std::string pf = std::string("\"") + k + "\":false";
-      if (body.find(pt) != std::string::npos) *v = true;
-      else if (body.find(pf) != std::string::npos) *v = false;
-    };
-    auto get_int = [&](const char* k, int* v) {
-      const std::string pt = std::string("\"") + k + "\":";
-      const size_t p = body.find(pt);
-      if (p == std::string::npos) return;
-      *v = atoi(body.c_str() + p + pt.size());
-    };
-    get_bool("pad_vibration", &st.pad_vibration);
-    get_bool("win11_personality", &st.win11_personality);
-    get_bool("write_watch", &st.write_watch);
-    get_bool("steam_auth", &st.steam_auth);
-    get_bool("show_qr", &st.show_qr);
-    get_int("mouse_speed", &st.mouse_speed);
-    get_int("wheel_speed", &st.wheel_speed);
-    get_int("os_major", &st.os_major);
-    get_int("os_minor", &st.os_minor);
-    get_int("os_build", &st.os_build);
-    get_int("log_lines", &st.log_lines);
-    const std::string dip = "\"default_input\":\"";
-    const size_t dp = body.find(dip);
-    if (dp != std::string::npos) {
-      const size_t e = body.find('"', dp + dip.size());
-      if (e != std::string::npos)
-        st.default_input = body.substr(dp + dip.size(), e - dp - dip.size());
+    const auto network_root = settings_get_global().network_games_root;
+    webxfer_set_network_games_dir(network_root);
+    if (network_root != previous_network_root) {
+      std::lock_guard<std::mutex> lock(g_mu);
+      g.rescan_requested = true;
+      g.rescan_game.clear();
     }
-    settings_store(st, g_local_state_dir);
     log_line("settings: saved from the web dashboard");
     respond(s, "200 OK", "application/json", "{\"saved\":true}");
     return;
@@ -2947,6 +3342,54 @@ int webxfer_score_ipv4(const char* dotted) {
   return 100;
 }
 
+void webxfer_set_external_storage(const std::vector<webxfer_storage_volume>& volumes,
+                                  const std::string& broker_status) {
+  std::lock_guard<std::mutex> lock(g_external_storage_mu);
+  g_external_storage = volumes;
+  g_storage_broker_status = broker_status;
+}
+
+void webxfer_set_package_games_dir(const std::string& path) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  g_package_games_dir = path;
+}
+
+void webxfer_set_network_games_dir(const std::string& path) {
+  {
+    std::lock_guard<std::mutex> lock(g_network_root_mu);
+    if (g_network_games_dir == path) return;
+    g_network_games_dir = path;
+  }
+#ifdef _WIN32
+  if (!path.empty()) {
+    SetLastError(ERROR_SUCCESS);
+    const DWORD attr = GetFileAttributesA(path.c_str());
+    const DWORD attr_error =
+        attr == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
+    const std::string glob = path + "\\*";
+    WIN32_FIND_DATAA fd{};
+    SetLastError(ERROR_SUCCESS);
+    HANDLE h = FindFirstFileA(glob.c_str(), &fd);
+    const DWORD find_error =
+        h == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    unsigned entries = 0;
+    if (h != INVALID_HANDLE_VALUE) {
+      do {
+        if (strcmp(fd.cFileName, ".") && strcmp(fd.cFileName, ".."))
+          ++entries;
+      } while (FindNextFileA(h, &fd));
+      FindClose(h);
+    }
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "network games probe: attr=%s attr_err=%lu find_err=%lu entries=%u",
+             attr == INVALID_FILE_ATTRIBUTES ? "missing" : "ok",
+             (unsigned long)attr_error, (unsigned long)find_error, entries);
+    log_line(msg);
+  }
+#endif
+}
+
 std::string webxfer_start_port(const std::string& local_state, unsigned short port) {
   webxfer_shutdown();
 #ifdef _WIN32
@@ -3025,26 +3468,24 @@ std::string webxfer_start(const std::string& local_state, int display_w) {
   return webxfer_start_port(local_state, 9127);
 }
 
-bool webxfer_find_game(const char* name, char* out_exe, size_t cap) {
+bool webxfer_find_game(const char* name, char* out_exe, size_t cap,
+                       std::string* out_game_dir) {
   if (!name || !name[0] || !out_exe || cap == 0) return false;
   out_exe[0] = 0;
+  std::string safe_name;
+  if (!sanitize_game_name(name, &safe_name)) return false;
   std::lock_guard<std::mutex> lk(g_mu);
-  std::vector<dir_ent> ents;
-  list_dir_entries(g_games_dir, &ents);
-  const std::string sep(1, XFER_SEP);
-  for (const auto& d : ents) {
-    if (!d.is_dir || !xfer_ieq(d.name, name)) continue;
-    const std::string gdir = g_games_dir + sep + d.name;
-    std::vector<std::string> exes;
-    std::string exe;
-    scan_game_exes(gdir, d.name, &exes, &exe);
-    if (exe.empty()) return false;
-    const size_t need = exe.size() + 1;
-    if (need > cap) return false;
-    memcpy(out_exe, exe.c_str(), need);
-    return true;
-  }
-  return false;
+  const std::string gdir = find_game_dir(safe_name);
+  if (gdir.empty()) return false;
+  std::vector<std::string> exes;
+  std::string exe;
+  scan_game_exes(gdir, safe_name, &exes, &exe);
+  if (exe.empty()) return false;
+  const size_t need = exe.size() + 1;
+  if (need > cap) return false;
+  memcpy(out_exe, exe.c_str(), need);
+  if (out_game_dir) *out_game_dir = gdir;
+  return true;
 }
 
 bool webxfer_poll_launch(std::string* out_name) {
@@ -3129,8 +3570,12 @@ void webxfer_shutdown() {
 
 std::string webxfer_status_line() {
   std::lock_guard<std::mutex> lk(g_mu);
-  if (!g.last_upload.empty()) return "xfer: " + g.last_upload + "  |  " + g.url;
+  if (!g_url_phase.empty()) {
+    return g_url_phase + " · " + std::to_string(g_url_received.load() / 1048576) +
+           " MB  |  " + g.url;
+  }
   if (!g.last_error.empty()) return "xfer ERR: " + g.last_error + "  |  " + g.url;
+  if (!g.last_upload.empty()) return "xfer: " + g.last_upload + "  |  " + g.url;
   return g.running ? ("LAN Dashboard: " + g.url) : "transfer: offline";
 }
 

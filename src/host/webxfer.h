@@ -12,6 +12,16 @@
 
 namespace longan {
 
+struct webxfer_storage_volume {
+  std::string name;
+  std::string path;
+  std::vector<std::string> game_roots;
+  bool operator==(const webxfer_storage_volume&) const = default;
+};
+
+void webxfer_set_external_storage(const std::vector<webxfer_storage_volume>& volumes,
+                                  const std::string& broker_status);
+
 struct webxfer_state {
   bool running = false;
   unsigned short port = 9127;
@@ -52,7 +62,10 @@ bool webxfer_poll_launch(std::string* out_name);
 // RELATIVE to the games root ("raccoin\RACCOIN.exe"). The shelf scan and
 // this must agree; the shelf can come up empty on the console while /games
 // works, so the launcher falls back to this.
-bool webxfer_find_game(const char* name, char* out_exe, size_t cap);
+void webxfer_set_package_games_dir(const std::string& path);
+void webxfer_set_network_games_dir(const std::string& path);
+bool webxfer_find_game(const char* name, char* out_exe, size_t cap,
+                       std::string* out_game_dir = nullptr);
 bool webxfer_poll_stop();
 // Consume a pending rescan request. The overload also returns the scoped
 // game dir (empty = full rescan). The no-arg form keeps the old contract

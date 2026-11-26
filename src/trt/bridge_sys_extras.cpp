@@ -8,6 +8,7 @@
 //   - userenv.dll  : User profile directories & environment blocks
 //   - wtsapi32.dll : Session notifications & WTSQuerySessionInformation
 #include "bridge_sys_extras.h"
+#include "gdi_raster.h"
 #include "bridge_ole.h"
 #include "trt.h"
 #include "thunk.h"
@@ -689,7 +690,6 @@ int TRT_GUEST_ABI k32_ProcessIdToSessionId(u32 pid, u32* sid) {
 
 // ---- 7. vulkan-1.dll now implemented in bridge_vulkan.cpp ---------------------
 std::atomic<bool> g_comdlg_logged{false};
-std::atomic<bool> g_msimg_logged{false};
 std::atomic<bool> g_wintrust_logged{false};
 
 // ---- 8. comdlg32.dll — honest user-cancel / no desktop common dialogs --------
@@ -784,32 +784,101 @@ int TRT_GUEST_ABI uxt_ShouldAppsUseDarkMode(void) { return 1; }
 int TRT_GUEST_ABI uxt_AllowDarkModeForWindow(void*, int) { return 1; }
 int TRT_GUEST_ABI uxt_SetPreferredAppMode(int) { return 1; }
 
-// ---- 10. msimg32.dll — fail-visible GDI AlphaBlend/TransparentBlt/Gradient ---
+// ---- 10. msimg32.dll — real blended blits on the GDI raster surface -------
+//
+// AlphaBlend / TransparentBlt / GradientFill used to be named no-ops ("headless
+// GDI surface"). The surface now holds real pixels, so they composite:
+//  - AlphaBlend: AC_SRC_OVER with SourceConstantAlpha (per-pixel AC_SRC_ALPHA
+//    needs an alpha channel the XRGB surface does not carry; named below).
+//  - TransparentBlt: color-keyed stretch blit.
+//  - GradientFill: GRADIENT_FILL_RECT_H/V between two TRIVERTEX stops;
+//    GRADIENT_FILL_TRIANGLE stays a named FALSE (no triangle rasterizer).
+namespace {
 
-int TRT_GUEST_ABI msimg_AlphaBlend(void*, int, int, int, int, void*, int, int,
-                                   int, int, u32) {
-  if (!g_msimg_logged.exchange(true, std::memory_order_relaxed)) {
-    trt_core_log("[msimg32] AlphaBlend unsupported on headless GDI surface");
+struct trivertex_ {
+  u32 x, y;
+  u16 red, green, blue, alpha;
+};
+
+struct blendfunction_ {
+  u8 blend_op, blend_flags, source_constant_alpha, alpha_format;
+};
+
+inline u32 argb_of_trivertex(const trivertex_* v) {
+  return ((u32)(v->alpha >> 8) << 24) | ((u32)(v->red >> 8) << 16) |
+         ((u32)(v->green >> 8) << 8) | (u32)(v->blue >> 8);
+}
+
+}  // namespace
+
+int TRT_GUEST_ABI msimg_AlphaBlend(void* hdc_dst, int x, int y, int w, int h,
+                                   void* hdc_src, int sx, int sy, int sw,
+                                   int sh, u32 blendfunc) {
+  blendfunction_ bf;
+  memcpy(&bf, &blendfunc, sizeof(bf));
+  if (bf.blend_op != 0) {  // AC_SRC_OVER is the only defined op
+    trt_core_log("[msimg32] AlphaBlend -> FALSE (BlendOp != AC_SRC_OVER)");
+    trt_SetLastError(87);
+    return 0;
   }
-  trt_SetLastError(120);
+  if (bf.alpha_format == 1) {
+    // Per-pixel alpha: the raster surface is XRGB, so there is nothing to read.
+    trt_core_log(
+        "[msimg32] AlphaBlend AC_SRC_ALPHA: surface has no alpha channel, "
+        "blending with SourceConstantAlpha instead");
+  }
+  const u8 alpha = bf.source_constant_alpha;
+  if (trt_raster::alpha_blend(hdc_dst, x, y, w, h, hdc_src, sx, sy, sw, sh,
+                              alpha)) {
+    return 1;
+  }
+  trt_core_log("[msimg32] AlphaBlend -> FALSE (no raster surface for a DC)");
+  trt_SetLastError(87);
   return 0;
 }
 
-int TRT_GUEST_ABI msimg_TransparentBlt(void*, int, int, int, int, void*, int,
-                                       int, int, int, u32) {
-  if (!g_msimg_logged.exchange(true, std::memory_order_relaxed)) {
-    trt_core_log("[msimg32] TransparentBlt unsupported on headless GDI surface");
+int TRT_GUEST_ABI msimg_TransparentBlt(void* hdc_dst, int x, int y, int w,
+                                       int h, void* hdc_src, int sx, int sy,
+                                       int sw, int sh, u32 transparent) {
+  if (trt_raster::key_blit(hdc_dst, x, y, w, h, hdc_src, sx, sy, sw, sh,
+                           transparent)) {
+    return 1;
   }
-  trt_SetLastError(120);
+  trt_core_log(
+      "[msimg32] TransparentBlt -> FALSE (no raster surface for a DC)");
+  trt_SetLastError(87);
   return 0;
 }
 
-int TRT_GUEST_ABI msimg_GradientFill(void*, void*, u32, void*, u32, u32) {
-  if (!g_msimg_logged.exchange(true, std::memory_order_relaxed)) {
-    trt_core_log("[msimg32] GradientFill unsupported on headless GDI surface");
+int TRT_GUEST_ABI msimg_GradientFill(void* hdc, void* vertex, u32 n_vertex,
+                                     void* mesh, u32 n_mesh, u32 mode) {
+  constexpr u32 kRectV = 1, kTriangle = 2;
+  if (!hdc || !vertex || n_vertex < 2 || !mesh || n_mesh < 1) {
+    trt_core_log("[msimg32] GradientFill -> FALSE (bad arguments)");
+    trt_SetLastError(87);
+    return 0;
   }
-  trt_SetLastError(120);
-  return 0;
+  if (mode == kTriangle) {
+    trt_core_log("[msimg32] GradientFill GRADIENT_FILL_TRIANGLE named (no triangle mesh rasterizer)");
+    trt_SetLastError(87);
+    return 0;
+  }
+  const trivertex_* v = (const trivertex_*)vertex;
+  const u32* rects = (const u32*)mesh;  // UpperLeft, LowerRight vertex indices
+  for (u32 i = 0; i < n_mesh; ++i) {
+    const u32 ul = rects[i * 2], lr = rects[i * 2 + 1];
+    if (ul >= n_vertex || lr >= n_vertex) continue;
+    const u32 c0 = argb_of_trivertex(&v[ul]);
+    const u32 c1 = argb_of_trivertex(&v[lr]);
+    const i32 x0 = (i32)v[ul].x, y0 = (i32)v[ul].y;
+    const i32 x1 = (i32)v[lr].x, y1 = (i32)v[lr].y;
+    // TRIVERTEX.Alpha is often left 0 by callers that mean "opaque" (the
+    // classic two-stop gradient); honour that instead of drawing nothing.
+    const u32 a0 = c0 | ((c0 >> 24) == 0 ? 0xFF000000u : 0u);
+    const u32 a1 = c1 | ((c1 >> 24) == 0 ? 0xFF000000u : 0u);
+    trt_raster::gradient(hdc, x0, y0, x1, y1, a0, a1, mode == kRectV);
+  }
+  return 1;
 }
 
 // ---- 11. secur32.dll / sspicli.dll — honest SSPI/LSA + GetUserNameEx -------

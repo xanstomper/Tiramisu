@@ -46,7 +46,7 @@ void* linux_alloc(size_t bytes, u64 preferred_base) {
 #endif
     if (preferred_base)
       p = mmap((void*)(uintptr_t)preferred_base, bytes, PROT_READ | PROT_WRITE,
-               MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+               MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   }
   if (!p || p == MAP_FAILED)
     p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,

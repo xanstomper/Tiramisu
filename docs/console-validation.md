@@ -77,3 +77,39 @@ on the console (autopilot fields are exposed in `/api/status`). Console
 validation now has real evidence for both a successful boot path and a named
 failure path. Remaining console work is the frame-loop stall and the Sekiro
 missing-content / invalid-pointer faults.
+
+## Play checkpoint after a restart
+
+On 0.2.4.27 and newer, `GET /api/launch-checkpoint` returns the last
+persisted Play phase and outcome. The response contains numeric fields
+only and can be read after reopening Tiramisu. The private crash bundle
+remains in LocalState.
+
+| Phase | Meaning |
+|---|---|
+| 1 | Preparing a launch |
+| 2 | Base guest drives configured |
+| 3 | Native executable TLS callbacks |
+| 4 | Native entry point invoked |
+| 5 | x86 execution invoked |
+| 6 | Managed runtime invoked |
+
+| Outcome | Meaning |
+|---|---|
+| 1 | The phase was entered |
+| 2 | Control returned to the launcher |
+| 3 | Guest ExitProcess was trapped |
+| 4 | Guest exception reached the launch boundary |
+| 5 | Unhandled host exception |
+| 6 | Host abort handler ran |
+| 7 | Host process exit handler ran |
+
+If the app disappears and the last outcome is 1, the checkpoint establishes
+the last entered phase. The exit reason is still unconfirmed. Exception
+outcomes carry the Windows exception code in `code`.
+
+On 0.2.4.33 and newer, `GET /api/launch-api-tail` shows up to 12 recent
+instrumented runtime APIs, newest first. It reports names and consecutive
+repeat counts for the current Play attempt. It contains no arguments,
+paths, or memory addresses. The trace is available while the process is
+alive. The last observed call establishes where the sample stopped.

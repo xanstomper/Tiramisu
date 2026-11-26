@@ -8,6 +8,8 @@
 #include "host_log.h"
 #include "audio.h"
 #include "boot_anim.h"
+#include "cursor_policy.h"
+#include "input_policy.h"
 #include "swapchain.h"
 #include "ui.h"
 #include "ui_sfx.h"
@@ -33,12 +35,16 @@
 #include "../trt/bridge_openal.h"
 #include "../trt/bridge_reg.h"
 #include "../trt/engine_synthesizer.h"
+#include "../trt/bridge_opengl32.h"
+#include "../trt/steam_library.h"
 #include "../trt/pc2xb_translator.h"
 #include "../trt/dynamic_api.h"
 #include "../trt/bridge_fmod_studio.h"
 #include "../trt/bridge_steam.h"
 #include "steam_client.h"
 #include "../trt/spirv_hlsl.h"
+#include "console_detect.h"
+#include "../trt/bridge_esram.h"
 
 #include <winrt/base.h>
 #include <winrt/Windows.ApplicationModel.Core.h>
@@ -76,8 +82,15 @@ extern "C" unsigned int __stdcall timeBeginPeriod(unsigned int uPeriod);
 // directly (item 5: the force-kill watchdog's last resort).
 extern "C" int __stdcall TerminateThread(void* hThread,
                                          unsigned long dwExitCode);
+extern "C" void trt_gap_env_set(const char* name, const char* value);
+// AddVectoredExceptionHandler is desktop-partition in the SDK headers, but
+// present in kernel32.dll and callable from the AppContainer at runtime.
+extern "C" void* __stdcall AddVectoredExceptionHandler(
+    unsigned long First,
+    LONG (WINAPI *Handler)(EXCEPTION_POINTERS*));
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <chrono>
 #include <cctype>
@@ -105,6 +118,8 @@ namespace {
 
 std::string g_local_state;
 std::string g_games_dir;
+std::string g_package_games_dir;
+std::string g_network_games_dir;
 std::mutex g_status_mu;
 std::string g_guest_status = "idle";
 std::string g_steam_status = "press Y to link Steam (your own account)";
@@ -126,11 +141,7 @@ std::string g_pending_launch;
 static longan::host_autopilot_state& g_host_ap = longan::host_ap_state();
 bool g_mouse_mode = false;
 bool g_kbd_mouse_mode = false;
-// Set only when pad-as-mouse was chosen automatically because no pointer was
-// visible at boot. A mouse connected later clears it so the real device takes
-// over the cursor immediately (the mouse allowlist is present in our package
-// identity, but the shell may attach the device after launch).
-std::atomic<bool> g_auto_pad_mouse{false};
+longan::guest_input_mode g_guest_input_mode = longan::guest_input_mode::automatic;
 bool g_quick_menu_open = false;
 std::string g_control_code_cached;
 std::atomic<bool> g_f8_down{false};
@@ -146,6 +157,7 @@ bool g_setup_active = false;    // currently showing the setup screen
 std::atomic<bool> g_controller_active{true};
 std::atomic<ULONGLONG> g_last_mouse_move_ms{0};
 std::atomic<ULONGLONG> g_last_raw_mouse_ms{0};
+std::atomic<bool> g_physical_pointer_seen{false};
 // Last CoreWindow-derived pointer event (motion/press/wheel). The Win32
 // GetCursorPos fallback yields while this is fresh so the two absolute
 // sources never fight over the same frame.
@@ -361,7 +373,17 @@ inline bool is_f8_cursor_vk(u16 nvk) {
   }
 }
 
+void request_guest_stop();
+
 inline bool handle_host_cursor_key(u16 raw_vk, u16 scan, bool ext, bool down) {
+  // F5 is the host's emergency exit. Handle it here rather than in the guest
+  // key stream so it works identically through CoreWindow, the foreground
+  // keyboard interceptor, and native GameInput, and so a guest cannot swallow
+  // it. request_guest_stop() is the same clean WM_CLOSE/WM_QUIT path as Alt+F4.
+  if (raw_vk == 0x74 /*VK_F5*/ && g_guest_running.load()) {
+    if (down) request_guest_stop();
+    return true;
+  }
   if (raw_vk == 0x77 /*VK_F8*/) {
     if (down) {
       if (!g_f8_down.exchange(true)) {
@@ -410,24 +432,31 @@ inline u16 disambiguate_modifier_vk(u16 vk, u16 scan, bool ext) {
   return vk;
 }
 
+bool relative_pointer_active(ULONGLONG now) {
+  return g_native_input.mouse_active_recent(300) ||
+         longan::pointer_event_recent(now, g_last_raw_mouse_ms.load(), 300);
+}
+
+void record_physical_pointer(ULONGLONG now) {
+  g_physical_pointer_seen.store(true);
+  g_controller_active.store(false);
+  g_last_mouse_move_ms.store(now);
+}
+
 void feed_core_pointer(CoreWindow const& window,
                        winrt::Windows::Foundation::Point point) {
-  // Only defer to MouseDevice while relative deltas arrived recently (<300ms);
-  // never permanently lock out CoreWindow pointer motion on Xbox UWP.
-  const ULONGLONG now = GetTickCount64();
-  const ULONGLONG last_raw = g_last_raw_mouse_ms.load();
-  if (g_uwp_raw_mouse.load() && last_raw != 0 && (now - last_raw) < 300) return;
+  const auto now = GetTickCount64();
+  g_last_core_pointer_ms.store(now);
+  record_physical_pointer(now);
+  if (relative_pointer_active(now)) return;
   const auto bounds = window.Bounds();
-  if (bounds.Width <= 0 || bounds.Height <= 0) return;
+  if (!(bounds.Width > 0) || !(bounds.Height > 0) ||
+      !std::isfinite(point.X) || !std::isfinite(point.Y)) return;
   int w, h;
   trt_display_size(&w, &h);
-  if (w <= 0) w = 1920;
-  if (h <= 0) h = 1080;
-  const int x = std::clamp(static_cast<int>(point.X * w / bounds.Width), 0, w - 1);
-  const int y = std::clamp(static_cast<int>(point.Y * h / bounds.Height), 0, h - 1);
+  const int x = static_cast<int>(std::clamp(point.X / bounds.Width, 0.f, 1.f) * (w - 1));
+  const int y = static_cast<int>(std::clamp(point.Y / bounds.Height, 0.f, 1.f) * (h - 1));
   trt_input_pointer_move(x, y, false);
-  g_last_mouse_move_ms.store(now);
-  g_last_core_pointer_ms.store(now);
 }
 
 inline int host_mouse_btn_for_press(winrt::Windows::UI::Input::PointerUpdateKind k) {
@@ -450,24 +479,57 @@ inline int host_mouse_btn_for_release(winrt::Windows::UI::Input::PointerUpdateKi
   return -1;
 }
 
-void poll_host_gamepads(XINPUT_STATE* pad0_out, bool* pad0_ok_out) {
+XINPUT_GAMEPAD keyboard_as_controller() {
+  XINPUT_GAMEPAD pad{};
+  const auto key = [](int vk) { return trt_key_down(vk); };
+  if (key(VK_UP)) pad.wButtons |= XINPUT_GAMEPAD_DPAD_UP;
+  if (key(VK_DOWN)) pad.wButtons |= XINPUT_GAMEPAD_DPAD_DOWN;
+  if (key(VK_LEFT)) pad.wButtons |= XINPUT_GAMEPAD_DPAD_LEFT;
+  if (key(VK_RIGHT)) pad.wButtons |= XINPUT_GAMEPAD_DPAD_RIGHT;
+  if (key(VK_RETURN) || key(VK_SPACE) || key('Z')) pad.wButtons |= XINPUT_GAMEPAD_A;
+  if (key(VK_ESCAPE) || key('C')) pad.wButtons |= XINPUT_GAMEPAD_B;
+  if (key('X')) pad.wButtons |= XINPUT_GAMEPAD_X;
+  if (key(VK_SHIFT) || key('V')) pad.bLeftTrigger = 255;
+  const auto axis = [&](int positive, int negative) -> SHORT {
+    const bool p = key(positive), n = key(negative);
+    return p == n ? 0 : p ? 32767 : -32768;
+  };
+  pad.sThumbLX = axis('D', 'A');
+  pad.sThumbLY = axis('W', 'S');
+  return pad;
+}
+
+void poll_host_gamepads(XINPUT_STATE* pad0_out, bool* pad0_ok_out,
+                        bool starting_guest = false) {
+  XINPUT_STATE states[4]{};
+  bool available[4]{};
+  int first = -1;
   for (DWORD idx = 0; idx < 4; ++idx) {
-    XINPUT_STATE xs{};
-    const bool ok = (XInputGetState(idx, &xs) == ERROR_SUCCESS);
-    trt_input_pad_state_n(idx, ok, xs.Gamepad.sThumbLX, xs.Gamepad.sThumbLY,
-                          xs.Gamepad.sThumbRX, xs.Gamepad.sThumbRY,
-                          xs.Gamepad.wButtons, xs.Gamepad.bLeftTrigger,
-                          xs.Gamepad.bRightTrigger);
-    if (ok) {
+    available[idx] = XInputGetState(idx, &states[idx]) == ERROR_SUCCESS;
+    if (available[idx] && first < 0) first = static_cast<int>(idx);
+  }
+  if (pad0_out) *pad0_out = first >= 0 ? states[first] : XINPUT_STATE{};
+  if (pad0_ok_out) *pad0_ok_out = first >= 0;
+
+  // The launcher uses the first available physical controller. The guest
+  // retains Windows slot numbers and has one translation route at a time.
+  const bool guest = starting_guest || g_guest_running.load();
+  const auto route = guest ? longan::route_gamepads(g_guest_input_mode, first >= 0, g_mouse_mode)
+                           : longan::guest_pad_route::physical;
+  for (DWORD idx = 0; idx < 4; ++idx) {
+    const bool physical = route == longan::guest_pad_route::physical && available[idx];
+    const bool virtual_pad = route == longan::guest_pad_route::keyboard && idx == 0;
+    const XINPUT_GAMEPAD pad = physical ? states[idx].Gamepad
+        : virtual_pad ? keyboard_as_controller() : XINPUT_GAMEPAD{};
+    trt_input_pad_state_n(idx, physical || virtual_pad, pad.sThumbLX, pad.sThumbLY,
+                          pad.sThumbRX, pad.sThumbRY, pad.wButtons,
+                          pad.bLeftTrigger, pad.bRightTrigger);
+    if (available[idx]) {
       u16 l = 0, r = 0;
       if (trt_pad_get_vibration(idx, &l, &r)) {
         XINPUT_VIBRATION xv{l, r};
         ::XInputSetState(idx, &xv);
       }
-    }
-    if (idx == 0) {
-      if (pad0_out) *pad0_out = xs;
-      if (pad0_ok_out) *pad0_ok_out = ok;
     }
   }
 }
@@ -596,6 +658,10 @@ struct game_entry {
   int exe_idx = 0;
   std::string compat;      // static PE analysis, shown before launch
   std::string input_mode;  // auto | controller | kbm | pad2kbm
+  std::string engine_name;
+  std::string gfx_name;
+  std::string audio_name;
+  bool synthesized = false;
 };
 std::vector<game_entry> g_games;
 int g_selected = 0;
@@ -609,6 +675,8 @@ bool is_junk_exe(const std::string& fname) {
   const std::string s = lower_ascii(fname);
   return s.find("unitycrashhandler") != std::string::npos ||
          s.find("crashreport") != std::string::npos ||
+         s.find("setup") != std::string::npos ||   // installers, not games
+         s.find("install") != std::string::npos ||
          s.find("ueprereq") != std::string::npos ||
          s.find("ue4prereq") != std::string::npos ||
          s.find("ue5prereq") != std::string::npos ||
@@ -657,11 +725,20 @@ void collect_exes_rec(const std::string& base_dir, const std::string& rel_dir,
     if (is_junk_exe(fn)) continue;
     const u64 sz = ((u64)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
     const std::string stem_low = lower_ascii(fn.substr(0, dot));
+    const std::string rel_low = lower_ascii(rel);
     int score = 0;
     if (stem_low == g_low || stem_low == g_low + "-win64-shipping") score += 200;
     if (stem_low.size() > 15 &&
         stem_low.rfind("-win64-shipping") == stem_low.size() - 15) {
       score += 120;
+    }
+    if (stem_low.find("-win64-shipping") != std::string::npos ||
+        stem_low.find("-shipping") != std::string::npos ||
+        rel_low.find("binaries\\win64") != std::string::npos ||
+        rel_low.find("binaries/win64") != std::string::npos ||
+        rel_low.find("bin\\win64") != std::string::npos ||
+        rel_low.find("bin/win64") != std::string::npos) {
+      score += 2000;
     }
     if (depth == 0) score += 60;
     else if (depth == 1) score += 30;
@@ -858,8 +935,26 @@ void scan_game_entry(
     const size_t dot = n.rfind('.');
     if (dot == std::string::npos) return;
     const std::string ext = lower_ascii(n.substr(dot));
-    if (ext != ".iso" && ext != ".bin" && ext != ".img") return;
-    const std::string img_path = root + "\\" + n;
+    if (ext != ".iso" && ext != ".bin" && ext != ".img" && ext != ".cue") return;
+    std::string img_path = root + "\\" + n;
+    if (ext == ".cue") {
+      // A .cue is a text index, not an image: mount the track it names.
+      char track[1200] = {};
+      if (!trt_iso_cue_track(img_path.c_str(), track, sizeof(track))) {
+        char line[700];
+        snprintf(line, sizeof(line),
+                 "shelf: %s is a .cue whose FILE track could not be read "
+                 "(skipped, named)",
+                 img_path.c_str());
+        longan::log_line(line);
+        return;
+      }
+      char line[700];
+      snprintf(line, sizeof(line), "shelf: %s -> track %s",
+               (root + "\\" + n).c_str(), track);
+      longan::log_line(line);
+      img_path = track;
+    }
     bool dup_img = false;
     for (const auto& existing : g_games)
       if (!_stricmp(existing.image.c_str(), img_path.c_str())) dup_img = true;
@@ -905,6 +1000,8 @@ void scan_game_entry(
     return;
   }
   const std::string gdir = root + "\\" + n;
+  if (GetFileAttributesA((gdir + longan::kSteamInstallPending).c_str()) !=
+      INVALID_FILE_ATTRIBUTES) return;
   std::string disp = n;
   bool dup = false;
   for (const auto& existing : g_games) {
@@ -920,23 +1017,77 @@ void scan_game_entry(
   std::vector<exe_cand> cands;
   collect_exes_rec(gdir, "", n, 0, &cands);
   // A folder that holds a disc image is a game too: the exe list comes from
-  // inside the image and the image is mounted as D: at launch.
+  // inside the image and the image is mounted as D: at launch. The image wins
+  // when the folder has no runnable exe, or when the image's best exe outscores
+  // the folder's (a bundled installer or launcher must not beat the real game).
   std::string image_path;
-  if (cands.empty()) {
+  {
     char img[1024] = {};
     if (trt_iso_find_image_in_dir(gdir.c_str(), img, sizeof(img))) {
+      std::vector<exe_cand> icands;
       trt_iso* iso = trt_iso_open(img);
       if (iso) {
-        collect_iso_exes_rec(iso, "", n, 0, &cands);
-        if (!cands.empty()) image_path = img;
+        collect_iso_exes_rec(iso, "", n, 0, &icands);
         trt_iso_close(iso);
       }
-      if (cands.empty()) {
-        char line[600];
+      if (!icands.empty()) {
+        std::sort(icands.begin(), icands.end(),
+                  [](const exe_cand& a, const exe_cand& b) {
+          if (a.score != b.score) return a.score > b.score;
+          if (a.size != b.size) return a.size > b.size;
+          return a.rel < b.rel;
+        });
+        int folder_score = -1;
+        for (const auto& c : cands)
+          if (c.score > folder_score) folder_score = c.score;
+        if (icands[0].score > folder_score) {
+          cands = icands;
+          image_path = img;
+          char line[800];
+          snprintf(line, sizeof(line),
+                   "shelf: %s mounts disc image %s (best exe inside: %s)",
+                   n.c_str(), img, icands[0].rel.c_str());
+          longan::log_line(line);
+        } else {
+          char line[800];
+          snprintf(line, sizeof(line),
+                   "shelf: %s runs from its folder exe over disc image %s "
+                   "(the image is not mounted)",
+                   n.c_str(), img);
+          longan::log_line(line);
+        }
+      } else {
+        char line[700];
         snprintf(line, sizeof(line),
                  "shelf: %s holds a disc image but no runnable exe inside it",
                  img);
         longan::log_line(line);
+      }
+    }
+  }
+  std::string steam_exe;
+  if (image_path.empty()) {
+    std::ifstream launch_file(gdir + longan::kSteamLaunchExe);
+    if (std::getline(launch_file, steam_exe)) {
+      if (!steam_exe.empty() && steam_exe.back() == '\r') steam_exe.pop_back();
+      // A Steam entry can be deeper than the shelf scan or filtered as a helper.
+      if (!steam_exe.empty() && std::none_of(cands.begin(), cands.end(), [&](const exe_cand& c) {
+            return _stricmp(c.rel.c_str(), steam_exe.c_str()) == 0;
+          })) {
+        trt_engine_profile profile;
+        if (trt_synthesize_engine(gdir.c_str(), steam_exe.c_str(), &profile)) {
+          steam_exe = profile.main_exe_rel;
+          const auto found = std::find_if(cands.begin(), cands.end(), [&](const exe_cand& c) {
+            return _stricmp(c.rel.c_str(), steam_exe.c_str()) == 0;
+          });
+          if (found == cands.end()) {
+            exe_cand candidate{};
+            candidate.rel = steam_exe;
+            cands.push_back(candidate);
+          }
+        } else {
+          steam_exe.clear();
+        }
       }
     }
   }
@@ -952,6 +1103,12 @@ void scan_game_entry(
   ge.dir = gdir;
   for (const auto& c : cands) ge.exes.push_back(c.rel);
   ge.exe_idx = 0;
+  for (size_t k = 0; k < ge.exes.size() && !steam_exe.empty(); ++k) {
+    if (_stricmp(ge.exes[k].c_str(), steam_exe.c_str()) == 0) {
+      ge.exe_idx = static_cast<int>(k);
+      break;
+    }
+  }
   {
     std::ifstream ef(gdir + "\\tiramisu_exe.txt");
     std::string cfg_exe;
@@ -994,6 +1151,26 @@ void scan_game_entry(
     scan_compat(gdir + "\\" + ge.exe, compat, (unsigned)sizeof(compat));
   }
   ge.compat = compat;
+  // If not a disc image, run/load autonomous engine synthesis so the shelf
+  // immediately displays the real engine and preferred graphics/audio layers.
+  if (ge.image.empty() && !ge.dir.empty() && !ge.exe.empty()) {
+    trt_engine_profile prof;
+    if (trt_synthesize_engine(ge.dir.c_str(), ge.exe.c_str(), &prof)) {
+      ge.engine_name = trt_engine_type_name(prof.engine_type);
+      ge.gfx_name = trt_graphics_api_name(prof.preferred_gfx);
+      ge.audio_name = trt_audio_middleware_name(prof.preferred_audio);
+      ge.synthesized = true;
+      if (!prof.main_exe_rel.empty() && prof.main_exe_rel != ge.exe) {
+        for (size_t k = 0; k < ge.exes.size(); ++k) {
+          if (!_stricmp(ge.exes[k].c_str(), prof.main_exe_rel.c_str())) {
+            ge.exe_idx = (int)k;
+            ge.exe = ge.exes[k];
+            break;
+          }
+        }
+      }
+    }
+  }
   {
     uint32_t appid = 0;
     std::ifstream sf(gdir + "\\steam_appid.txt");
@@ -1047,6 +1224,13 @@ void refresh_storage_stats() {
 std::wstring infer_engine_label(const game_entry& ge) {
   const std::string c = lower_ascii(ge.compat);
   if (c.find("anti-cheat") != std::string::npos) return L"Anti-Cheat (Blocked)";
+  if (ge.synthesized && !ge.engine_name.empty()) {
+    std::string label = ge.engine_name;
+    if (!ge.gfx_name.empty() && ge.gfx_name != "Direct3D 11") {
+      label += " (" + ge.gfx_name + ")";
+    }
+    return u82ws(label);
+  }
   if (c.find("32-bit") != std::string::npos) return L"x86 32-bit (JIT)";
   if (c.find("arm64") != std::string::npos) return L"ARM64 (Unsupported)";
   if (c.find("d3d12") != std::string::npos) return L"Direct3D 12";
@@ -1127,18 +1311,127 @@ void sort_games_shelf() {
             });
 }
 
+std::vector<longan::webxfer_storage_volume> g_external_volumes;
+
+std::string volume_key(std::string path) {
+  while (path.size() > 1 && (path.back() == '\\' || path.back() == '/'))
+    path.pop_back();
+  return lower_ascii(std::move(path));
+}
+
+bool poll_external_storage(bool force = false) {
+  using winrt::Windows::Foundation::AsyncStatus;
+  using winrt::Windows::Foundation::IAsyncOperation;
+  using winrt::Windows::Foundation::Collections::IVectorView;
+  using winrt::Windows::Storage::KnownFolders;
+  using winrt::Windows::Storage::StorageFolder;
+  static IAsyncOperation<IVectorView<StorageFolder>> pending{nullptr};
+  static std::vector<longan::webxfer_storage_volume> brokered;
+  static std::string broker_status = "checking";
+  static std::string published_status;
+  static ULONGLONG next_probe = 0;
+
+  const ULONGLONG now = GetTickCount64();
+  if (pending && pending.Status() != AsyncStatus::Started) {
+    try {
+      std::vector<longan::webxfer_storage_volume> discovered;
+      broker_status = "unavailable";
+      if (pending.Status() == AsyncStatus::Completed) {
+        for (const auto& folder : pending.GetResults()) {
+          auto name = winrt::to_string(folder.Name());
+          std::string path;
+          try { path = winrt::to_string(folder.Path()); } catch (...) {}
+          discovered.push_back({std::move(name), std::move(path), {}});
+        }
+        broker_status = "ready";
+      }
+      brokered = std::move(discovered);
+    } catch (...) {
+      broker_status = "unavailable";
+      brokered.clear();
+    }
+    pending = nullptr;
+    force = true;
+    // Keep broker calls on the regular cadence when the async result lands.
+    if (now >= next_probe) next_probe = now + 7000;
+  } else if (!pending && (force || now >= next_probe)) {
+    try {
+      pending = KnownFolders::RemovableDevices().GetFoldersAsync();
+    } catch (...) {
+      broker_status = "unavailable";
+      brokered.clear();
+    }
+  } else if (!force && now < next_probe) {
+    return false;
+  }
+  if (now >= next_probe || force) next_probe = now + 7000;
+
+  auto volumes = brokered;
+  auto add_game_roots = [](longan::webxfer_storage_volume& volume) {
+    if (volume.path.empty()) return;
+    std::string base = volume.path;
+    if (base.back() != '\\' && base.back() != '/') base += '\\';
+    for (const char* child : {"Games", "TiramisuGames"}) {
+      std::string path = base + child;
+      const DWORD attr = GetFileAttributesA(path.c_str());
+      if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY))
+        continue;
+      WIN32_FIND_DATAA file{};
+      const HANDLE check = FindFirstFileA((path + "\\*").c_str(), &file);
+      if (check != INVALID_HANDLE_VALUE) {
+        FindClose(check);
+      } else if (GetLastError() != ERROR_FILE_NOT_FOUND) {
+        continue;
+      }
+      volume.game_roots.push_back(std::move(path));
+    }
+  };
+  for (auto& volume : volumes) add_game_roots(volume);
+  // Some consoles expose USB SSDs as fixed volumes. Only list fixed
+  // drive-letter fallbacks when they expose an actual game folder.
+  for (char letter = 'D'; letter <= 'Z'; ++letter) {
+    const char root[4] = {letter, ':', '\\', 0};
+    const UINT type = GetDriveTypeA(root);
+    if (type != DRIVE_REMOVABLE && type != DRIVE_FIXED) continue;
+    const auto key = volume_key(root);
+    if (std::any_of(volumes.begin(), volumes.end(), [&](const auto& v) {
+          return !v.path.empty() && volume_key(v.path) == key;
+        })) continue;
+    longan::webxfer_storage_volume volume{std::string(1, letter) + ":", root, {}};
+    add_game_roots(volume);
+    if (type == DRIVE_REMOVABLE || !volume.game_roots.empty())
+      volumes.push_back(std::move(volume));
+  }
+  std::sort(volumes.begin(), volumes.end(), [](const auto& a, const auto& b) {
+    if (a.path != b.path) return a.path < b.path;
+    return a.name < b.name;
+  });
+  const bool changed = volumes != g_external_volumes;
+  if (!changed && broker_status == published_status) return false;
+  g_external_volumes = std::move(volumes);
+  published_status = broker_status;
+  longan::webxfer_set_external_storage(g_external_volumes, broker_status);
+  longan::log_line(("storage: removable device discovery " + broker_status +
+                   ", volumes=" + std::to_string(g_external_volumes.size())).c_str());
+  return changed;
+}
+
 void rescan_games() {
+  g_network_games_dir = longan::settings_get().network_games_root;
   std::vector<std::pair<std::string, std::string>> prev_choice =
       snapshot_prev_choice();
   g_games.clear();
   scan_games_root(g_games_dir, 0, prev_choice);
-  for (char drv = 'D'; drv <= 'Y'; ++drv) {
-    const char root_drv[4] = {drv, ':', '\\', 0};
-    const UINT dt = GetDriveTypeA(root_drv);
-    if (dt == DRIVE_REMOVABLE || dt == DRIVE_FIXED) {
-      scan_games_root(std::string(1, drv) + ":\\Games", drv, prev_choice);
-      scan_games_root(std::string(1, drv) + ":\\TiramisuGames", drv, prev_choice);
-    }
+  if (!g_package_games_dir.empty() && g_package_games_dir != g_games_dir)
+    scan_games_root(g_package_games_dir, 0, prev_choice);
+  if (!g_network_games_dir.empty() && g_network_games_dir != g_games_dir &&
+      g_network_games_dir != g_package_games_dir)
+    scan_games_root(g_network_games_dir, 0, prev_choice);
+  for (const auto& volume : g_external_volumes) {
+    const char drive_tag = volume.path.size() > 1 && volume.path[1] == ':'
+                               ? volume.path[0] : 0;
+    for (const auto& root : volume.game_roots)
+      scan_games_root(root, drive_tag, prev_choice);
   }
   sort_games_shelf();
   if (g_selected >= (int)g_games.size()) g_selected = 0;
@@ -1154,15 +1447,26 @@ void rescan_games() {
 void rescan_games_root_only() {
   std::vector<std::pair<std::string, std::string>> prev_choice =
       snapshot_prev_choice();
-  // Preserve USB / external-drive entries while refreshing LocalState\games
+  // Preserve removable-drive entries while refreshing all configured roots.
+  const auto under_root = [](const std::string& path, const std::string& root) {
+    return !root.empty() &&
+           _strnicmp(path.c_str(), root.c_str(), root.size()) == 0;
+  };
   std::vector<game_entry> external_games;
   for (auto& ge : g_games) {
-    if (_strnicmp(ge.dir.c_str(), g_games_dir.c_str(), g_games_dir.size()) != 0) {
+    if (!under_root(ge.dir, g_games_dir) &&
+        !under_root(ge.dir, g_package_games_dir) &&
+        !under_root(ge.dir, g_network_games_dir)) {
       external_games.push_back(std::move(ge));
     }
   }
   g_games.clear();
   scan_games_root(g_games_dir, 0, prev_choice);
+  if (!g_package_games_dir.empty() && g_package_games_dir != g_games_dir)
+    scan_games_root(g_package_games_dir, 0, prev_choice);
+  if (!g_network_games_dir.empty() && g_network_games_dir != g_games_dir &&
+      g_network_games_dir != g_package_games_dir)
+    scan_games_root(g_network_games_dir, 0, prev_choice);
   for (auto& eg : external_games) g_games.push_back(std::move(eg));
   sort_games_shelf();
   if (g_selected >= (int)g_games.size()) g_selected = 0;
@@ -1199,7 +1503,7 @@ void rescan_one_game(const std::string& name) {
   if (attrs != INVALID_FILE_ATTRIBUTES)
     scan_game_entry(g_games_dir, name,
                     (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0, 0, prev_choice);
-  for (const char* ext : {".iso", ".bin", ".img"}) {
+  for (const char* ext : {".iso", ".bin", ".img", ".cue"}) {
     const std::string img = gdir + ext;
     DWORD ia = GetFileAttributesA(img.c_str());
     if (ia != INVALID_FILE_ATTRIBUTES &&
@@ -1256,6 +1560,23 @@ std::jmp_buf g_exit_jmp;
 int g_exit_code = 0;
 u32 g_raise_code = 0;
 DWORD g_guest_tid = 0;
+std::atomic<longan::launch_phase> g_launch_phase{longan::launch_phase::none};
+std::atomic<longan::launch_outcome> g_launch_outcome{longan::launch_outcome::none};
+
+void checkpoint_phase(longan::launch_phase phase) {
+  g_launch_phase.store(phase);
+  g_launch_outcome.store(longan::launch_outcome::running);
+  longan::launch_checkpoint_write(g_local_state, {phase, longan::launch_outcome::running, 0});
+}
+
+void checkpoint_outcome(longan::launch_outcome outcome, uint32_t code) {
+  const auto phase = g_launch_phase.load();
+  auto expected = longan::launch_outcome::running;
+  if (phase != longan::launch_phase::none &&
+      g_launch_outcome.compare_exchange_strong(expected, outcome)) {
+    longan::launch_checkpoint_write(g_local_state, {phase, outcome, code});
+  }
+}
 std::atomic<bool> g_guest_stop_req{false};
 std::atomic<u64> g_guest_stop_since{0};
 
@@ -1302,6 +1623,8 @@ void check_guest_stop_trap() {
 //   3. clear the stop request (it was for the dead run)
 //   4. reset the memory budget (the dead guest's charges are unrecoverable
 //      any other way — the ledger would otherwise refuse the next launch)
+static void apply_bridge_launch_settings();
+
 void force_kill_guest(const char* reason) {
   if (!g_guest_thread.joinable()) return;
   char line[192];
@@ -1311,6 +1634,8 @@ void force_kill_guest(const char* reason) {
   longan::log_line(line);
   ::TerminateThread(g_guest_thread.native_handle(), 1);
   g_guest_thread.join();
+  longan::settings_clear_profile();
+  apply_bridge_launch_settings();
   g_guest_running.store(false);
   longan::webxfer_set_running_game("");
   g_running_game_name.clear();
@@ -1374,17 +1699,10 @@ static int capture_fault_stack(const CONTEXT* initial, DWORD64* frames, int cap)
 }
 
 static int guest_seh_filter(EXCEPTION_POINTERS* ep) {
-  // .213 DIAG: canary -- proves the filter was entered. If the filter itself
-  // faults before logging, this line never appears (double fault in the filter).
-  if (ep && ep->ExceptionRecord) {
-    char canary[128];
-    snprintf(canary, sizeof(canary), "guest_seh_filter entered code=0x%08lx",
-             (unsigned long)ep->ExceptionRecord->ExceptionCode);
-    longan::log_line(canary);
-  } else {
-    longan::log_line("guest_seh_filter entered (null record)");
-  }
+  if (!ep || !ep->ExceptionRecord) return EXCEPTION_EXECUTE_HANDLER;
   if (trt_dispatch_win32_exception(ep) == -1) return EXCEPTION_CONTINUE_EXECUTION;
+  // Persist the terminal code before walking an untrusted stack or writing logs.
+  checkpoint_outcome(longan::launch_outcome::guest_fault, ep->ExceptionRecord->ExceptionCode);
   const EXCEPTION_RECORD& record = *ep->ExceptionRecord;
   char where[192];
   describe_fault_pc(reinterpret_cast<uintptr_t>(record.ExceptionAddress),
@@ -1499,12 +1817,21 @@ static int guest_seh_filter(EXCEPTION_POINTERS* ep) {
 // natively via Windows .pdata while still catching truly unhandled faults.
 int call_guest_seh(trt_image* img, u64* out_rc, DWORD* out_ex) {
   __try {
+    if (img->tls_callback_count) {
+      checkpoint_phase(longan::launch_phase::native_tls);
+      for (int i = 0; i < img->tls_callback_count; ++i) {
+        trt_call_guest_img((void*)(img->base + img->tls_callback_rvas[i]), img,
+                           (u64)(uintptr_t)img->base, 1, 0, 0);
+      }
+    }
+    checkpoint_phase(longan::launch_phase::native_entry);
     *out_rc = trt_call_guest_img(
         (void*)(img->base + img->entry_rva), img,
         (u64)(uintptr_t)img->base, 0, 0, 0);
     return 0;
   } __except (guest_seh_filter(GetExceptionInformation())) {
     *out_ex = GetExceptionCode();
+    checkpoint_outcome(longan::launch_outcome::guest_fault, *out_ex);
     return 1;
   }
 }
@@ -1665,14 +1992,17 @@ void run_guest_trapped(trt_image* img, char* detail, size_t cap) {
     u64 rc = 0;
     DWORD ex_code = 0;
     if (call_guest_seh(img, &rc, &ex_code) == 0) {
+      checkpoint_outcome(longan::launch_outcome::returned, static_cast<uint32_t>(rc));
       snprintf(detail, cap, "guest returned %llu", (unsigned long long)rc);
     } else {
       snprintf(detail, cap, "guest unhandled exception 0x%08lx",
                (unsigned long)ex_code);
     }
   } else if (trapped == 1) {
+    checkpoint_outcome(longan::launch_outcome::guest_exit, static_cast<uint32_t>(g_exit_code));
     snprintf(detail, cap, "guest ExitProcess(%d)", g_exit_code);
   } else {
+    checkpoint_outcome(longan::launch_outcome::guest_fault, g_raise_code);
     snprintf(detail, cap, "guest raised exception 0x%08x", g_raise_code);
   }
   trt_boot_exit_trap = nullptr;
@@ -1691,18 +2021,51 @@ static void apply_bridge_launch_settings() {
   // Before this call existed the gate documented "the host calls this with the
   // fsb_decode setting" and nothing ever did.
   trt_fsb5_set_console_decode(longan::trt_settings_fsb_decode() ? 1 : 0);
+
+  const int configured_mb = longan::trt_settings_memory_budget_mb();
+  if (configured_mb > 0) {
+    auto budget_mb = static_cast<unsigned>(configured_mb);
+    try {
+      using winrt::Windows::System::MemoryManager;
+      const auto usage = MemoryManager::AppMemoryUsage();
+      const auto limit = MemoryManager::AppMemoryUsageLimit();
+      budget_mb = longan::console_guest_memory_budget_mb(budget_mb, usage, limit);
+    } catch (const winrt::hresult_error&) {
+      // A console OS that cannot query the cap still uses its configured budget.
+    }
+    trt_mem_budget_set_mb(budget_mb);
+  }
 }
 
 guest_run_result run_game(const std::string& name, const std::string& exe,
                           const std::string& game_dir,
                           const std::string& image = std::string()) {
+  struct launch_profile_scope {
+    ~launch_profile_scope() {
+      longan::settings_clear_profile();
+      apply_bridge_launch_settings();
+    }
+  } profile_scope;
   guest_run_result r{};
+  struct checkpoint_scope {
+    const guest_run_result& result;
+    ~checkpoint_scope() {
+      checkpoint_outcome(longan::launch_outcome::returned, static_cast<uint32_t>(result.map_rc));
+      g_launch_phase.store(longan::launch_phase::none);
+    }
+  } checkpoint{r};
+  gap_trace_begin_launch();
+  checkpoint_phase(longan::launch_phase::preparing);
   char line[256];
 
+  trt_gpu_reset_render_stats();
+  trt_sync_reset_launch_stats();
+  longan::swapchain_reset_guest_draw_probe();
   trt_images_reset();
   trt_backend be{&uwp_alloc,     &uwp_protect,        &uwp_release,
                  &uwp_log,       &uwp_register_unwind};
   trt_set_vmem_hooks(&uwp_reserve, &uwp_commit, &uwp_decommit);
+  trt_va_enable_deferred_data(1);
   trt_bridge_boot(&be);
   trt_bridge_register_kernel32();
   trt_bridge_register_nvapi();  // nvapi/nvml/atiadl honest not-supported stubs
@@ -1742,6 +2105,21 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   };
   for (const char* sub : c_dirs)
     trt_vfs_mkdir_p((drive_c + sub).c_str());
+  // Universal save directories: provision AppData\LocalLow, AppData\Local,
+  // AppData\Roaming, Saved Games, and Documents\My Games for the title.
+  if (!name.empty()) {
+    std::string safe_name = name;
+    for (char& c : safe_name) {
+      if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
+        c = '_';
+      }
+    }
+    trt_vfs_mkdir_p((drive_c + "\\Users\\Player\\AppData\\LocalLow\\" + safe_name).c_str());
+    trt_vfs_mkdir_p((drive_c + "\\Users\\Player\\AppData\\Local\\" + safe_name).c_str());
+    trt_vfs_mkdir_p((drive_c + "\\Users\\Player\\AppData\\Roaming\\" + safe_name).c_str());
+    trt_vfs_mkdir_p((drive_c + "\\Users\\Player\\Saved Games\\" + safe_name).c_str());
+    trt_vfs_mkdir_p((drive_c + "\\Users\\Player\\Documents\\My Games\\" + safe_name).c_str());
+  }
   if (_stricmp(name.c_str(), "raccoin") == 0) {
     // The game's offline Steam profile is the default guest account.
     const auto save = drive_c +
@@ -1752,13 +2130,12 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   }
   trt_vfs_mount("c:", drive_c.c_str());
   trt_vfs_mount("z:", game_dir.c_str());
-  // Per-title overrides, applied on top of global settings. The file beside
-  // the exe wins (a title can ship one); otherwise the writable per-title
-  // store under LocalState is used, so a game on a read-only folder or a
-  // mounted disc can still be tuned from the console. A first launch drops a
-  // commented starter there rather than guessing at values.
+  checkpoint_phase(longan::launch_phase::mounted);
+  // A game can ship its own defaults. The writable profile for this source
+  // layers user overrides on top, including for read-only games and discs.
   {
-    const std::string titles_dir = g_local_state + "\\profiles";
+    const auto titles_dir = longan::settings_title_profile_dir(
+        g_local_state, image.empty() ? game_dir : image);
     const int stub = longan::settings_write_profile_stub(titles_dir, name);
     const int prof = longan::settings_load_profile(game_dir, titles_dir);
     // A per-title profile may flip fsb_decode or the quality tier, so the
@@ -1812,7 +2189,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   }
   trt_bridge_set_exe_path(guest_exe.c_str());
   {
-    const size_t rel_sl = exe.rfind('\\');
+    const size_t rel_sl = exe.find_last_of("/\\");
     const std::string guest_cwd =
         (rel_sl == std::string::npos) ? guest_cwd_root
                                       : (guest_cwd_root + exe.substr(0, rel_sl));
@@ -1845,9 +2222,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
         trt_bridge_set_cmd_args("");
       }
     }
-    u32 app_id = 0;
-    std::ifstream sf(game_dir + "\\steam_appid.txt");
-    if (sf) sf >> app_id;
+    const u32 app_id = trt_steam_read_appid(game_dir.c_str());
     app_id_read = (app_id != 0);
     trt_steam_set_appid(app_id);
   }
@@ -1876,96 +2251,215 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
       struct trt_iso* iso =
           trt_vfs_image_for_guest_utf16((const u16*)wdir.c_str(), nullptr, 0);
       if (iso) trt_iso_extract_dir(iso, rel_dir.c_str(), hdir);
-      char hexe[1400] = {};
-      const std::wstring wexe = u82ws(guest_exe);
-      if (trt_vfs_image_materialize((const u16*)wexe.c_str(), hexe,
-                                    sizeof(hexe), nullptr) == 0)
-        exe_path = hexe;
     }
+    char hexe[1400] = {};
+    const std::wstring wexe = u82ws(guest_exe);
+    if (trt_vfs_image_materialize((const u16*)wexe.c_str(), hexe,
+                                  sizeof(hexe), nullptr) != 0) {
+      r.map_rc = TRT_ERR_BAD_PE;
+      snprintf(r.detail, sizeof(r.detail),
+               "Could not extract %s from the mounted disc", exe.c_str());
+      return r;
+    }
+    exe_path = hexe;
   }
   trt_engine_profile synth_prof;
-  if (trt_synthesize_engine(game_dir.c_str(), exe.c_str(), &synth_prof)) {
-    char synth_msg[512];
-    snprintf(synth_msg, sizeof(synth_msg),
-             "host: [ENGINE SYNTHESIZER] %s engine=%s arch=%s gfx=%s audio=%s universal_flags=%u",
-             synth_prof.game_name.c_str(),
-             trt_engine_type_name(synth_prof.engine_type),
-             synth_prof.is_managed ? "Managed (.NET)" : (synth_prof.is_pe32 ? "PE32" : "PE64"),
-             trt_graphics_api_name(synth_prof.preferred_gfx),
-             trt_audio_middleware_name(synth_prof.preferred_audio),
-             synth_prof.universal_flags);
-    longan::log_line(synth_msg);
-    if (synth_prof.engine_type == TRT_ENGINE_UNIVERSAL) {
-      // Universal: use the universal guest runtime for this game (Phase 3+).
-      // For now, log + fall back to the native guest path — the guest boots
-      // and the dynamic API synthesizer fills unknowns at boot.
-      longan::log_line("host: universal engine -> clearing game onto Xbox via universal guest");
-    }
-    longan::log_line(synth_msg);
-    // A profile only counts if the launch uses it. The synthesized engine
-    // arguments reach the bridge before the guest runs (a game-shipped
-    // tiramisu_args.txt still wins), and a Steam title that had no
-    // steam_appid.txt gets the AppID the synthesizer just resolved instead of
-    // spending this launch at AppID 0.
-    if (!has_user_args && !synth_prof.cmdline_args.empty()) {
-      std::string synth_args;
-      for (const auto& a : synth_prof.cmdline_args) {
-        if (!synth_args.empty()) synth_args += ' ';
-        synth_args += a;
-      }
-      trt_bridge_set_cmd_args(synth_args.c_str());
-      longan::log_line(("host: [ENGINE SYNTHESIZER] applied args: " + synth_args).c_str());
-    }
-    if (!app_id_read && synth_prof.has_steam) {
-      trt_steam_set_appid(synth_prof.steam_appid);
-      char al[160];
-      snprintf(al, sizeof(al),
-               "host: [ENGINE SYNTHESIZER] steam appid %u applied",
-               synth_prof.steam_appid);
-      longan::log_line(al);
-    }
-    const std::string tdir = game_dir + "\\.tiramisu";
-    CreateDirectoryA(tdir.c_str(), nullptr);
-    const int xlated = trt_pc2xb_translate_file(exe_path.c_str(),
-                                                (tdir + "\\xb").c_str());
-    if (xlated >= 0) {
-      char xl_msg[192];
-      snprintf(xl_msg, sizeof(xl_msg),
-               "host: [PC->XBOX] translated %d import symbols -> %s\\xb_imports.json",
-               xlated, tdir.c_str());
-      longan::log_line(xl_msg);
+  const bool synth_ok = image_mounted
+      ? trt_synthesize_engine_for_file(exe_path.c_str(), &synth_prof)
+      : trt_synthesize_engine(game_dir.c_str(), exe.c_str(), &synth_prof);
+  if (!synth_ok) {
+    r.map_rc = TRT_ERR_BAD_PE;
+    snprintf(r.detail, sizeof(r.detail),
+             "No supported Windows executable found for %s", exe.c_str());
+    return r;
+  }
+
+  // Unity's native launcher loads the game's embedded Mono runtime after the
+  // profile is synthesized. mono_host.cpp configures the separate managed-EXE
+  // path; expose the same supported SGen settings through the guest environment
+  // bridge before UnityPlayer/mono.dll can read them.
+  if (synth_prof.engine_type == TRT_ENGINE_UNITY_MONO) {
+    constexpr const char* gc_params = "nursery-size=64m,major=marksweep";
+    trt_gap_env_set("MONO_GC_PARAMS", gc_params);
+    trt_gap_env_set("MONO_LOG_MASK", "gc");
+    trt_gap_env_set("MONO_LOG_LEVEL", "debug");
+    SetEnvironmentVariableW(L"MONO_GC_PARAMS", L"nursery-size=64m,major=marksweep");
+    SetEnvironmentVariableW(L"MONO_LOG_MASK", L"gc");
+    SetEnvironmentVariableW(L"MONO_LOG_LEVEL", L"debug");
+    longan::log_line("host: Unity Mono guest env MONO_GC_PARAMS=nursery-size=64m,major=marksweep");
+  }
+
+  std::string effective_exe = exe;
+  // If the synthesizer selected an optimal executable in a subfolder (e.g. Binaries\Win64),
+  // update exe_path and guest working paths so the real game binary and its sibling DLLs run.
+  if (!image_mounted && !synth_prof.main_exe_abs.empty() && synth_prof.main_exe_abs != exe_path) {
+    DWORD attrs = GetFileAttributesA(synth_prof.main_exe_abs.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+      char ch_msg[512];
+      snprintf(ch_msg, sizeof(ch_msg),
+               "host: [ENGINE SYNTHESIZER] redirected executable: %s -> %s",
+               exe_path.c_str(), synth_prof.main_exe_abs.c_str());
+      longan::log_line(ch_msg);
+      exe_path = synth_prof.main_exe_abs;
+      std::string target_exe = synth_prof.main_exe_rel;
+      effective_exe = target_exe;
+      guest_exe = "Z:\\" + target_exe;
+      trt_bridge_set_exe_path(guest_exe.c_str());
+      const size_t rel_sl = target_exe.find_last_of("/\\");
+      const std::string guest_cwd =
+          (rel_sl == std::string::npos) ? guest_cwd_root
+                                        : (guest_cwd_root + target_exe.substr(0, rel_sl));
+      trt_bridge_set_cwd(guest_cwd.c_str());
     }
   }
 
-  const size_t exe_sl = exe_path.rfind('\\');
+  std::string steam_args;
+  if (!image_mounted) {
+    std::ifstream launch_file(game_dir + longan::kSteamLaunchExe);
+    std::string launch_exe;
+    std::string working_dir;
+    if (std::getline(launch_file, launch_exe) &&
+        _stricmp(launch_exe.c_str(), effective_exe.c_str()) == 0) {
+      std::getline(launch_file, working_dir);
+      std::getline(launch_file, steam_args);
+      std::string normalized;
+      if (working_dir == ".") {
+        trt_bridge_set_cwd(guest_cwd_root.c_str());
+      } else if (trt_steam_normalize_content_path(working_dir, &normalized)) {
+        const DWORD attrs = GetFileAttributesA((game_dir + "\\" + normalized).c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY))
+          trt_bridge_set_cwd((guest_cwd_root + normalized).c_str());
+      }
+    }
+  }
+
+  char synth_msg[512];
+  snprintf(synth_msg, sizeof(synth_msg),
+           "host: [ENGINE SYNTHESIZER] %s engine=%s arch=%s gfx=%s audio=%s universal_flags=%u",
+           synth_prof.game_name.c_str(),
+           trt_engine_type_name(synth_prof.engine_type),
+           synth_prof.is_managed ? "Managed (.NET)" : (synth_prof.is_pe32 ? "PE32" : "PE64"),
+           trt_graphics_api_name(synth_prof.preferred_gfx),
+           trt_audio_middleware_name(synth_prof.preferred_audio),
+           synth_prof.universal_flags);
+  longan::log_line(synth_msg);
+  if (synth_prof.engine_type == TRT_ENGINE_UNIVERSAL) {
+    // Universal: no engine evidence. What actually happens is the native guest
+    // path plus blanket stub provisioning for unknown imports (see
+    // trt_autonomous_provision_runtime); PC imports are translated, not
+    // recompiled, so say that instead of claiming a port that does not exist.
+    longan::log_line("host: universal engine -> native guest path with translated "
+                     "imports and blanket stubs (no engine-specific args applied)");
+  }
+  // Keep explicit title settings first, then the Steam launch command,
+  // and use the generated engine defaults when neither specifies arguments.
+  if (!has_user_args) {
+    std::string launch_args = std::move(steam_args);
+    if (launch_args.empty()) {
+      for (const auto& arg : synth_prof.cmdline_args) {
+        if (!launch_args.empty()) launch_args += ' ';
+        launch_args += arg;
+      }
+    }
+    if (!launch_args.empty()) {
+      trt_bridge_set_cmd_args(launch_args.c_str());
+      longan::log_line(("host: launch arguments: " + launch_args).c_str());
+    }
+  }
+  if (!app_id_read && synth_prof.steam_appid) {
+    trt_steam_set_appid(synth_prof.steam_appid);
+    char al[160];
+    snprintf(al, sizeof(al),
+             "host: [ENGINE SYNTHESIZER] steam appid %u applied",
+             synth_prof.steam_appid);
+    longan::log_line(al);
+  }
+  // Engine-owned screen settings: a title that ignores -ResX/-screen-width still
+  // reads its own settings file, and its shipped default is usually the PC
+  // 4K/12 GB one that cannot fit the Dev-Mode budget.
+  {
+    char up[1200] = {};
+    if (trt_engine_write_user_settings(&synth_prof, drive_c.c_str(), up, sizeof(up))) {
+      std::string ul = std::string("host: [ENGINE SYNTHESIZER] user settings: ") + up;
+      longan::log_line(ul.c_str());
+    }
+  }
+  const std::string tdir = game_dir + "\\.tiramisu";
+  CreateDirectoryA(tdir.c_str(), nullptr);
+  const int xlated = trt_pc2xb_translate_file(exe_path.c_str(),
+                                              (tdir + "\\xb").c_str());
+  if (xlated >= 0) {
+    char xl_msg[192];
+    snprintf(xl_msg, sizeof(xl_msg),
+             "host: [PC->XBOX] translated %d import symbols -> %s\\xb_imports.json",
+             xlated, tdir.c_str());
+    longan::log_line(xl_msg);
+  }
+  // This is the click-to-play provisioning point: the profile above is
+  // translated into registered graphics/audio/middleware bridges and a
+  // fail-visible stub for every imported module the catalog does not know.
+  // It runs before trt_runtime_init/guest mapping, so the first import bind
+  // already sees the synthesized surface.
+  char status_synth[256];
+  snprintf(status_synth, sizeof(status_synth), "Provisioning: %s (%s / %s)",
+           name.c_str(), trt_graphics_api_name(synth_prof.preferred_gfx),
+           trt_audio_middleware_name(synth_prof.preferred_audio));
+  set_guest_status(status_synth);
+  trt_autonomous_provision_runtime(&be, &synth_prof);
+
+  // Launch preflight: resolve the profile just provisioned against what this
+  // host can actually do, so the wall is named once here instead of surfacing
+  // 400 log lines later inside the engine. The verdict is written back into
+  // .tiramisu/profile.json ("preflight") and summarised in one log line.
+  {
+    trt_host_caps caps{};
+    caps.d3d11_device = trt_gpu_host_device_present();
+    caps.d3d12_device = trt_gpu_host_d3d12_present();
+    caps.compositor = trt_gpu_host_swapchain_present();
+    caps.opengl_renderer = trt_gl_render_hooks_present();
+    caps.mono_host = trt_mono_host_present();
+    // The console host always has an audio endpoint (WASAPI/XAudio2 are
+    // registered before this point); the offline harness passes 0.
+    caps.audio_device = 1;
+    trt_preflight_report pre{};
+    const int blockers = trt_engine_launch_preflight(&synth_prof, &caps, &pre);
+    char pl[640];
+    if (blockers > 0) {
+      snprintf(pl, sizeof(pl), "Preflight: %d blocker(s) - %s", blockers,
+               pre.lines.empty() ? "see log" : pre.lines[0].c_str());
+    } else {
+      snprintf(pl, sizeof(pl), "Preflight: no known blocker (%s / %s)",
+               trt_graphics_api_name(synth_prof.preferred_gfx),
+               trt_audio_middleware_name(synth_prof.preferred_audio));
+    }
+    set_guest_status(pl);
+  }
+
+  const size_t exe_sl = exe_path.find_last_of("/\\");
   const std::string exe_dir =
       (exe_sl == std::string::npos) ? game_dir : exe_path.substr(0, exe_sl);
   // the runtime knows where the game's own DLLs live, and resolves imports
   // through the guest-image registry (a game's own DLLs beat the system's)
   trt_runtime_init(&be, exe_dir.c_str());
+  if (!image_mounted && _stricmp(exe_dir.c_str(), game_dir.c_str()) != 0)
+    trt_runtime_set_content_root(game_dir.c_str());
   trt_resolver* runtime_rs = trt_runtime_resolver();
 
-  {  // scope the first exe read: buf dies after the managed check
-     // (saves 409MB persistent + the 409MB transient double-buffer
-     // during mapping; the second read below is a separate buf).
-  std::ifstream f(exe_path, std::ios::binary);
-  if (!f) {
-    snprintf(r.detail, sizeof(r.detail), "cannot open %s", exe_path.c_str());
-    return r;
+  bool is_managed = synth_prof.is_managed;
+  if (!is_managed) {
+    // Fast header-only probe: read the first 64KB to check for CLR COM descriptor
+    std::ifstream f(exe_path, std::ios::binary);
+    if (f) {
+      u8 hdr_buf[65536] = {};
+      f.read(reinterpret_cast<char*>(hdr_buf), sizeof(hdr_buf));
+      const size_t got = static_cast<size_t>(f.gcount());
+      if (got >= 64 && trt_pe_is_managed(hdr_buf, got)) {
+        is_managed = true;
+      }
+    }
   }
-  std::vector<u8> buf((std::istreambuf_iterator<char>(f)),
-                      std::istreambuf_iterator<char>());
 
-  snprintf(line, sizeof(line), "trt: launching %s (%zu bytes)", exe_path.c_str(),
-           buf.size());
-  longan::log_line(line);
-
-  // Managed (.NET) games don't go through the native PE loader: their
-  // entry point is mscoree!_CorExeMain and their code is IL. Route them
-  // to the embedded Mono runtime instead (Path B). On UWP this fails
-  // NAMED until the Mono-for-UWP step lands (no runtime in-tree yet);
-  // offline it runs the game under Mono + the FNA stack.
-  if (trt_pe_is_managed(buf.data(), buf.size())) {
+  if (is_managed) {
     longan::log_line("trt: managed exe detected, routing to Mono");
     trt_mono_config mcfg = {};
     mcfg.exe_path = exe_path.c_str();
@@ -2002,13 +2496,13 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     trt_trace("TRACE PrepareWindowAttributes enter");
     FNA3D_PrepareWindowAttributes();
     trt_trace("TRACE PrepareWindowAttributes ok");
+    checkpoint_phase(longan::launch_phase::managed_runtime);
     r.map_rc = trt_mono_run(&mcfg, nullptr, 0, nullptr);
     if (r.map_rc != TRT_OK) {
       strncpy(r.detail, trt_mono_last_error(), sizeof(r.detail) - 1);
     }
     return r;
   }
-  }  // end scoped first-read block; the 409MB buf is freed before the native map
 
   trt_image* img = nullptr;
   {
@@ -2053,7 +2547,10 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     strncpy(r.detail, "seal failed", sizeof(r.detail) - 1);
     return r;
   }
-  trt_images_register_main(img, exe.c_str());
+  trt_images_register_main(img, effective_exe.c_str());
+  if (effective_exe != exe) {
+    trt_images_register_alias(img, exe.c_str());
+  }
   if (img->is_pe32) {
     // 32-bit PE: run through x86 interpreter instead of native call
     snprintf(line, sizeof(line), "trt: 32-bit PE detected, running via x86 interpreter");
@@ -2061,15 +2558,18 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     x86_context xctx = {};
     x86_cpu_init(&xctx);
     xctx.log = [](const char* s) { longan::log_line(s); };
+    checkpoint_phase(longan::launch_phase::x86_execution);
     int rc = x86_run_pe32(&xctx, img->base, img->size_of_image,
-                          img->guest_base, img->entry_rva, 0x00100000, 0x00100000);
-    snprintf(r.detail, sizeof(r.detail), "x86 interpreter returned %d", rc);
+                          img->guest_base, img->entry_rva, 0x00100000, 0x00100000, img);
+    if (rc != X86_EXEC_OK) {
+      r.map_rc = TRT_ERR_PE32_EXECUTION;
+      snprintf(r.detail, sizeof(r.detail), "x86 stopped with status %d at EIP %08X",
+               rc, xctx.regs.eip);
+    } else {
+      snprintf(r.detail, sizeof(r.detail), "x86 entry finished");
+    }
     x86_mem_free(&xctx);
     return r;
-  }
-  for (int i = 0; i < img->tls_callback_count; ++i) {
-    trt_call_guest_img((void*)(img->base + img->tls_callback_rvas[i]), img,
-                       (u64)(uintptr_t)img->base, 1, 0, 0);
   }
   run_guest_trapped(img, r.detail, sizeof(r.detail));
   return r;
@@ -2079,6 +2579,11 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
 void rescan_games();
 
 void sync_steam_to_ui() {
+  static ULONGLONG next_refresh = 0;
+  const ULONGLONG now = GetTickCount64();
+  if (now < next_refresh) return;
+  next_refresh = now + 250;
+
   const auto acct = longan::steam_client_account();
   g_steam_status = acct.status_line;
   g_steam_qr = acct.qr_url;
@@ -2099,6 +2604,7 @@ void sync_steam_to_ui() {
     u.size_str = u82ws(r.size_str);
     u.installed = r.installed;
     u.downloading = r.downloading;
+    u.queued = r.queued;
     u.download_pct = r.download_pct;
     u.status_str = u82ws(r.status_text);
     u.install_dir = u82ws(r.install_dir);
@@ -2141,7 +2647,7 @@ const wchar_t* k_input_choices[4] = {L"auto", L"controller", L"kbm",
 const wchar_t* k_cap_choices[4] = {L"0", L"30", L"60", L"120"};
 
 void sync_settings_rows() {
-  const auto& s = longan::settings_get();
+  const auto s = longan::settings_get_global();
   auto set_bool = [](longan::ui_setting& r, bool v) {
     r.is_bool = true; r.is_choice = false; r.is_int = false;
     r.value[0] = v ? L'1' : L'0'; r.value[1] = 0;
@@ -2211,7 +2717,7 @@ void sync_settings_rows() {
   set_bool(g_set_rows[i], s.show_sysinfo);
   ++i;
   // 11 quick menu
-  wcscpy(g_set_rows[i].label, L"Back+Start quick menu");
+  wcscpy(g_set_rows[i].label, L"Shift+Tab quick menu");
   set_bool(g_set_rows[i], s.quick_menu_enabled);
   ++i;
   // 12 vsync
@@ -2265,7 +2771,7 @@ void sync_settings_rows() {
 
 // Apply the current row buffers back into host_settings and persist.
 void apply_settings_rows() {
-  longan::host_settings s = longan::settings_get();
+  longan::host_settings s = longan::settings_get_global();
   for (int i = 0; i < g_set_count; ++i) {
     const longan::ui_setting& r = g_set_rows[i];
     if (i == 0) {
@@ -2304,7 +2810,12 @@ void apply_settings_rows() {
       else s.texture_quality = 2;
     } else if (i == 20) s.fsb_decode = (wcscmp(r.value, L"1") == 0);
   }
-  longan::settings_store(s, g_local_state);
+  if (!longan::settings_store(s, g_local_state)) {
+    sync_settings_rows();
+    longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
+    longan::ui_toast(L"Could not save settings. Check free storage.", 4.0f);
+    return;
+  }
   apply_bridge_launch_settings();
   sync_settings_rows();
   longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
@@ -2314,13 +2825,31 @@ void apply_settings_rows() {
 
 void reset_all_settings() {
   longan::host_settings def{};
-  longan::settings_store(def, g_local_state);
+  if (!longan::settings_store(def, g_local_state)) {
+    sync_settings_rows();
+    longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
+    longan::ui_toast(L"Could not save settings. Check free storage.", 4.0f);
+    return;
+  }
   apply_bridge_launch_settings();
   sync_settings_rows();
   longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
   longan::ui_toast(L"All settings reset to defaults", 2.8f);
   longan::log_line("settings: reset to defaults");
 }
+
+void request_settings_reset() {
+  static ULONGLONG confirm_until = 0;
+  const ULONGLONG now = GetTickCount64();
+  if (confirm_until && now <= confirm_until) {
+    confirm_until = 0;
+    reset_all_settings();
+    return;
+  }
+  confirm_until = now + 5000;
+  longan::ui_toast(L"Select Reset Defaults again to confirm", 4.0f);
+}
+
 
 // Cycle/edit the selected row: dir = -1/+1 for LR cycles and int edit,
 // toggle for bools. Returns true when something changed.
@@ -2386,7 +2915,9 @@ struct tiramisu_host
   ULONGLONG m_next_full_rescan_ms = 0;  // periodic root rescan (30 s)
 
   IFrameworkView CreateView() { return *this; }
-  void Initialize(CoreApplicationView const&) {}
+  void Initialize(CoreApplicationView const&) {
+    longan::log_line("host view: Initialize called");
+  }
   void Load(hstring const&) {}
   void Uninitialize() {
     g_shutdown.store(true);
@@ -2430,11 +2961,8 @@ struct tiramisu_host
         dxgidev->Release();
       }
     }
-    // Opt into full-screen CoreWindow bounds & raw pointer capture on Xbox UWP.
-    // We keep the OS cursor visible: the Edge-identity package is granted a real
-    // hardware pointer, so the shell's cursor IS the pointer. Hiding it left only
-    // our drawn D2D arrow, which freezes when GameInput stops reporting deltas.
-    // The drawn arrow is now a fallback for pad-as-mouse sessions only.
+    // Opt into full-screen CoreWindow bounds. Keep the standard Arrow
+    // available whenever the launcher is not drawing its own pointer.
     try {
       using namespace winrt::Windows::UI::ViewManagement;
       ApplicationViewScaling::TrySetDisableLayoutScaling(true);
@@ -2508,9 +3036,6 @@ struct tiramisu_host
         });
     m_pp = window.PointerPressed([](CoreWindow const& sender,
                                     PointerEventArgs const& a) {
-      g_controller_active.store(false);
-      g_last_mouse_move_ms.store(GetTickCount64());
-      if (g_guest_running.load() && g_native_input.mouse_active_recent(300)) return;
       const auto point = a.CurrentPoint();
       feed_core_pointer(sender, point.Position());
       const int btn = host_mouse_btn_for_press(point.Properties().PointerUpdateKind());
@@ -2525,18 +3050,13 @@ struct tiramisu_host
     });
     m_pr = window.PointerReleased([this](CoreWindow const& sender,
                                          PointerEventArgs const& a) {
-      if (g_guest_running.load() && g_native_input.mouse_active_recent(300)) return;
       const auto point = a.CurrentPoint();
       feed_core_pointer(sender, point.Position());
       const int btn = host_mouse_btn_for_release(point.Properties().PointerUpdateKind());
-      if (btn >= 0) trt_input_mouse_button(btn, false);
-      if (btn == 0) launcher_click();
+      if (btn >= 0 && trt_input_mouse_button(btn, false) && btn == 0) launcher_click();
     });
     m_pm = window.PointerMoved([](CoreWindow const& sender,
                                   PointerEventArgs const& a) {
-      g_controller_active.store(false);
-      g_last_mouse_move_ms.store(GetTickCount64());
-      if (g_guest_running.load() && g_native_input.mouse_active_recent(300)) return;
       static bool logged = false;
       if (!logged) {
         logged = true;
@@ -2544,6 +3064,7 @@ struct tiramisu_host
       }
       const auto point = a.CurrentPoint();
       feed_core_pointer(sender, point.Position());
+      if (g_native_input.mouse_active_recent(300)) return;
       const auto properties = point.Properties();
       const bool held[5] = {properties.IsLeftButtonPressed(),
                             properties.IsRightButtonPressed(),
@@ -2567,8 +3088,7 @@ struct tiramisu_host
     });
     m_pw = window.PointerWheelChanged([](CoreWindow const& sender,
                                          PointerEventArgs const& a) {
-      if (g_native_input.mouse_active()) return;
-      g_controller_active.store(false);
+      if (g_native_input.wheel_active_recent()) return;
       const auto point = a.CurrentPoint();
       feed_core_pointer(sender, point.Position());
       trt_input_wheel(static_cast<i32>(point.Properties().MouseWheelDelta()));
@@ -2594,10 +3114,14 @@ struct tiramisu_host
 
   }
 
+  ULONGLONG m_last_web_pointer_ms = 0;
+
   void apply_web_controls() {
     const auto events = longan::webxfer_control_events();
     if (!events.empty()) g_controller_active.store(false);
     for (const auto& event : events) {
+      if (event.kind == 'a' || event.kind == 'm' || event.kind == 'b')
+        m_last_web_pointer_ms = GetTickCount64();
       const bool down = event.second != 0;
       switch (event.kind) {
         case 'a': {
@@ -2621,6 +3145,13 @@ struct tiramisu_host
           const u32 scan = trt_MapVirtualKeyW(vk, 4 /*MAPVK_VK_TO_VSC_EX*/);
           const bool repeat = down && m_web_keys[vk];
           m_web_keys[vk] = down;
+          static unsigned web_key_trace = 0;
+          if (web_key_trace++ < 32) {
+            char line[128];
+            snprintf(line, sizeof(line), "input: web key vk=%u down=%u scan=%u",
+                     (unsigned)vk, down ? 1u : 0u, (unsigned)(scan & 0xff));
+            longan::log_line(line);
+          }
           if (handle_host_cursor_key(vk, static_cast<u16>(scan & 0xff),
                                      (scan >> 8) != 0, down)) {
             break;
@@ -2654,10 +3185,18 @@ struct tiramisu_host
     }
   }
 
-  void trigger_steam_item_action(int idx) {
+  void trigger_steam_item_action(unsigned app_id) {
+    if (!app_id) return;
     const auto items = longan::steam_client_items();
-    if (idx < 0 || idx >= static_cast<int>(items.size())) return;
-    const auto& it = items[idx];
+    const auto found = std::find_if(items.begin(), items.end(),
+        [app_id](const auto& item) { return item.app_id == app_id; });
+    if (found == items.end()) return;
+    const auto& it = *found;
+    if (it.downloading || it.queued) {
+      if (longan::steam_client_cancel_download(app_id))
+        longan::ui_toast(L"Steam download cancellation requested", 2.5f);
+      return;
+    }
     if (it.installed) {
       std::string launch_name;
       for (const auto& ge : g_games) {
@@ -2679,15 +3218,20 @@ struct tiramisu_host
       if (launch_name.empty()) launch_name = it.title;
       g_pending_launch = launch_name;
     } else if (!it.downloading) {
-      longan::steam_client_download_app(
-          it.app_id, []() { g_steam_needs_rescan.store(true); });
+      if (!longan::steam_client_account().signed_in) {
+        longan::ui_toast(L"Sign in with Steam to install this game", 3.0f);
+        return;
+      }
+      if (!longan::steam_client_download_app(
+              it.app_id, []() { g_steam_needs_rescan.store(true); }))
+        longan::ui_toast(L"Could not queue Steam install", 3.0f);
     }
   }
 
   void sync_tools_list() {
     std::vector<longan::ui_tool_item> items = {
-        {L"Rescan Game Library", L"Internal SSD + USB Drives (D:–Y:)", L"RUN"},
-        {L"Refresh Game Cover Art", L"Re-fetch HD Steam covers for all games", L"RUN"},
+        {L"Rescan Game Library", L"Internal and accessible USB game folders", L"RUN"},
+        {L"Refresh Game Cover Art", L"Refresh available cover art", L"RUN"},
         {L"Run Runtime Self-Test", L"Verify PE64 loader & syscall hooks", L"RUN"},
         {L"Gamepad-as-Mouse Mode", L"Right stick moves cursor (R3 / F1)",
          g_mouse_mode ? L"ON" : L"OFF"},
@@ -2702,6 +3246,7 @@ struct tiramisu_host
   void run_console_tool(int idx) {
     switch (idx) {
       case 0:
+        poll_external_storage(true);
         rescan_games();
         g_tool_result = L"Rescanned: " + std::to_wstring(g_games.size()) + L" games";
         break;
@@ -2722,7 +3267,6 @@ struct tiramisu_host
         break;
       case 4:
         g_kbd_mouse_mode = !g_kbd_mouse_mode;
-        longan::set_pointer_cursor_mode(g_kbd_mouse_mode);
         refresh_control_hint();
         g_tool_result = g_kbd_mouse_mode ? L"KBM Cursor ON (F8)" : L"KBM Cursor OFF";
         break;
@@ -2875,13 +3419,19 @@ struct tiramisu_host
           longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
         }
         break;
+      case longan::ui_click_type::select_settings_section:
+        if (hit.index >= 0 && hit.index < g_set_count) {
+          g_set_selected = hit.index;
+          longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
+        }
+        break;
       case longan::ui_click_type::reset_settings:
-        reset_all_settings();
+        request_settings_reset();
         break;
       case longan::ui_click_type::select_steam:
         break;
       case longan::ui_click_type::steam_action:
-        trigger_steam_item_action(hit.index);
+        trigger_steam_item_action(longan::ui_steam_selected_app());
         break;
       case longan::ui_click_type::steam_qr:
         steam_begin();
@@ -2896,6 +3446,9 @@ struct tiramisu_host
 
   void boot_all() {
     const std::string install = package_install_path();
+    g_package_games_dir = install.empty()
+        ? std::string()
+        : install + std::string(1, static_cast<char>(92)) + "network-games";
     g_local_state =
         ws2u8(winrt::Windows::Storage::ApplicationData::Current()
                   .LocalFolder()
@@ -2919,7 +3472,20 @@ struct tiramisu_host
     longan::log_line("tiramisu boot: host timer resolution 1ms (timeBeginPeriod)");
 
     // ---- persisted settings (dashboard-editable; consumed by bridges) ----
+    // Load first: apply_console_hardware_profile starts from the stored
+    // settings and must not overwrite them with defaults on every boot.
     const int applied = longan::settings_load(g_local_state);
+    g_network_games_dir = longan::settings_get().network_games_root;
+    longan::webxfer_set_network_games_dir(g_network_games_dir);
+    if (!g_network_games_dir.empty()) {
+      const std::string root_line =
+          "games: external network root=" + g_network_games_dir;
+      longan::log_line(root_line.c_str());
+    }
+    // Auto-apply detected console hardware profile (memory budget, ESRAM
+    // budget ledger, and resolution/texture scaling) on top of those settings.
+    const auto cons_info = longan::get_detected_console_info();
+    longan::apply_console_hardware_profile(cons_info, g_local_state);
     apply_bridge_launch_settings();
     snprintf(line, sizeof(line), "settings: %d keys applied from settings.ini",
              applied);
@@ -2927,22 +3493,15 @@ struct tiramisu_host
 
     // System specs for overlay (read once at boot)
     {
-      MEMORYSTATUSEX ms{};
-      ms.dwLength = sizeof(ms);
-      GlobalMemoryStatusEx(&ms);
-      HKEY hkey;
-      wchar_t cpuName[128] = L"Unknown CPU";
-      if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-                        L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", 0,
-                        KEY_READ, &hkey) == ERROR_SUCCESS) {
-        DWORD sz = sizeof(cpuName);
-        RegQueryValueExW(hkey, L"ProcessorNameString", nullptr, nullptr,
-                         (LPBYTE)cpuName, &sz);
-        RegCloseKey(hkey);
+      wchar_t esram_tag[64] = L"";
+      if (cons_info.has_esram) {
+        swprintf(esram_tag, 64, L" + %dMB ESRAM", cons_info.esram_size_mb);
       }
       wchar_t info[256];
-      swprintf(info, 256, L"%s | %.0f GB RAM", cpuName,
-               (double)ms.ullTotalPhys / (1024.0 * 1024.0 * 1024.0));
+      swprintf(info, 256, L"%hs (%hs) | %hs @ %.2f GHz | %.0f GB RAM%ls",
+               cons_info.generation_name, cons_info.codename,
+               cons_info.cpu_arch, cons_info.cpu_clock_ghz,
+               (double)cons_info.total_ram_mb / 1024.0, esram_tag);
       longan::ui_set_sysinfo(info);
     }
 
@@ -2971,6 +3530,7 @@ struct tiramisu_host
     setup_steps({L"Storage ready", L"Direct3D 11 ready", L"Gamepads probed",
                  std::wstring(L"Audio: ") + u82ws(line)},
                 L"Starting the transfer server…", false);
+    longan::webxfer_set_package_games_dir(g_package_games_dir);
     const std::string url = longan::webxfer_start(g_local_state, 1920);
     snprintf(line, sizeof(line), "transfer: %s (QR on TV)", url.c_str());
     longan::log_line(line);
@@ -3029,6 +3589,7 @@ struct tiramisu_host
     setup_steps({L"Storage ready", L"Direct3D 11 ready", L"Gamepads probed",
                  L"Audio ready", url_step},
                 L"Scanning for games…", false);
+    poll_external_storage(true);
     rescan_games();
     longan::steam_client_init(g_local_state, g_games_dir);
     trt_steam_load_account(g_local_state.c_str());
@@ -3157,12 +3718,11 @@ struct tiramisu_host
       if (m_mouse_device) {
         m_mm = m_mouse_device.MouseMoved(
             [](wdi::MouseDevice const&, wdi::MouseEventArgs const& a) {
-          if (g_native_input.mouse_active()) return;
+          if (g_native_input.mouse_active_recent(300)) return;
           const auto d = a.MouseDelta();
           if (d.X == 0 && d.Y == 0) return;
           const ULONGLONG now = GetTickCount64();
-          g_controller_active.store(false);
-          g_last_mouse_move_ms.store(now);
+          record_physical_pointer(now);
           g_last_raw_mouse_ms.store(now);
           if (!g_uwp_raw_mouse.exchange(true))
             longan::log_line("input: physical relative mouse motion received");
@@ -3184,12 +3744,19 @@ struct tiramisu_host
     g_ui_tid = GetCurrentThreadId();
     auto active_window = CoreWindow::GetForCurrentThread();
     active_window.Activate();
+    CoreCursor system_arrow{nullptr};
+    try {
+      system_arrow = CoreCursor(CoreCursorType::Arrow, 0);
+      active_window.PointerCursor(system_arrow);
+    } catch (...) {}
+    bool system_cursor_hidden = false;
+    ULONGLONG next_cursor_update_ms = 0;
+    bool cursor_error_logged = false;
     if (!g_booted) {
       g_booted = true;
       boot_all();
       g_native_input.set_host_key_handler(&handle_host_cursor_key);
       g_native_input.open();
-      longan::set_pointer_cursor_mode(false);
     }
     setup_mouse_device();
     longan::log_line(active_window.IsInputEnabled()
@@ -3200,7 +3767,6 @@ struct tiramisu_host
                          : "input: MouseDevice unavailable; CoreWindow pointer listener active");
     enable_keyboard_interceptor();
 
-    int mouse_vx = 960, mouse_vy = 540;
     auto next_heartbeat = std::chrono::steady_clock::now();
     g_boot_ms = (ULONGLONG)GetTickCount64();
     while (!g_shutdown.load()) {
@@ -3244,12 +3810,21 @@ struct tiramisu_host
                     mm_was_y = false, mm_was_dl = false, mm_was_dr = false,
                     mm_was_w = false, mm_was_s = false, mm_was_ak = false,
                     mm_was_d = false, guest_was_running = false;
-        static int mm_wheel_tick = 0, vm_hold_ticks = 0;
+        static ULONGLONG mm_next_wheel_ms = 0;
+        static int mm_wheel_direction = 0;
+        static ULONGLONG mm_last_motion_ms = 0;
+        static float mm_px = 0.f, mm_py = 0.f;
+        static bool back_start_was = false;
         const u16 b = pad_ok ? xs.Gamepad.wButtons : 0;
 
         // Adaptive Controller vs KBM detection + CoreWindow::PointerPosition + Win32 GetCursorPos fallback:
         const ULONGLONG now_input_ms = GetTickCount64();
-        {
+        if (g_input_focused) {
+          if (g_native_input.mouse_active_recent(300)) record_physical_pointer(now_input_ms);
+          const bool relative_active = relative_pointer_active(now_input_ms);
+          const bool native_buttons = g_native_input.mouse_active_recent(300);
+          bool core_pointer_recent = longan::pointer_event_recent(
+              now_input_ms, g_last_core_pointer_ms.load(), 500);
           // 1) WinRT CoreWindow::PointerPosition() poll
           if (m_window) {
             try {
@@ -3259,15 +3834,15 @@ struct tiramisu_host
               if (bnd.Width > 0 && bnd.Height > 0) {
                 const float rx = pos.X - bnd.X;
                 const float ry = pos.Y - bnd.Y;
-                if (last_cw_x > -9000.0f &&
+                if (!relative_active && !core_pointer_recent && last_cw_x > -9000.0f &&
                     (fabsf(rx - last_cw_x) > 0.5f || fabsf(ry - last_cw_y) > 0.5f)) {
                   int dw = 1920, dh = 1080;
                   trt_display_size(&dw, &dh);
                   const int cx = std::clamp((int)(rx * dw / bnd.Width), 0, dw - 1);
                   const int cy = std::clamp((int)(ry * dh / bnd.Height), 0, dh - 1);
                   trt_input_pointer_move(cx, cy, false);
-                  g_controller_active.store(false);
-                  g_last_mouse_move_ms.store(now_input_ms);
+                  record_physical_pointer(now_input_ms);
+                  core_pointer_recent = true;
                 }
                 last_cw_x = rx;
                 last_cw_y = ry;
@@ -3280,9 +3855,6 @@ struct tiramisu_host
           //    This runs in-game too: a title that polls the cursor must not be
           //    left with a frozen pointer just because CoreWindow is silent. It
           //    yields whenever CoreWindow pointer events are live.
-          const ULONGLONG last_core = g_last_core_pointer_ms.load();
-          const bool core_pointer_recent =
-              last_core != 0 && (now_input_ms - last_core) < 500;
           {
             using get_cp_fn = BOOL(WINAPI*)(POINT*);
             using get_aks_fn = SHORT(WINAPI*)(int);
@@ -3300,22 +3872,22 @@ struct tiramisu_host
                 p_get_aks = reinterpret_cast<get_aks_fn>(GetProcAddress(u32, "GetAsyncKeyState"));
               }
             }
-            if (p_get_cp && !core_pointer_recent) {
+            if (p_get_cp) {
               POINT pt{};
               if (p_get_cp(&pt)) {
-                if (last_pt.x != -99999 && (pt.x != last_pt.x || pt.y != last_pt.y)) {
+                if (!relative_active && !core_pointer_recent && last_pt.x != -99999 &&
+                    (pt.x != last_pt.x || pt.y != last_pt.y)) {
                   int dw = 1920, dh = 1080;
                   trt_display_size(&dw, &dh);
                   const int cx = std::clamp((int)pt.x, 0, dw - 1);
                   const int cy = std::clamp((int)pt.y, 0, dh - 1);
                   trt_input_pointer_move(cx, cy, false);
-                  g_controller_active.store(false);
-                  g_last_mouse_move_ms.store(now_input_ms);
+                  record_physical_pointer(now_input_ms);
                 }
                 last_pt = pt;
               }
             }
-            if (p_get_aks && !core_pointer_recent) {
+            if (p_get_aks) {
               static const u16 k_probe_vk[3] = {0x01 /*VK_LBUTTON*/,
                                                 0x02 /*VK_RBUTTON*/,
                                                 0x04 /*VK_MBUTTON*/};
@@ -3323,9 +3895,10 @@ struct tiramisu_host
                 const bool down = (p_get_aks(k_probe_vk[i]) & 0x8000) != 0;
                 if (down == was_btn[i]) continue;
                 was_btn[i] = down;
-                g_controller_active.store(false);
-                if (trt_mouse_button(i) != down) trt_input_mouse_button(i, down);
-                if (i == 0 && !down && !g_guest_running.load()) launcher_click();
+                if (core_pointer_recent || native_buttons) continue;
+                record_physical_pointer(now_input_ms);
+                const bool transitioned = trt_input_mouse_button(i, down);
+                if (i == 0 && transitioned && !down) launcher_click();
               }
             }
           }
@@ -3340,21 +3913,14 @@ struct tiramisu_host
           prev_mx = cur_mx;
           prev_my = cur_my;
         }
-        // Hot-plug: the shell can attach the pointer after launch. Trust either
-        // GameInput's device status or a fresh CoreWindow pointer event, then
-        // hand the cursor from the pad to the real mouse in auto mode.
+        // Allow a physical mouse to appear after launch without changing
+        // any selected mapping or controller slot.
         if (!g_host_mouse_present.load() &&
-            (g_native_input.mouse_connected() || g_last_mouse_move_ms.load() != 0)) {
+            (g_native_input.mouse_connected() || g_physical_pointer_seen.load())) {
           g_host_mouse_present.store(true);
           longan::log_line("input: mouse connected -> hardware pointer active");
         }
-        if (g_host_mouse_present.load() && g_auto_pad_mouse.load() &&
-            g_guest_running.load()) {
-          g_auto_pad_mouse.store(false);
-          g_mouse_mode = false;
-          longan::log_line("input: hardware mouse active -> pad-as-mouse OFF");
-        }
-        if (g_native_input.mouse_active() || g_native_input.keyboard_active() ||
+        if (g_native_input.mouse_active_recent(300) || g_native_input.keyboard_active() ||
             (!pad_ok && (g_native_input.mouse_connected() ||
                          g_native_input.keyboard_connected()))) {
           g_controller_active.store(false);
@@ -3388,21 +3954,36 @@ struct tiramisu_host
           trt_mouse_pos(&pmx, &pmy);
           longan::ui_set_pointer_pos(pmx, pmy);
         }
-        const bool mouse_recent =
-            (g_last_mouse_move_ms.load() != 0) &&
-            (now_input_ms - g_last_mouse_move_ms.load() < 15000);
-        // A real mouse owns the on-screen pointer now (the shell grants one to
-        // the Edge identity). Do not stack our D2D arrow on top of it; keep the
-        // drawn cursor only when there is no hardware pointer at all.
-        const bool hw_pointer = g_host_mouse_present.load() ||
-                                g_native_input.mouse_connected() ||
-                                g_last_raw_mouse_ms.load() != 0;
-        // The shell owns the pointer on the dashboard. Only draw our own arrow
-        // while an actual game is being driven by pad-as-mouse.
-        const bool show_cursor = !hw_pointer && g_guest_running.load() &&
-                                 g_mouse_mode;
-        longan::ui_set_cursor_visible(show_cursor);
-        longan::set_launcher_cursor_visible(false);
+        const bool guest_running = g_guest_running.load();
+        const bool virtual_pointer = g_mouse_mode || g_kbd_mouse_mode ||
+            longan::pointer_event_recent(now_input_ms, m_last_web_pointer_ms, 12000);
+        const bool launcher_drawing = !guest_running || g_quick_menu_open;
+        const auto cursor = longan::choose_cursor({
+            g_input_focused, longan::boot_anim_is_active(), guest_running,
+            g_quick_menu_open, launcher_drawing && longan::ui_can_draw_cursor(),
+            longan::guest_cursor_overlay_ready(now_input_ms), g_physical_pointer_seen.load(),
+            virtual_pointer, g_controller_active.load(),
+        });
+        const bool hide_system = cursor != longan::cursor_owner::system;
+        if (system_arrow && hide_system != system_cursor_hidden &&
+            now_input_ms >= next_cursor_update_ms) {
+          try {
+            active_window.PointerCursor(hide_system ? CoreCursor{nullptr} : system_arrow);
+            system_cursor_hidden = hide_system;
+            longan::log_line(hide_system ? "input: Tiramisu owns the pointer"
+                                        : "input: shell owns the pointer");
+          } catch (...) {
+            next_cursor_update_ms = now_input_ms + 2000;
+            if (!cursor_error_logged) {
+              longan::log_line("input: shell declined cursor visibility change; will retry");
+              cursor_error_logged = true;
+            }
+          }
+        }
+        const bool draw_pointer = system_cursor_hidden ||
+            (virtual_pointer && !g_host_mouse_present.load());
+        longan::ui_set_cursor_visible(draw_pointer && cursor == longan::cursor_owner::launcher);
+        longan::set_guest_cursor_visible(draw_pointer && cursor == longan::cursor_owner::guest);
 
         // Launcher mouse wheel scrolling across all screens
         if (!g_guest_running.load() && !g_setup_active) {
@@ -3410,7 +3991,7 @@ struct tiramisu_host
           if (wh != 0) {
             const int dir = (wh > 0) ? -1 : 1;
             if (g_screen == longan::UI_SETTINGS && g_set_count > 0) {
-              g_set_selected = std::clamp(g_set_selected + dir, 0, g_set_count - 1);
+              g_set_selected = longan::ui_settings_step(dir);
               longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
             } else if (g_screen == longan::UI_STEAM) {
               if (dir < 0) longan::ui_steam_nav_up();
@@ -3472,7 +4053,6 @@ struct tiramisu_host
           g_kbd_mouse_mode = !g_kbd_mouse_mode;
           for (auto& k : g_km_keys) k.store(false);
           km_rem_x = km_rem_y = 0.0f;
-          longan::set_pointer_cursor_mode(g_kbd_mouse_mode);
           refresh_control_hint();
           longan::log_line(g_kbd_mouse_mode ? "input: keyboard-mouse cursor mode ON (F8)"
                                             : "input: keyboard-mouse cursor mode OFF (F8)");
@@ -3589,12 +4169,27 @@ struct tiramisu_host
               (u64)GetTickCount64() - g_guest_stop_since.load() > 10000ull) {
             force_kill_guest("stop ignored 10s");
           }
+          // Back+Start exits the running game immediately. It used to toggle
+          // the quick menu, which made the requested shortcut indistinguishable
+          // from opening an overlay. The quick menu remains available on
+          // Shift+Tab and through Steam's overlay shortcut.
+          if (pad_vm && !back_start_was) {
+            back_start_was = true;
+            if (g_quick_menu_open) {
+              g_quick_menu_open = false;
+              longan::ui_set_quick_menu(false);
+            }
+            request_guest_stop();
+          } else if (!pad_vm) {
+            back_start_was = false;
+          }
           static bool qm_was = false;
           const bool shift_tab =
               trt_key_down(0x10 /*VK_SHIFT*/) && trt_key_down(0x09 /*VK_TAB*/);
           if (longan::trt_settings_quick_menu_enabled() &&
-              (pad_vm || shift_tab || trt_steam_overlay_check_and_reset())) {
-            // RetroArch/Steam overlay: Back+Start, Shift+Tab, or Steam API toggles overlay
+              (shift_tab || trt_steam_overlay_check_and_reset())) {
+            // Shift+Tab or the Steam API toggles the quick menu. Back+Start is
+            // reserved for exiting the game (above).
             if (!qm_was) {
               qm_was = true;
               g_quick_menu_open = !g_quick_menu_open;
@@ -3602,20 +4197,15 @@ struct tiramisu_host
             }
           } else {
             qm_was = false;
-            // hold Back+Start for 45 ticks to force-stop (escape hatch)
-            if (pad_vm) {
-              if (++vm_hold_ticks == 45) request_guest_stop();
-            } else {
-              vm_hold_ticks = 0;
-            }
           }
         } else {
-          vm_hold_ticks = 0;
+          back_start_was = false;
           longan::webxfer_poll_stop();
           if (guest_was_running) {
             trt_input_release_all();
             trt_input_reset_cursor_mode(false);
             g_mouse_mode = false;
+            g_guest_input_mode = longan::guest_input_mode::automatic;
             longan::webxfer_set_running_game("");
             const std::string gs = get_guest_status();
             if (!gs.empty() && gs != "idle") longan::ui_toast(u82ws(gs), 3.6f);
@@ -3755,14 +4345,15 @@ struct tiramisu_host
         } else if (!g_guest_running.load() && g_screen == longan::UI_SETTINGS) {
           // settings screen nav: up/down select (auto-repeat), LR edit + persist,
           // A toggle, Y reset defaults, B Home
-          if (step_up && g_set_selected > 0) {
-            --g_set_selected;
+          if (step_up || step_dn) {
+            g_set_selected = longan::ui_settings_step(step_up ? -1 : 1);
             longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
           }
-          if (step_dn && g_set_selected + 1 < g_set_count) {
-            ++g_set_selected;
+          if (want_x && !x_btn) {
+            g_set_selected = longan::ui_settings_next_section();
             longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
           }
+          x_btn = want_x;
           if (step_lt && edit_setting_row(-1)) apply_settings_rows();
           if (step_rt && edit_setting_row(1)) apply_settings_rows();
           if (want_go && !a_btn) {
@@ -3771,18 +4362,19 @@ struct tiramisu_host
           } else if (!want_go) a_btn = false;
           if (want_st && !y_btn) {
             y_btn = true;
-            reset_all_settings();
+            request_settings_reset();
           } else if (!want_st) y_btn = false;
           if (want_back && !b_btn) {
             b_btn = true;
             on_screen_enter(longan::UI_SHELF);
           } else if (!want_back) b_btn = false;
-          x_btn = false;
         } else if (!g_guest_running.load() && g_screen == longan::UI_STEAM) {
           // on-console Steam screen: up/down select title (auto-repeat), A download/play,
           // X refresh library, Y QR login, B Home
           if (step_up) longan::ui_steam_nav_up();
           if (step_dn) longan::ui_steam_nav_down();
+          if (step_lt) longan::ui_steam_cycle_filter(-1);
+          if (step_rt) longan::ui_steam_cycle_filter(1);
           const bool want_ref = want_x || (!km_lock && launcher_key('R'));
           if (want_ref && !x_btn) {
             x_btn = true;
@@ -3794,7 +4386,7 @@ struct tiramisu_host
           }
           if (want_go && !a_btn) {
             a_btn = true;
-            trigger_steam_item_action(longan::ui_steam_selected_index());
+            trigger_steam_item_action(longan::ui_steam_selected_app());
           } else if (!want_go) a_btn = false;
           if (want_st && !y_btn) {
             y_btn = true;
@@ -3816,25 +4408,24 @@ struct tiramisu_host
         // gamepad-as-mouse + virtual KBM (KBM games without a real mouse/KB)
         if (pad_ok && g_mouse_mode) {
           mm_was_active = true;
-          const int dz = 8000;
-          int sx = xs.Gamepad.sThumbRX;
-          int sy = -xs.Gamepad.sThumbRY;
-          sx = sx > dz ? sx - dz : sx < -dz ? sx + dz : 0;
-          sy = sy > dz ? sy - dz : sy < -dz ? sy + dz : 0;
-          const int ddx = (int)(sx / 32767.0f * 1400.0f / 60.0f);
-          const int ddy = (int)(sy / 32767.0f * 1400.0f / 60.0f);
-          int dw = 1920, dh = 1080;
-          trt_display_size(&dw, &dh);
-          if (dw <= 0) dw = 1920;
-          if (dh <= 0) dh = 1080;
-          mouse_vx += ddx;
-          mouse_vy += ddy;
-          if (mouse_vx < 0) mouse_vx = 0;
-          if (mouse_vx >= dw) mouse_vx = dw - 1;
-          if (mouse_vy < 0) mouse_vy = 0;
-          if (mouse_vy >= dh) mouse_vy = dh - 1;
-          trt_input_pointer_move(mouse_vx, mouse_vy, true);
-          if (ddx != 0 || ddy != 0) trt_input_mouse_delta_raw(ddx, ddy);
+          const auto pointer_settings = longan::settings_get();
+          const int deadzone = 32767 * pointer_settings.input_deadzone / 100;
+          const float dt = mm_last_motion_ms
+              ? std::min<ULONGLONG>(now_input_ms - mm_last_motion_ms, 50) * 0.001f
+              : 1.0f / 60.0f;
+          mm_last_motion_ms = now_input_ms;
+          const float speed = (0.25f + 0.015f * pointer_settings.mouse_speed) * 1400.0f;
+          const auto pointer_delta = [&](int stick, float& fraction) {
+            const int magnitude = std::max(0, std::abs(stick) - deadzone);
+            const float motion = speed * dt * magnitude / (32767 - deadzone);
+            fraction += stick < 0 ? -motion : motion;
+            const int pixels = static_cast<int>(fraction);
+            fraction -= pixels;
+            return pixels;
+          };
+          const int dx = pointer_delta(xs.Gamepad.sThumbRX, mm_px);
+          const int dy = pointer_delta(-static_cast<int>(xs.Gamepad.sThumbRY), mm_py);
+          if (dx || dy) trt_input_mouse_delta_raw(dx, dy);
 
           const bool rt = xs.Gamepad.bRightTrigger >
                           XINPUT_GAMEPAD_TRIGGER_THRESHOLD;
@@ -3870,18 +4461,22 @@ struct tiramisu_host
             if (k_shf != mm_was_ls) { trt_input_key_event(0xA0, k_shf); mm_was_ls = k_shf; }
             if (k_r != mm_was_dl) { trt_input_key_event('R', k_r); mm_was_dl = k_r; }
             if (k_f != mm_was_dr) { trt_input_key_event('F', k_f); mm_was_dr = k_f; }
-            if (b & XINPUT_GAMEPAD_DPAD_UP) {
-              if (mm_wheel_tick <= 0) { trt_input_wheel(120); mm_wheel_tick = 8; }
-              else --mm_wheel_tick;
-            } else if (b & XINPUT_GAMEPAD_DPAD_DOWN) {
-              if (mm_wheel_tick <= 0) { trt_input_wheel(-120); mm_wheel_tick = 8; }
-              else --mm_wheel_tick;
-            } else {
-              mm_wheel_tick = 0;
+            const int wheel_direction = ((b & XINPUT_GAMEPAD_DPAD_UP) != 0) -
+                                        ((b & XINPUT_GAMEPAD_DPAD_DOWN) != 0);
+            if (wheel_direction &&
+                (wheel_direction != mm_wheel_direction || now_input_ms >= mm_next_wheel_ms)) {
+              trt_input_wheel(120 * wheel_direction);
+              mm_next_wheel_ms = now_input_ms +
+                  static_cast<ULONGLONG>(std::clamp(280 - 2 * pointer_settings.wheel_speed, 80, 278));
             }
+            mm_wheel_direction = wheel_direction;
           }
         } else if (mm_was_active) {
           mm_was_active = false;
+          mm_wheel_direction = 0;
+          mm_next_wheel_ms = 0;
+          mm_last_motion_ms = 0;
+          mm_px = mm_py = 0.f;
           if (mm_was_rt) { trt_input_mouse_button(0, false); mm_was_rt = false; }
           if (mm_was_lt) { trt_input_mouse_button(1, false); mm_was_lt = false; }
           if (mm_was_rb) { trt_input_mouse_button(2, false); mm_was_rb = false; }
@@ -3902,6 +4497,7 @@ struct tiramisu_host
 
       // ---- launch handoff (web + pad) ----
       if (!g_guest_running.load()) {
+        if (poll_external_storage()) rescan_games();
         // Rescan debounce + scope (item 4): uploads request a rescan per
         // file, and a full rescan re-walks every root + drive on the UI
         // thread — the prime wedge suspect. Pending rescans coalesce and
@@ -3930,7 +4526,8 @@ struct tiramisu_host
             if (m_rescan_pending_full) {
               m_rescan_pending_full = false;
               m_rescan_pending_game.clear();
-              rescan_games_root_only();
+              poll_external_storage(true);
+              rescan_games();
             } else if (!m_rescan_pending_game.empty()) {
               const std::string game = m_rescan_pending_game;
               m_rescan_pending_game.clear();
@@ -3976,14 +4573,17 @@ struct tiramisu_host
             // fall back to the webxfer's own list so a web launch NEVER
             // drops silently
             char wexe[1024] = {};
-            if (longan::webxfer_find_game(want.c_str(), wexe, sizeof(wexe))) {
+            std::string wdir;
+            if (longan::webxfer_find_game(want.c_str(), wexe, sizeof(wexe), &wdir)) {
               std::string dir_rel = want;
               for (char& c : dir_rel) if (c == '/') c = '\\';
               game_entry fge;
               fge.name = want;
               fge.exe = wexe;
               fge.exes.push_back(wexe);
-              fge.dir = g_games_dir + std::string(1, '\\') + dir_rel;
+              fge.dir = wdir.empty()
+                  ? g_games_dir + std::string(1, static_cast<char>(92)) + dir_rel
+                  : wdir;
               fge.input_mode = "auto";
               char found_line[192];
               snprintf(found_line, sizeof(found_line),
@@ -4014,23 +4614,13 @@ struct tiramisu_host
                 }
               }
               set_guest_status("running " + ge.name + "…");
-              if (ge.input_mode == "pad2kbm" || ge.input_mode == "kbm") {
-                g_mouse_mode = true;
-              } else if (ge.input_mode == "controller") {
-                g_mouse_mode = false;
-              } else if (!g_host_mouse_present.load()) {
-                // Auto mode with no hardware pointer available: launch with the
-                // pad-driven cursor rather than a title that polls the mouse and
-                // never receives a single event.
-                g_mouse_mode = true;
-                g_auto_pad_mouse.store(true);
-                longan::log_line("input: auto input mode, no hardware pointer -> "
-                                 "pad-as-mouse ON for this launch");
-              }
+              g_guest_input_mode = longan::resolve_input_mode(
+                  longan::settings_get_global().default_input, ge.input_mode);
+              g_mouse_mode = g_guest_input_mode == longan::guest_input_mode::pad_as_mouse;
               trt_input_release_all();
-              // Keep the visible console cursor active for all games unless
-              // the guest explicitly pins it to a 1x1 mouselook trap.
-              trt_input_reset_cursor_mode(true);
+              poll_host_gamepads(nullptr, nullptr, true);
+              // Start visible. A guest can hide or lock its pointer for mouselook.
+              trt_input_reset_cursor_mode(false);
               longan::webxfer_set_running_game(want);
               longan::webxfer_set_launch_result(want, "started");
               longan::host_ap_on_result(want, "started");
@@ -4074,7 +4664,16 @@ struct tiramisu_host
                 snprintf(line, sizeof(line), "launch %s: rc=%s (%s)",
                          want.c_str(), trt_errstr(gr.map_rc), gr.detail);
                 longan::log_line(line);
-                set_guest_status(want + ": " + trt_errstr(gr.map_rc));
+                if (gr.map_rc == TRT_OK) {
+                  if (gr.detail[0]) {
+                    set_guest_status(want + ": " + std::string(gr.detail));
+                  } else {
+                    set_guest_status(want + ": Finished");
+                  }
+                } else {
+                  set_guest_status(want + ": " +
+                                   (gr.detail[0] ? gr.detail : trt_errstr(gr.map_rc)));
+                }
                 if (stack_charged)
                   trt_mem_budget_discharge_va(1024ull * 1024ull);
                 g_running_game_name.clear();
@@ -4250,6 +4849,125 @@ struct tiramisu_host
 
 } // namespace
 
+// Startup crash guard: top-level Vectored Exception Handler that captures any
+// fault before or during window/Direct3D initialization and writes a post-mortem
+// log into tiramisu_startup_crash.log in LocalState (or working dir).
+static LONG WINAPI startup_veh_filter(EXCEPTION_POINTERS* ep) {
+  if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+  const DWORD code = ep->ExceptionRecord->ExceptionCode;
+  if (code == STATUS_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2) {
+    const DWORD prior_error = ::GetLastError();
+    const bool resumed = trt_va_handle_deferred_data_fault(
+        ep->ExceptionRecord->ExceptionInformation[1],
+        static_cast<u32>(ep->ExceptionRecord->ExceptionInformation[0])) != 0;
+    ::SetLastError(prior_error);
+    if (resumed) return EXCEPTION_CONTINUE_EXECUTION;
+  }
+  if (code == 0x406D1388 /* SetThreadName */ ||
+      code == 0x000006BA /* RPC_S_SERVER_UNAVAILABLE */ ||
+      code == 0x000006BE /* RPC_S_CALL_FAILED */ ||
+      code == 0x80000003 /* STATUS_BREAKPOINT */) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+  if (code != STATUS_ACCESS_VIOLATION &&
+      code != STATUS_ILLEGAL_INSTRUCTION &&
+      code != STATUS_DATATYPE_MISALIGNMENT &&
+      code != STATUS_IN_PAGE_ERROR &&
+      code != STATUS_STACK_OVERFLOW) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+
+  // The unwind itself can fault if the stack is damaged. Avoid
+  // recursively entering the crash logger in that case.
+  static std::atomic_flag recording = ATOMIC_FLAG_INIT;
+  if (recording.test_and_set(std::memory_order_acquire))
+    return EXCEPTION_CONTINUE_SEARCH;
+
+  char buf[512];
+  if (code == 0xC000001Dul) {
+    snprintf(buf, sizeof(buf),
+             "FIRST CHANCE EXCEPTION: STATUS_ILLEGAL_INSTRUCTION (0xC000001D) at addr=%p\n",
+             ep->ExceptionRecord->ExceptionAddress);
+  } else {
+    snprintf(buf, sizeof(buf),
+             "FIRST CHANCE EXCEPTION: code=0x%08lx addr=%p\n",
+             (unsigned long)code, ep->ExceptionRecord->ExceptionAddress);
+  }
+
+  std::string crash_path = g_local_state.empty() ? "tiramisu_startup_crash.log"
+                                                 : (g_local_state + "\\tiramisu_startup_crash.log");
+  FILE* fp = fopen(crash_path.c_str(), "a");
+  if (fp) {
+    fputs(buf, fp);
+    if (ep->ContextRecord) {
+      char gprs[256];
+      snprintf(gprs, sizeof(gprs),
+               "GPRs: rip=%llx rsp=%llx rax=%llx rcx=%llx rdx=%llx\n",
+               (unsigned long long)ep->ContextRecord->Rip,
+               (unsigned long long)ep->ContextRecord->Rsp,
+               (unsigned long long)ep->ContextRecord->Rax,
+               (unsigned long long)ep->ContextRecord->Rcx,
+               (unsigned long long)ep->ContextRecord->Rdx);
+      fputs(gprs, fp);
+      fprintf(fp, "  THREAD: tid=%lu\n", (unsigned long)::GetCurrentThreadId());
+      if (::GetCurrentThreadId() == g_guest_tid) {
+        void* const active_tls = reinterpret_cast<void*>(__readgsqword(0x58));
+        void* const guest_tls = trt_guest_tls_array();
+        fprintf(fp, "  TLS: active=%p guest=%p\n", active_tls, guest_tls);
+      }
+
+      DWORD64 frames[12]{};
+      const int count = capture_fault_stack(ep->ContextRecord, frames, 12);
+      for (int i = 0; i < count; ++i) {
+        const auto pc = static_cast<uintptr_t>(frames[i]);
+        MEMORY_BASIC_INFORMATION page{};
+        ::VirtualQuery(reinterpret_cast<void*>(pc), &page, sizeof(page));
+        fprintf(fp, "  FRAME %d: pc=%p allocation=%p\n", i,
+                reinterpret_cast<void*>(pc), page.AllocationBase);
+      }
+
+      if (ep->ExceptionRecord->NumberParameters >= 2) {
+        char access[192];
+        snprintf(access, sizeof(access),
+                 "  EXCEPTION-ACCESS: operation=%llu target=0x%llx\n",
+                 (unsigned long long)ep->ExceptionRecord->ExceptionInformation[0],
+                 (unsigned long long)ep->ExceptionRecord->ExceptionInformation[1]);
+        fputs(access, fp);
+      }
+      // The exception callback runs on the faulting thread. Record its
+      // readable stack words so a post-mortem identifies the native caller,
+      // rather than only the ntdll faulting instruction and registers.
+      const uintptr_t sp = (uintptr_t)ep->ContextRecord->Rsp;
+      MEMORY_BASIC_INFORMATION mbi{};
+      if (::VirtualQuery((const void*)sp, &mbi, sizeof(mbi)) != 0 &&
+          mbi.State == MEM_COMMIT &&
+          !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+        const uintptr_t base = (uintptr_t)mbi.BaseAddress;
+        const uintptr_t end = base + mbi.RegionSize;
+        uintptr_t words[12]{};
+        if (sp >= base && sp <= end && sizeof(words) <= end - sp) {
+          memcpy(words, (const void*)sp, sizeof(words));
+          char stack[512];
+          snprintf(stack, sizeof(stack),
+                   "  STACK: rsp+00=%llx rsp+08=%llx rsp+10=%llx rsp+18=%llx rsp+20=%llx rsp+28=%llx rsp+30=%llx rsp+38=%llx rsp+40=%llx rsp+48=%llx rsp+50=%llx rsp+58=%llx\n",
+                   (unsigned long long)words[0], (unsigned long long)words[1],
+                   (unsigned long long)words[2], (unsigned long long)words[3],
+                   (unsigned long long)words[4], (unsigned long long)words[5],
+                   (unsigned long long)words[6], (unsigned long long)words[7],
+                   (unsigned long long)words[8], (unsigned long long)words[9],
+                   (unsigned long long)words[10], (unsigned long long)words[11]);
+          fputs(stack, fp);
+        }
+      }
+    }
+    fflush(fp);
+    fclose(fp);
+  }
+  longan::log_line(buf);
+  recording.clear(std::memory_order_release);
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
 // .211 DIAG: host-side unhandled-exception filter. The guest faults
 // are caught by guest_seh_filter (call_guest_seh), so anything
 // reaching here is a HOST crash (host thread, D3D/GameInput callback,
@@ -4257,10 +4975,17 @@ struct tiramisu_host
 // log_line flushes, so the line survives the kill. Returns
 // CONTINUE_SEARCH so the OS terminates normally after logging.
 static LONG WINAPI host_unhandled_filter(EXCEPTION_POINTERS* ep) {
+  if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+  checkpoint_outcome(longan::launch_outcome::host_fault, ep->ExceptionRecord->ExceptionCode);
   char line[256];
-  snprintf(line, sizeof(line), "HOST UNHANDLED: code=0x%08lx addr=%p",
-           (unsigned long)ep->ExceptionRecord->ExceptionCode,
-           ep->ExceptionRecord->ExceptionAddress);
+  if (ep->ExceptionRecord && ep->ExceptionRecord->ExceptionCode == 0xC000001Dul) {
+    snprintf(line, sizeof(line), "HOST UNHANDLED: STATUS_ILLEGAL_INSTRUCTION (0xC000001D) at addr=%p (unsupported opcode/AVX2 on Jaguar)",
+             ep->ExceptionRecord->ExceptionAddress);
+  } else {
+    snprintf(line, sizeof(line), "HOST UNHANDLED: code=0x%08lx addr=%p",
+             (unsigned long)ep->ExceptionRecord->ExceptionCode,
+             ep->ExceptionRecord->ExceptionAddress);
+  }
   longan::log_line(line);
   if (ep->ContextRecord) {
     const CONTEXT& c = *ep->ContextRecord;
@@ -4281,6 +5006,7 @@ static LONG WINAPI host_unhandled_filter(EXCEPTION_POINTERS* ep) {
 // process SIGABRT, and an unhandled C++ exception calls terminate(). These
 // log (flushed) so a silent death via any of those paths becomes visible.
 static void host_atexit_handler() {
+  checkpoint_outcome(longan::launch_outcome::host_exit, 0);
   longan::log_line("host: atexit (clean process exit via real CRT exit())");
 }
 static void host_terminate_handler() {
@@ -4288,16 +5014,36 @@ static void host_terminate_handler() {
   std::abort();
 }
 static void host_sigabrt_handler(int) {
+  checkpoint_outcome(longan::launch_outcome::host_abort, 3);
   longan::log_line("host: SIGABRT (abort() called via real CRT)");
   std::_Exit(3);
 }
 
 int __stdcall wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+  AddVectoredExceptionHandler(1, startup_veh_filter);
   SetUnhandledExceptionFilter(host_unhandled_filter);
   std::atexit(host_atexit_handler);
   std::set_terminate(host_terminate_handler);
   std::signal(SIGABRT, host_sigabrt_handler);
   init_apartment(apartment_type::multi_threaded);
+
+  // Early disk logging: open log immediately on entry before COM/DirectX initialization
+  const std::string install_early = package_install_path();
+  longan::log_open(install_early);
+
+  // Auto-detect Xbox console hardware generation early
+  const auto cons_info = longan::get_detected_console_info();
+  {
+    char cmsg[512];
+    snprintf(cmsg, sizeof(cmsg),
+             "console_detect: detected %s (%s, family=%s) | CPU: %s %d cores @ %.2f GHz (AVX2=%d) | GPU: %s (%.2f TF) | RAM: %d MB (Dev Mode budget %d MB) | ESRAM: %d MB",
+             cons_info.generation_name, cons_info.codename, cons_info.family_id,
+             cons_info.cpu_arch, cons_info.cpu_cores, cons_info.cpu_clock_ghz,
+             cons_info.has_avx2 ? 1 : 0, cons_info.gpu_arch, cons_info.gpu_tflops,
+             cons_info.total_ram_mb, cons_info.dev_mode_game_budget_mb,
+             cons_info.esram_size_mb);
+    longan::log_line(cmsg);
+  }
 
   // Console lifetime: the app is suspended when the player leaves it and
   // resumed when they come back. Release held inputs on both edges so a game

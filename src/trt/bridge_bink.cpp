@@ -121,5 +121,7 @@ extern "C" int trt_bridge_register_bink(void) {
                         (int)(sizeof(k_fns) / sizeof(k_fns[0])));
     trt_module_register("bink2w32.dll", TRT_ROUTE_BUILTIN, k_fns,
                         (int)(sizeof(k_fns) / sizeof(k_fns[0])));
+    trt_module_register("binkw32.dll", TRT_ROUTE_BUILTIN, k_fns,
+                        (int)(sizeof(k_fns) / sizeof(k_fns[0])));
     return 0;
 }

@@ -105,16 +105,18 @@ decode for the containers games actually ship.
 - **Acceptance**: `test_fmod` and `test_fmod_studio` assert non-zero PCM for
   an FSB5-FADPCM fixture and an MP3 fixture, not a named-silent log.
 
-### W3 — Wwise (zero coverage today)
+### W3 — Wwise (stub bridge; no bank decode)
 
-`grep -ri wwise src/trt` returns nothing. Wwise (Audiokinetic) is the audio
-middleware of a large share of AA/AAA PC titles; God of War's named gap is
-"audio validation", which is this wall.
+`src/trt/bridge_wwise.cpp` is a fallback stub: init, `RenderAudio`, and
+bank-load return `AK_Success`, but no bank is parsed and no samples are
+submitted. Wwise (Audiokinetic) is the audio middleware of a large share of
+AA/AAA PC titles; God of War's named gap is "audio validation", which is this
+wall. A game-shipped native `AkSoundEngine.dll` is preferred by the loader's
+native-override path; the stub is what runs when the title does not ship it.
 
-- **Path**: `AkSoundEngine.dll` is usually game-shipped, so the loader maps
-  it; what it needs from us is the Win32/COM surface it calls plus
-  `AkSoundEngine_*` real backends (`RenderAudio` → mixer). Start with the
-  init + render + bank-load path and name everything else.
+- **Path**: implement `AkSoundEngine_*` backends behind the existing bridge
+  (`RenderAudio` → mixer) and parse the bank/event graph. Start with the init +
+  render + bank-load path and name everything else.
 - **Acceptance**: a game shipping Wwise reaches "audio initialized, N banks
   loaded, samples submitted" in the log; silence is named, never faked.
 

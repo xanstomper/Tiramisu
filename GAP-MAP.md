@@ -24,6 +24,30 @@
 
 ## 1. Ground truth (measured 2026-11-14)
 
+### 2026-11-24 — Autonomous Universal Engine Synthesizer & Dynamic API Provisioning
+
+Transformed Tiramisu's engine synthesis and launch pipeline so clicking "Play" on a covered x64 Windows title on Xbox Series S/X autonomously inspects the binary, synthesizes the optimal engine profile, binds the covered APIs, provisions translation layers, and blanket-thunks unknown middleware DLLs without per-game bridge-registration hacks. This is generic provisioning, not universal compatibility; the boundaries below still apply:
+- **Autonomous Click-to-Play Runtime Provisioning (`src/trt/engine_synthesizer.cpp`, `.h`):** `trt_autonomous_provision_runtime` unconditionally provisions all graphics translation backends (Direct3D 11 passthrough, Direct3D 12 root-signature/descriptor bridge, Vulkan SPIR-V->HLSL translator, OpenGL GLSL->HLSL translator, Direct3D 9/8/DDraw -> D3D11 bridge), all audio middleware (XAudio2, FMOD Studio PCM decoder, Wwise AkSoundEngine, OpenAL 1.1, DirectSound, WASAPI, WinMM), video & storage middleware (Bink Video, CriWare, Miles, Oodle, DirectStorage), and controllers (GameInput, XInput, DirectInput, HID, WinRT, Steamworks).
+- **Universal Dynamic API Blanket & Thunk Synthesis (`src/trt/dynamic_api.cpp`, `pe_loader.cpp`, `x86_image.cpp`):** Every uncataloged module in the game's PE import and delay-import tables is automatically registered as `TRT_ROUTE_STUB`. In `pe_loader.cpp` (both PE64 and PE32) and `x86_image.cpp`, missing symbols generate adaptive machine-code thunks with deduced return values (pseudo-handles in `0x77000000` range, S_OK, TRUE, Windows 10 versions, memory basic info, display dimensions) instead of failing at load time with `TRT_ERR_IMPORT`.
+- **Universal COM Object Interface Dispatch (`src/trt/dynamic_api.cpp`):** `trt_dynamic_universal_com_object()` provides an `IUnknown` interface instance backed by a 256-method vtable following Microsoft x64 `TRT_GUEST_ABI` (`ms_abi`). `QueryInterface` returns `self` with `S_OK`, `AddRef` returns `2`, `Release` returns `1`, and all other method slots return `S_OK` (0) so virtual interface method calls never crash.
+- **OOM-Safe Bounded Memory PE Scanner (`src/trt/engine_synthesizer.cpp`):** Replaced unbounded whole-file allocations in `mapped_file::open` with adaptive bounded allocation (max 64 MB, gracefully dropping to 32MB/16MB if memory is tight), eliminating heap allocation crashes on 500MB+ game executables under Xbox UWP AppContainer memory constraints.
+- **Executable Target Redirection & Sibling Alignment (`src/host/main.cpp`):** If the synthesizer selects a shipping binary in a subdirectory (e.g., `Binaries\Win64\Game-Win64-Shipping.exe`), `run_game` redirects `exe_path`, `guest_exe`, `guest_cwd`, and `exe_dir` so sibling DLLs (`UnityPlayer.dll`, `GameAssembly.dll`, `fmod.dll`, `binkw64.dll`) are loaded directly by the guest image loader without path mismatches.
+- **Universal Save Directory Provisioning (`src/host/main.cpp`):** Automatically creates `AppData\LocalLow\<Game>`, `AppData\Local\<Game>`, `AppData\Roaming\<Game>`, `Saved Games\<Game>`, and `Documents\My Games\<Game>` for every title launched.
+- **Verification Gate (`tests/test_engine_synthesizer.cpp`):** 12 comprehensive test sections covering dynamic API arity/return deduction, machine-code thunk synthesis, honest NULL GetProcAddress contracts, engine signature profiling, PE import scanning, universal COM dispatch, middleware return heuristics, unknown module blanket provisioning, and single-file synthesis (`trt_synthesize_engine_for_file`). All 12 sections passed cleanly alongside `test_engine` and `test_kernel32b`.
+
+**Scope boundary (2026-11-24).** Generic provisioning does not make these work: ARM64 guests; Xbox GDK/GameOS packages; kernel anti-cheat (EasyAntiCheat/BattlEye) by contract; D3D12 real-game execution verified on hardware; Bink video, Wwise audio, and Miles audio; PE32 beyond the experimental x86-32 JIT; and title-specific archive/save/launcher quirks. Wwise, Bink, and Miles are classified `TRT_IMPL_NAMED_SILENT` in coverage, not `REAL`, unless a game-shipped native DLL overrides the fallback.
+
+### 2026-11-24 — Xbox One family detection/profiling scaffolding (offline-tested; no hardware proof)
+
+Detection and host-profile scaffolding landed for Original Xbox One (Durango), Xbox One S (Edmonton), and Xbox One X (Scorpio), alongside the existing Series S/X path. No One-family console has been used for verification:
+- **Hardware detection (`src/host/console_detect.h`, `.cpp`):** Best-effort identification via CPUID (AMD Jaguar Family 16h lacking AVX2 vs Zen 2 Family 17h/19h with AVX2), physical memory sizing (8 GB vs 12 GB vs 10 GB vs 16 GB), WinRT `EasClientDeviceInformation`, and a Device Portal tweak file. CPUID/RAM heuristics can misclassify a non-Xbox PC; this is not a hardware proof.
+- **Dynamic memory budget (`src/trt/bridge_membudget.cpp`, `trt.h`):** `trt_mem_budget_set_mb` lets the host apply a runtime budget and returns named `ERROR_COMMITMENT_LIMIT` (1455) to guest low-memory paths. The 5120 MB figure is a target, not a measured concession on each console.
+- **32 MB ESRAM budget ledger (`src/trt/bridge_esram.h`, `.cpp`):** Tracks candidate render targets/depth surfaces against a 32 MB budget for Durango and Edmonton and reports spillover. It is **accounting only**: UWP D3D11 does not expose explicit ESRAM allocation, so the driver still owns residency. It does not by itself accelerate a resource. Scorpio has no ESRAM ledger.
+- **Startup crash guard & early logging (`src/host/main.cpp`):** Vectored exception handler, pre-COM disk logging, D3D11 feature-level fallback, and GameInput-to-XInput fallback are implemented in code; their behavior on One-family OS builds is unverified.
+- **Tooling & offline gates (`tools/console_type.py`, `tests/py_tools/test_console_type.py`):** Alias resolution and Python unit tests for the added families.
+
+**Scope boundary (2026-11-24).** Do not describe One/One S/One X as supported or verified until boot, input, D3D11, memory headroom, and the ESRAM ledger are measured on each console. The existing hardware proof remains Series S.
+
 ### 2026-11-21 — corpus LOAD gaps closed (gdi32 stretch mode, shell32 icons, ktmw32)
 
 Corpus-smoke was failing three PEs with a named `FAIL IMPORT` gap. Each was a
@@ -741,8 +765,9 @@ would have caught today's fault.
 **Acceptance (UPDATED 2026-11-15):** ~~RACCOIN ladder prints `UNITYMAIN2
 CALLED` (fixed marker) + `PUMP ENTERED`~~ → **DONE: full ladder 7/7 REACHED
 (UNITYMAIN2 via naked-asm IAT probe, ehfix19), RACCOIN + Go Next demo.exe both
-boot 1/0, all repo gates green.** Remaining for "any game": x86-32 (PE32)
-loader + translator ladder.
+boot 1/0, all repo gates green.** Remaining for broader PC coverage: PE32
+hardening, ARM64, D3D12 hardware verification, and real Bink/Wwise/Miles decode
+(the generic loader/translator ladder is in place for the covered x64 path).
 
 ## W2 — measured bridge gaps (small; do alongside W1)
 

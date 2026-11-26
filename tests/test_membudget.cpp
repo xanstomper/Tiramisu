@@ -11,6 +11,8 @@
 // Runs ARGLESS: every surface is exercised host-side through the bridge
 // entry points (the same functions the guest IAT resolves to).
 #include "../src/trt/trt.h"
+#include "../src/trt/bridge_mem.h"
+#include <signal.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +22,8 @@
 #include <unistd.h>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <thread>
 
 extern "C" {
 int trt_bridge_register_kernel32(void);
@@ -39,11 +43,17 @@ int trt_mem_budget_charge_commit(u64 bytes);
 void trt_mem_budget_discharge_commit(u64 bytes);
 int trt_mem_budget_charge_map(u64 bytes);
 void trt_mem_budget_discharge_map(u64 bytes);
+int trt_mem_budget_charge_file_view(u64 bytes);
+void trt_mem_budget_discharge_file_view(u64 bytes);
+u64 trt_mem_budget_file_mapped(void);
 void trt_mem_budget_report(char* line, unsigned cap);
 
 // kernel32 surfaces under test
 void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot);
 int TRT_STDCALL trt_VirtualFree(void* addr, u64 bytes, u32 type);
+u64 TRT_STDCALL trt_VirtualQuery(const void*, void*, u64);
+int TRT_STDCALL trt_VirtualProtect(void*, u64, u32, u32*);
+int trt_dispatch_hw_fault(int, void*, void*);
 void* TRT_STDCALL trt_HeapCreate(u32 flags, u64 init, u64 max);
 void* TRT_STDCALL trt_HeapAlloc(void* heap, u32 flags, u64 bytes);
 int TRT_STDCALL trt_HeapFree(void* heap, u32 flags, void* p);
@@ -119,6 +129,23 @@ void mmap_free(void* base, size_t) {
       return;
     }
   }
+}
+
+void* mmap_reserve(size_t bytes, u64 preferred) {
+  void* base = mmap_alloc(bytes, preferred);
+  if (base && mmap_protect(base, bytes, 0) != 0) {
+    mmap_free(base, bytes);
+    return nullptr;
+  }
+  return base;
+}
+
+int mmap_decommit(void* base, size_t bytes) {
+  return madvise(base, bytes, MADV_DONTNEED) == 0 && mmap_protect(base, bytes, 0) == 0 ? 0 : 1;
+}
+
+void demand_commit_handler(int sig, siginfo_t* info, void* context) {
+  if (!trt_dispatch_hw_fault(sig, info, context)) _exit(90);
 }
 
 void boot_runtime(bool capture_log) {
@@ -353,6 +380,110 @@ int main(int argc, char** argv) {
   waitpid(pid, &wstatus, 0);
   const int rc = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : 1;
   CHECK(rc == 0, "small-budget integration probe passes (fresh process)");
+
+  // Reserve all the bytes before releasing them on separate threads. Each
+  // release owns a distinct reservation, so a balance left over is lost
+  // accounting rather than a missing allocation or a guest double-free.
+  constexpr unsigned workers = 6;
+  constexpr unsigned releases = 16000;
+  constexpr u64 page = 4096;
+  constexpr u64 total = workers * static_cast<u64>(releases) * page;
+  const u64 baseline_va = trt_mem_budget_reserved();
+  const bool maps_charged = trt_mem_budget_charge_map(total) == 0;
+  const bool files_charged = trt_mem_budget_charge_file_view(total) == 0;
+  CHECK(maps_charged && files_charged,
+        "reserve mapped commit and file-backed VA for concurrent release");
+  if (maps_charged && files_charged) {
+    std::atomic<unsigned> ready{0};
+    std::atomic<bool> release{false};
+    std::vector<std::thread> threads;
+    for (unsigned i = 0; i < workers; ++i) {
+      threads.emplace_back([&] {
+        ready.fetch_add(1);
+        while (!release.load()) std::this_thread::yield();
+        for (unsigned n = 0; n < releases; ++n) {
+          trt_mem_budget_discharge_map(page);
+          trt_mem_budget_discharge_file_view(page);
+        }
+      });
+    }
+    while (ready.load() != workers) std::this_thread::yield();
+    release.store(true);
+    for (auto& thread : threads) thread.join();
+    CHECK(trt_mem_budget_committed() == 0, "concurrent frees release every committed byte");
+    CHECK(trt_mem_budget_mapped() == 0, "concurrent unmaps release every mapped byte");
+    CHECK(trt_mem_budget_file_mapped() == 0 && trt_mem_budget_reserved() == baseline_va,
+          "concurrent unmaps release every file-backed reservation");
+  }
+
+  trt_mem_budget_set_mb(1024);
+  trt_mem_budget_report(rep, sizeof(rep));
+  CHECK(strstr(rep, "/1024 MB") != nullptr, "report uses the active console memory limit");
+
+  trt_set_vmem_hooks(mmap_reserve, mmap_protect, mmap_decommit);
+  trt_mem_budget_set_mb(64);
+  trt_va_enable_deferred_data(1);
+  const u64 before_arena = trt_mem_budget_committed();
+  const u64 before_arena_va = trt_mem_budget_reserved();
+  constexpr u64 arena_size = 256 * MB;
+  auto* arena = static_cast<u8*>(trt_VirtualAlloc(nullptr, arena_size, 0x101000u, 0x04u));
+  CHECK(arena && trt_mem_budget_committed() == before_arena &&
+            trt_mem_budget_reserved() == before_arena_va + arena_size,
+        "large anonymous data arena reserves VA without exhausting the commit budget");
+  if (arena) {
+    struct mbi {
+      u64 address, base;
+      u32 allocation_protect, partition;
+      u64 region_size;
+      u32 state, protection, type, padding;
+    } info{};
+    static_assert(sizeof(mbi) == 48);
+    CHECK(trt_VirtualQuery(arena, &info, sizeof(info)) == sizeof(info) &&
+              info.state == 0x1000u && info.protection == 0x04u &&
+              info.region_size == arena_size,
+          "VirtualQuery reports the logical committed extent");
+    CHECK(trt_VirtualAlloc(arena, arena_size, 0x1000u, 0x04u) == arena &&
+              trt_mem_budget_committed() == before_arena,
+          "recommitting a logically committed arena leaves physical backing deferred");
+    u32 unchanged_protect = 0;
+    CHECK(trt_VirtualProtect(arena, arena_size, 0x04u, &unchanged_protect) == 1 &&
+              unchanged_protect == 0x04u && trt_mem_budget_committed() == before_arena,
+          "an unchanged read/write protection leaves physical backing deferred");
+    struct sigaction handler{}, previous{};
+    handler.sa_sigaction = demand_commit_handler;
+    handler.sa_flags = SA_SIGINFO;
+    sigemptyset(&handler.sa_mask);
+    if (sigaction(SIGSEGV, &handler, &previous) != 0) {
+      CHECK(false, "install the first-touch test handler");
+    } else {
+      auto* data = static_cast<volatile u8*>(arena);
+      CHECK(data[128 * MB] == 0, "first-touch read materializes a zero-initialized page");
+      data[0] = 73;
+      CHECK(data[0] == 73 && trt_mem_budget_committed() == before_arena + 2 * 65536,
+            "touches charge only the two materialized chunks");
+      CHECK(trt_va_prepare_data_range(arena + 4 * MB, page) &&
+                trt_mem_budget_committed() == before_arena + 2 * 65536 + page,
+            "backend I/O can materialize its buffer without faulting");
+      u32 old_protection = 0;
+      CHECK(trt_VirtualProtect(arena + 5 * MB, page, 0x02u, &old_protection) &&
+                old_protection == 0x04u &&
+                trt_mem_budget_committed() == before_arena + 2 * 65536 + 2 * page,
+            "VirtualProtect materializes just its requested span and preserves the old protection");
+      CHECK(trt_VirtualFree(arena, 65536, 0x4000u) &&
+                trt_mem_budget_committed() == before_arena + 65536 + 2 * page,
+            "decommit releases backed bytes while keeping the reservation");
+      CHECK(trt_VirtualAlloc(arena, page, 0x1000u, 0x04u) == arena &&
+                data[0] == 0,
+            "explicit recommit returns zeroed bytes after decommit");
+      sigaction(SIGSEGV, &previous, nullptr);
+    }
+    CHECK(trt_VirtualFree(arena, 0, 0x8000u) &&
+              trt_mem_budget_committed() == before_arena &&
+              trt_mem_budget_reserved() == before_arena_va,
+          "release returns both memory ledgers to baseline");
+  }
+  trt_va_enable_deferred_data(0);
+  trt_set_vmem_hooks(nullptr, nullptr, nullptr);
 
   printf("RESULT: %s (%d failures)\n", failures ? "FAILURES" : "ALL PASS",
          failures);

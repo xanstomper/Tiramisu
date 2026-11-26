@@ -10,6 +10,7 @@
 // Phase 2); the entry point and TLS callbacks are collected, never called.
 #include "trt.h"
 #include "thunk.h"
+#include "dynamic_api.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -88,7 +89,7 @@ static std::atomic<u32> g_tls_epoch{1};
 static std::vector<tls_template> g_tls_templates;
 
 struct ThreadTlsState {
-  alignas(16) u8 teb[0x1900]{};
+  alignas(16) u8 teb[0x2000]{};
   void** slots = nullptr;
   size_t cap = 0;
   std::vector<void**> retired_arrays;
@@ -103,6 +104,8 @@ struct ThreadTlsState {
       slots = nullptr;
     }
     for (void** old : retired_arrays) free(old);
+    void** exp = *(void***)(teb + 0x1780);
+    if (exp) free(exp);
   }
 };
 
@@ -588,6 +591,7 @@ extern "C" const char* trt_errstr(int code) {
     case TRT_ERR_DELAY_IMPORT: return "DELAY_IMPORT (delay-load directory not processed in v0)";
     case TRT_ERR_MANAGED: return "MANAGED (.NET assembly: CLR header present, no .NET Framework CLR on console)";
     case TRT_ERR_MONO: return "MONO (Mono embedding failure; see trt_mono_last_error)";
+    case TRT_ERR_PE32_EXECUTION: return "PE32_EXECUTION (see interpreter diagnostics)";
     case TRT_ERR_FNA3D: return "FNA3D (FNA3D host-device handoff failure; see trt_fna3d_last_error)";
     default: return "UNKNOWN";
   }
@@ -840,6 +844,10 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
         }
         void* fn = rs->resolve(rs->user, mod_name, sym_name, ordinal);
         if (!fn) {
+          // Universal Dynamic API Blanket: synthesize fail-visible adaptive thunk
+          fn = trt_dynamic_synthesize_api(mod_name, sym_name, ordinal);
+        }
+        if (!fn) {
           char det[224];
           snprintf(det, sizeof(det), "%s!%s", mod_name,
                    sym_name ? sym_name : "#ordinal");
@@ -1005,6 +1013,10 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
           if (strnlen(sym_name, 256) == 256) break;
         }
         void* fn = rs->resolve(rs->user, mod_name, sym_name, ordinal);
+        if (!fn) {
+          // Dynamic API Blanket: synthesize intelligent adaptive thunk with deduced return value
+          fn = trt_dynamic_synthesize_api(mod_name, sym_name, ordinal);
+        }
         if (fn) {
           memcpy(img.base + iat_rva + t, &fn, 8);
           ++n_delay_bound;
@@ -1473,6 +1485,10 @@ extern "C" int trt_map_pe32(const trt_backend* be, const trt_resolver* rs,
           if (strnlen(sym_name, 256) == 256) break;
         }
         void* fn = rs->resolve(rs->user, mod_name, sym_name, ordinal);
+        if (!fn) {
+          // Dynamic API Blanket: synthesize intelligent adaptive thunk with deduced return value
+          fn = trt_dynamic_synthesize_api(mod_name, sym_name, ordinal);
+        }
         u32 slot = 0;
         int is_trap = 0;
         if (fn) {

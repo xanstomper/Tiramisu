@@ -5,8 +5,15 @@
 #if !defined(_WIN32) && !defined(_GNU_SOURCE)
 #  define _GNU_SOURCE
 #endif
+#if defined(_WIN32)
+#  include <intrin.h>
+#else
+#  include <pthread.h>
+#endif
 #include "iso.h"
+#include <algorithm>
 #include "trt.h"
+#include "pe.h"
 #include "thunk.h"
 #include "images.h"
 #include "apiset.h"
@@ -22,6 +29,8 @@
 extern "C" int trt_cs_size_for_guest(void);
 #include "bridge_winmm.h"
 #include "bridge_d3d9.h"
+
+
 #include "bridge_dsound.h"
 #include "bridge_ddraw.h"
 #include "bridge_d3dx9.h"
@@ -32,6 +41,8 @@ extern "C" int trt_cs_size_for_guest(void);
 // Linux-only syscalls: guarded so the UWP host build uses VirtualQuery.
 #ifdef __linux__
 #include <errno.h>
+#include <pthread.h>
+#include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #endif
@@ -39,6 +50,8 @@ extern "C" int trt_cs_size_for_guest(void);
 #include "bridge_ole.h"
 #include "bridge_shell.h"
 #include "bridge_shlwapi.h"
+#include "bridge_actctx.h"
+#include "bridge_version.h"
 #include "bridge_mmedia.h"
 #include "bridge_d3dx.h"
 #include "bridge_dinput.h"
@@ -114,11 +127,12 @@ extern "C" bool trt_settings_write_watch() __attribute__((weak));
 namespace {
 
 // ---- FLS (fiber-local storage; uncapped metadata + per-thread values) ----
+constexpr size_t k_max_fls_slots = 128;
 struct fls_meta { void* cb; bool used; };
 std::mutex g_fls_mu;
-std::vector<fls_meta> g_fls_meta;
+fls_meta g_fls_meta[k_max_fls_slots]{};
 std::atomic<u32> g_fls_epoch{1};
-thread_local std::vector<void*> t_fls_vals;
+thread_local void* t_fls_slots[k_max_fls_slots]{};
 thread_local u32 t_fls_epoch = 0;
 
 size_t wcslen16(const u16* s) { size_t n = 0; while (s && s[n]) ++n; return n; }
@@ -175,9 +189,37 @@ i64 now_qpc_ticks() {
   return (i64)ts.tv_sec * 1000000000ll + ts.tv_nsec;
 }
 
+// A continuation can repair memory without changing RIP. Permit retries while
+// bounding a stuck handler that resumes the identical fault in the same frame.
+struct fault_retry {
+  u64 pc, stack, address;
+  u32 code, access;
+  i64 last_tick;
+  unsigned count;
+};
+thread_local fault_retry t_fault_retry{};
+
+bool guest_fault_retry_exhausted(u64 pc, u64 stack, u64 address, u32 code, u32 access) {
+  constexpr i64 retry_interval_ns = 1000000000;
+  constexpr unsigned max_same_fault_retries = 8;
+  const i64 tick = now_qpc_ticks();
+  auto& prior = t_fault_retry;
+  if (prior.pc != pc || prior.stack != stack || prior.address != address ||
+      prior.code != code || prior.access != access || tick < prior.last_tick ||
+      tick - prior.last_tick > retry_interval_ns) {
+    prior = {pc, stack, address, code, access, tick, 1};
+    return false;
+  }
+  prior.last_tick = tick;
+  return ++prior.count > max_same_fault_retries;
+}
+
 } // namespace
 
 extern "C" {
+
+// Defined below; the registration tables are earlier in this unit.
+void TRT_STDCALL trt_GetCurrentThreadStackLimits(u64* low, u64* high);
 
 // ---- guest-visible kernel32 surface (v0) ----
 
@@ -254,12 +296,14 @@ int TRT_STDCALL trt_HeapFree(void* heap, u32 flags, void* p) {
 }
 
 // ---- VirtualAlloc / VirtualFree / VirtualQuery extent tracker (uncapped) ----
+enum class va_backing : u8 { eager, deferred, materialized };
 struct va_extent {
   uintptr_t start;
   size_t size;
   u32 state;  // 0x1000 MEM_COMMIT, 0x2000 MEM_RESERVE
   u32 prot;   // Win32 PAGE_*
   bool pending_rx;
+  va_backing backing = va_backing::eager;
 };
 struct va_region {
   uintptr_t base;
@@ -277,6 +321,8 @@ std::vector<va_extent> g_va_split_scratch;
 trt_vmem_reserve_fn g_vmem_reserve = nullptr;
 trt_vmem_commit_fn g_vmem_commit = nullptr;
 trt_vmem_decommit_fn g_vmem_decommit = nullptr;
+std::atomic<bool> g_va_defer_data{false};
+std::atomic<bool> g_va_has_deferred_data{false};
 
 unsigned va_prot_bits(u32 wp) {
   switch (wp & 0xFFu) {
@@ -307,10 +353,12 @@ extern "C" void trt_va_forget_all(void) {
   std::lock_guard<std::mutex> lk(g_va_mu);
   g_va.clear();
   g_extra_pending_rx.clear();
+  g_va_has_deferred_data.store(false);
 }
 
 void va_split_and_set_locked(va_region& r, uintptr_t s, uintptr_t e,
-                             int new_state, u32 new_prot, int pending_rx) {
+                             int new_state, u32 new_prot, int pending_rx,
+                             int backing = -1) {
   const uintptr_t rend = r.base + r.size;
   if (s < r.base) s = r.base;
   if (e > rend) e = rend;
@@ -328,7 +376,7 @@ void va_split_and_set_locked(va_region& r, uintptr_t s, uintptr_t e,
       continue;
     }
     if (ex.start < s) {
-      next.push_back({ex.start, s - ex.start, ex.state, ex.prot, ex.pending_rx});
+      next.push_back({ex.start, s - ex.start, ex.state, ex.prot, ex.pending_rx, ex.backing});
     }
     const uintptr_t ms = (ex.start > s) ? ex.start : s;
     const uintptr_t me = (ex_end < e) ? ex_end : e;
@@ -339,10 +387,11 @@ void va_split_and_set_locked(va_region& r, uintptr_t s, uintptr_t e,
           (new_state >= 0) ? (u32)new_state : ex.state,
           (new_prot != 0xFFFFFFFFu) ? (new_prot & 0xFFu) : ex.prot,
           (pending_rx >= 0) ? (pending_rx != 0) : ex.pending_rx,
+          backing >= 0 ? static_cast<va_backing>(backing) : ex.backing,
       });
     }
     if (ex_end > e) {
-      next.push_back({e, ex_end - e, ex.state, ex.prot, ex.pending_rx});
+      next.push_back({e, ex_end - e, ex.state, ex.prot, ex.pending_rx, ex.backing});
     }
   }
   r.extents.clear();
@@ -351,7 +400,7 @@ void va_split_and_set_locked(va_region& r, uintptr_t s, uintptr_t e,
     if (!r.extents.empty()) {
       va_extent& back = r.extents.back();
       if (back.start + back.size == x.start && back.state == x.state &&
-          back.prot == x.prot && back.pending_rx == x.pending_rx) {
+          back.prot == x.prot && back.pending_rx == x.pending_rx && back.backing == x.backing) {
         back.size += x.size;
         continue;
       }
@@ -361,9 +410,9 @@ void va_split_and_set_locked(va_region& r, uintptr_t s, uintptr_t e,
 }
 
 void va_record_add(uintptr_t base, size_t size, u32 alloc_prot, u32 cur_prot,
-                   u32 state, bool pending_rx) {
+                   u32 state, bool pending_rx, va_backing backing = va_backing::eager) {
   std::lock_guard<std::mutex> lk(g_va_mu);
-  va_extent ex{base, size, state, cur_prot & 0xFFu, pending_rx};
+  va_extent ex{base, size, state, cur_prot & 0xFFu, pending_rx, backing};
   size_t free_idx = (size_t)-1;
   for (size_t i = 0; i < g_va.size(); ++i) {
     if (g_va[i].base == base) {
@@ -411,13 +460,42 @@ size_t va_committed_in_locked(const va_region& r, uintptr_t s, uintptr_t e) {
   size_t n = 0;
   for (size_t i = 0; i < r.extents.size(); ++i) {
     const va_extent& ex = r.extents[i];
-    if (ex.state != 0x1000u) continue;  // MEM_COMMIT only
+    if (ex.state != 0x1000u || ex.backing == va_backing::deferred) continue;
     const uintptr_t os = ex.start > s ? ex.start : s;
     const uintptr_t oe =
         ex.start + ex.size < e ? ex.start + ex.size : e;
     if (os < oe) n += (size_t)(oe - os);
   }
   return n;
+}
+
+// Caller holds g_va_mu. The entire span must already be logically committed.
+bool va_has_deferred_readwrite_locked(const va_region& region, uintptr_t start,
+                                       uintptr_t end) {
+  if (start >= end || end > region.base + region.size) return false;
+  bool deferred = false;
+  for (const auto& extent : region.extents) {
+    const uintptr_t extent_end = extent.start + extent.size;
+    if (extent_end <= start) continue;
+    if (extent.start > start || extent.state != 0x1000u ||
+        extent.prot != 0x04u || extent.pending_rx) return false;
+    deferred |= extent.backing == va_backing::deferred;
+    if (extent_end >= end) return deferred;
+    start = extent_end;
+  }
+  return false;
+}
+
+extern "C" int trt_va_is_deferred_readwrite(const void* buffer, size_t size) {
+  if (!g_va_has_deferred_data.load() || !buffer || !size) return 0;
+  const uintptr_t raw = reinterpret_cast<uintptr_t>(buffer);
+  if (size > UINTPTR_MAX - raw || raw + size > UINTPTR_MAX - 4095) return 0;
+  const uintptr_t start = raw & ~uintptr_t(4095);
+  const uintptr_t end = (raw + size + 4095) & ~uintptr_t(4095);
+  std::lock_guard<std::mutex> lock(g_va_mu);
+  const int index = va_find_idx_locked(start);
+  return index >= 0 &&
+         va_has_deferred_readwrite_locked(g_va[static_cast<size_t>(index)], start, end);
 }
 
 extern "C" void trt_set_vmem_hooks(trt_vmem_reserve_fn reserve_fn,
@@ -427,6 +505,91 @@ extern "C" void trt_set_vmem_hooks(trt_vmem_reserve_fn reserve_fn,
   g_vmem_reserve = reserve_fn;
   g_vmem_commit = commit_fn;
   g_vmem_decommit = decommit_fn;
+}
+
+extern "C" void trt_va_enable_deferred_data(int enabled) {
+  g_va_defer_data.store(enabled != 0);
+}
+
+// The logical MEM_COMMIT state is already visible through VirtualQuery.
+// Charge RAM at the moment a physical data range is committed.
+bool va_materialize_locked(va_region& region, uintptr_t start, uintptr_t end) {
+  if (!g_vmem_commit || start >= end) return false;
+  try {
+    // Leave no allocation or reallocation after a successful host commit.
+    g_va_split_scratch.reserve(region.extents.size() + 2);
+    region.extents.reserve(region.extents.size() + 2);
+  } catch (...) {
+    set_err_for_current_thread(8);
+    return false;
+  }
+  const size_t size = end - start;
+  if (trt_mem_budget_charge_commit(size) != 0) return false;
+  if (g_vmem_commit(reinterpret_cast<void*>(start), size, TRT_PROT_R | TRT_PROT_W) != 0) {
+    trt_mem_budget_discharge_commit(size);
+    set_err_for_current_thread(8);
+    return false;
+  }
+  va_split_and_set_locked(region, start, end, -1, 0xFFFFFFFFu, -1,
+                          static_cast<int>(va_backing::materialized));
+  return true;
+}
+
+extern "C" int trt_va_handle_deferred_data_fault(u64 address, u32 access) {
+  if (!g_va_defer_data.load() || !g_va_has_deferred_data.load() || access > 1)
+    return 0;  // Never enable execute.
+  thread_local uintptr_t last_racing_page = 0;
+  const uintptr_t page = static_cast<uintptr_t>(address) & ~uintptr_t(4095);
+  std::lock_guard<std::mutex> lock(g_va_mu);
+  const int index = va_find_idx_locked(page);
+  if (index < 0) return 0;
+  auto& region = g_va[static_cast<size_t>(index)];
+  const auto* extent = va_find_extent_locked(region, page);
+  if (!extent || extent->state != 0x1000u || extent->prot != 0x04u) return 0;
+  if (extent->backing == va_backing::materialized) {
+    // A second thread can fault before the first thread finishes committing.
+    // Retry that page once, then let a real fault reach the guest handler.
+    if (last_racing_page == page) return 0;
+    last_racing_page = page;
+    return 1;
+  }
+  if (extent->backing != va_backing::deferred) return 0;
+
+  const u32 prior_error = err_for_current_thread();
+  constexpr uintptr_t chunk = 65536;
+  const uintptr_t chunk_start = page & ~(chunk - 1);
+  const uintptr_t start = std::max(chunk_start, extent->start);
+  const uintptr_t end = std::min(chunk_start + chunk, extent->start + extent->size);
+  if (!va_materialize_locked(region, start, end) &&
+      ((start == page && end == page + 4096) ||
+       !va_materialize_locked(region, page, page + 4096))) return 0;
+  set_err_for_current_thread(prior_error);
+  last_racing_page = page;
+  return 1;
+}
+
+// A host operation may pass the buffer to the kernel, which cannot deliver
+// a first-touch exception back to the application. Materialize its span.
+extern "C" int trt_va_prepare_data_range(const void* buffer, size_t size) {
+  if (!g_va_defer_data.load() || !g_va_has_deferred_data.load() || !buffer || !size)
+    return 1;
+  const uintptr_t raw = reinterpret_cast<uintptr_t>(buffer);
+  if (size > UINTPTR_MAX - raw || raw + size > UINTPTR_MAX - 4095) return 0;
+  uintptr_t start = raw & ~uintptr_t(4095);
+  const uintptr_t end = (raw + size + 4095) & ~uintptr_t(4095);
+  std::lock_guard<std::mutex> lock(g_va_mu);
+  const int index = va_find_idx_locked(start);
+  if (index < 0) return 1;
+  auto& region = g_va[static_cast<size_t>(index)];
+  while (start < end && start < region.base + region.size) {
+    const auto* extent = va_find_extent_locked(region, start);
+    if (!extent) break;
+    const uintptr_t next = std::min(end, extent->start + extent->size);
+    if (extent->backing == va_backing::deferred &&
+        !va_materialize_locked(region, start, next)) return 0;
+    start = next;
+  }
+  return 1;
 }
 
 extern "C" void trt_va_notify_protect(void* base, size_t size, u32 win32_prot,
@@ -705,6 +868,7 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
   // MEM_WRITE_WATCH is a REQUEST modifier, not an allocation type: real
   // Windows accepts it silently alongside MEM_RESERVE|COMMIT (bdwgc probes
   // with exactly this combination). Rejecting it fails the whole GC probe.
+  const bool write_watch = (type & 0x00200000u) != 0;
   type &= ~0x00200000u;
   if (!(type & 0x3000u)) {
     set_err_for_current_thread(87);  // INVALID_PARAMETER
@@ -765,7 +929,11 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
       if (idx >= 0) {
         const va_region& r = g_va[(size_t)idx];
         ok = (sz <= r.size && (page - r.base) <= r.size - sz);
-        if (ok) fresh = sz - va_committed_in_locked(r, page, page + sz);
+        if (ok) {
+          if (prot == 0x04u && va_has_deferred_readwrite_locked(r, page, page + sz))
+            return reinterpret_cast<void*>(page);
+          fresh = sz - va_committed_in_locked(r, page, page + sz);
+        }
       }
     }
     if (!ok) {
@@ -814,7 +982,8 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
         if (still_fresh < fresh)
           trt_mem_budget_discharge_commit((u64)(fresh - still_fresh));
         va_split_and_set_locked(g_va[(size_t)idx], page, page + sz, 0x1000,
-                                eff_prot, pending_rx ? 1 : 0);
+                                eff_prot, pending_rx ? 1 : 0,
+                                static_cast<int>(va_backing::eager));
       } else {
         // region vanished mid-commit (released by another thread): the
         // host commit is orphaned — discharge the whole charge
@@ -824,14 +993,22 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
     return (void*)page;
   }
 
+  if (bytes > SIZE_MAX - 4095ULL) {
+    set_err_for_current_thread(8);
+    return nullptr;
+  }
   const size_t sz = (size_t)(bytes ? ((bytes + 4095ULL) & ~4095ULL) : 4096ULL);
   const bool want_commit = (type & 0x1000u) != 0;
-  if (!want_commit) {
-    trt_vmem_reserve_fn rfn = nullptr;
-    {
-      std::lock_guard<std::mutex> lk(g_va_mu);
-      rfn = g_vmem_reserve;
-    }
+  bool defer_data = g_va_defer_data.load() && want_commit && !addr && !write_watch &&
+      prot == 0x04u && (type & ~0x00103000u) == 0 && sz >= 128ULL * 1024 * 1024;
+  trt_vmem_reserve_fn rfn = nullptr;
+  if (!want_commit || defer_data) {
+    std::lock_guard<std::mutex> lk(g_va_mu);
+    rfn = g_vmem_reserve;
+    // A backend without split reserve/commit still uses eager commit.
+    defer_data = defer_data && rfn && g_vmem_commit && g_vmem_decommit;
+  }
+  if (!want_commit || defer_data) {
     // reserve-only: no commit, but the VA is consumed — charge the VA
     // ledger (a reservation that never commits still exhausts address
     // space, and the old code charged nothing at all here)
@@ -850,7 +1027,16 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
     if (!rfn && g_be.protect && (pclean == 0x01u || (pclean & 0xF0u))) {
       g_be.protect(p, sz, 0);
     }
-    va_record_add((uintptr_t)p, sz, pclean, pclean, 0x2000u, false);
+    try {
+      va_record_add((uintptr_t)p, sz, pclean, pclean, defer_data ? 0x1000u : 0x2000u,
+                    false, defer_data ? va_backing::deferred : va_backing::eager);
+      if (defer_data) g_va_has_deferred_data.store(true);
+    } catch (...) {
+      g_be.release(p, sz);
+      trt_mem_budget_discharge_va(sz);
+      set_err_for_current_thread(8);
+      return nullptr;
+    }
     return p;
   }
 
@@ -935,7 +1121,8 @@ int TRT_STDCALL trt_VirtualFree(void* addr, u64 bytes, u32 type) {
         }
         if (s < e) {
           committed_here = va_committed_in_locked(r, s, e);
-          va_split_and_set_locked(r, s, e, 0x2000, 0x01u, 0);
+          va_split_and_set_locked(r, s, e, 0x2000, 0x01u, 0,
+                                  static_cast<int>(va_backing::eager));
         }
       }
     }
@@ -959,7 +1146,8 @@ int TRT_STDCALL trt_VirtualFree(void* addr, u64 bytes, u32 type) {
     if (idx >= 0 && g_va[(size_t)idx].base == (uintptr_t)addr) {
       if (!r_size) r_size = g_va[(size_t)idx].size;
       for (const va_extent& ex : g_va[(size_t)idx].extents) {
-        if (ex.state == 0x1000u) release_committed += (u64)ex.size;
+        if (ex.state == 0x1000u && ex.backing != va_backing::deferred)
+          release_committed += (u64)ex.size;
       }
       release_va = (u64)g_va[(size_t)idx].size;  // the whole reservation goes
       g_va[(size_t)idx].base = 0;
@@ -991,7 +1179,7 @@ u64 TRT_STDCALL trt_VirtualQuery(const void* addr, void* mbi_out, u64 len) {
     return 0;
   }
   const uintptr_t a = (uintptr_t)addr;
-  if (a >= 0x7FFFFFFF0000ULL) {
+  if (a > 0x7FFFFFFFFFFFULL) {
     set_err_for_current_thread(87);
     return 0;
   }
@@ -1012,6 +1200,14 @@ u64 TRT_STDCALL trt_VirtualQuery(const void* addr, void* mbi_out, u64 len) {
         r_base = r.base;
         r_alloc_prot = r.alloc_prot;
         hit = *ex;
+        const size_t index = static_cast<size_t>(ex - r.extents.data());
+        // Hide host materialization splits when guest state/protection agree.
+        for (size_t i = index + 1; i < r.extents.size(); ++i) {
+          const auto& next = r.extents[i];
+          if (next.start != hit.start + hit.size || next.state != hit.state ||
+              next.prot != hit.prot) break;
+          hit.size += next.size;
+        }
         found = true;
       }
     }
@@ -1037,10 +1233,37 @@ u64 TRT_STDCALL trt_VirtualQuery(const void* addr, void* mbi_out, u64 len) {
       m->BaseAddress = (u64)page;
       m->AllocationBase = (u64)b;
       m->AllocationProtect = 0x20u;  // PAGE_EXECUTE_READ
-      m->RegionSize = (u64)(e - page);
-      m->State = 0x1000u;            // MEM_COMMIT
-      m->Protect = (page == b) ? 0x02u : 0x20u;
       m->Type = 0x1000000u;          // MEM_IMAGE
+      m->State = 0x1000u;            // MEM_COMMIT
+      u32 prot = (page == b) ? 0x02u : 0x20u;
+      u64 reg_end = (u64)e;
+      const trt_dos_header* dos = (const trt_dos_header*)img->base;
+      if (dos->e_magic == 0x5A4D && dos->e_lfanew > 0 && (u64)dos->e_lfanew < img->size_of_image) {
+        const trt_nt_headers64* nt = (const trt_nt_headers64*)(img->base + dos->e_lfanew);
+        if (nt->signature == 0x00004550) {
+          const u32 rva = (u32)(a - b);
+          const u16 nsec = nt->file_header.number_of_sections;
+          const trt_section_header* secs =
+              (const trt_section_header*)((const u8*)&nt->optional_header +
+                                         nt->file_header.size_of_optional_header);
+          for (u16 s = 0; s < nsec; ++s) {
+            const u32 sva = secs[s].virtual_address;
+            const u32 ssz = secs[s].virtual_size ? secs[s].virtual_size : secs[s].size_of_raw_data;
+            const u32 salign = (ssz + 4095) & ~4095;
+            if (rva >= sva && rva < sva + salign) {
+              const u32 ch = secs[s].characteristics;
+              if ((ch & 0x20000000) && (ch & 0x80000000)) prot = 0x40;  // PAGE_EXECUTE_READWRITE
+              else if (ch & 0x20000000) prot = 0x20;                   // PAGE_EXECUTE_READ
+              else if (ch & 0x80000000) prot = 0x04;                   // PAGE_READWRITE
+              else prot = 0x02;                                        // PAGE_READONLY
+              reg_end = (u64)(b + sva + salign);
+              break;
+            }
+          }
+        }
+      }
+      m->RegionSize = (reg_end > page) ? (reg_end - page) : 4096;
+      m->Protect = prot;
       return sizeof(mbi64);
     }
   }
@@ -1049,20 +1272,41 @@ u64 TRT_STDCALL trt_VirtualQuery(const void* addr, void* mbi_out, u64 len) {
   const SIZE_T nr =
       ::VirtualQuery(addr, (PMEMORY_BASIC_INFORMATION)mbi_out, (SIZE_T)len);
   if (nr) return (u64)nr;
-#endif
+#else
+  void* sb = nullptr;
+  size_t ss = 0;
+  pthread_attr_t attr;
+  if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+    if (pthread_attr_getstack(&attr, &sb, &ss) == 0 && sb && ss) {
+      const uintptr_t stack_low = (uintptr_t)sb;
+      const uintptr_t stack_high = (uintptr_t)sb + (uintptr_t)ss;
+      if (a >= stack_low && a < stack_high) {
+        m->BaseAddress = (u64)page;
+        m->AllocationBase = (u64)stack_low;
+        m->AllocationProtect = 0x04u;  // PAGE_READWRITE
+        m->RegionSize = (u64)(stack_high - page);
+        m->State = 0x1000u;            // MEM_COMMIT
+        m->Protect = 0x04u;            // PAGE_READWRITE
+        m->Type = 0x20000u;            // MEM_PRIVATE
+        pthread_attr_destroy(&attr);
+        return sizeof(mbi64);
+      }
+    }
+    pthread_attr_destroy(&attr);
+  }
 
-  int stack_probe = 0;
-  const intptr_t diff = (intptr_t)a - (intptr_t)&stack_probe;
-  if (diff > -8388608 && diff < 8388608) {
+  unsigned char mincore_vec = 0;
+  if (mincore((void*)page, 4096, &mincore_vec) == 0) {
     m->BaseAddress = (u64)page;
     m->AllocationBase = (u64)page;
     m->AllocationProtect = 0x04u;
-    m->RegionSize = 0x10000u;
-    m->State = 0x1000u;
-    m->Protect = 0x04u;
-    m->Type = 0x20000u;
+    m->RegionSize = 4096;
+    m->State = 0x1000u;      // MEM_COMMIT
+    m->Protect = 0x04u;      // PAGE_READWRITE
+    m->Type = 0x20000u;      // MEM_PRIVATE
     return sizeof(mbi64);
   }
+#endif
 
   m->BaseAddress = (u64)page;
   m->RegionSize = 0x10000u;
@@ -1186,19 +1430,92 @@ int TRT_STDCALL trt_QueryPerformanceFrequency(i64* out) {
   return 1;
 }
 
+#if defined(_WIN32)
+#include <intrin.h>
+#endif
+
+static bool host_supports_avx2() {
+  static int cached = -1;
+  if (cached != -1) return cached == 1;
+#if defined(__x86_64__) || defined(_M_X64)
+  int info[4] = {0};
+#if defined(_WIN32)
+  __cpuidex(info, 7, 0);
+#elif defined(__GNUC__) || defined(__clang__)
+  __asm__ __volatile__("cpuid"
+                       : "=a"(info[0]), "=b"(info[1]), "=c"(info[2]), "=d"(info[3])
+                       : "a"(7), "c"(0));
+#endif
+  cached = (info[1] & (1 << 5)) ? 1 : 0;
+#else
+  cached = 0;
+#endif
+  return cached == 1;
+}
+
+static bool host_supports_bmi2() {
+  static int cached = -1;
+  if (cached != -1) return cached == 1;
+#if defined(__x86_64__) || defined(_M_X64)
+  int info[4] = {0};
+#if defined(_WIN32)
+  __cpuidex(info, 7, 0);
+#elif defined(__GNUC__) || defined(__clang__)
+  __asm__ __volatile__("cpuid"
+                       : "=a"(info[0]), "=b"(info[1]), "=c"(info[2]), "=d"(info[3])
+                       : "a"(7), "c"(0));
+#endif
+  cached = (info[1] & (1 << 8)) ? 1 : 0;
+#else
+  cached = 0;
+#endif
+  return cached == 1;
+}
+
 u32 TRT_STDCALL trt_IsProcessorFeaturePresent(u32 feature) {
-  // x64 baseline: SSE/SSE2/SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT/NX present.
+  // x64 baseline: SSE/SSE2/SSE3/SSSE3/SSE4.1/SSE4.2/CMPXCHG16B/POPCNT/AVX present.
   // STAGE 7 (OrTMM): 0x17 = PF_FASTFAIL_AVAILABLE — MSVC 2019+ CRT startup
   // queries it before __security_init; returning 0 sends _set_Fflag to
   // __fastfail(FAST_FAIL_FATAL_APP_EXIT) and the EXE dies at CRT-STARTUP
   // with int 0x29 (measured: OrTMM.exe SIGSEGV/UD at image+0xd1d4, the
   // `int $0x29` guarding call IsProcessorFeaturePresent(0x17)).
-  // 0x17=PF_FASTFAIL_AVAILABLE, 0x14=PF_ARM_V8... (unused); also name the
-  // common x64 extras real CRTs ask about.
+  // AMD Jaguar (Xbox One, One S, One X) has SSE3, CMPXCHG16B, SSSE3, SSE4.1,
+  // SSE4.2, and split-128 AVX, but lacks AVX2 and BMI2. Zen 2 (Series S/X) has AVX2 & BMI2.
   switch (feature) {
-    case 0: case 1: case 6: case 7: case 8: case 9: case 10:
-    case 0x14: case 0x17: case 0x18:  // 0x17=PF_FASTFAIL_AVAILABLE
+    case 0:   // PF_FLOATING_POINT_PRECISION_ERRATA
       return 1;
+    case 1:   // PF_FLOATING_POINT_EMULATED
+      return 0;
+    case 2:   // PF_COMPARE_EXCHANGE_DOUBLE (CMPXCHG8B)
+    case 3:   // PF_MMX_INSTRUCTIONS_AVAILABLE
+    case 6:   // PF_XMMI_INSTRUCTIONS_AVAILABLE (SSE)
+    case 7:   // PF_3DNOW_INSTRUCTIONS_AVAILABLE
+    case 8:   // PF_RDTSC_INSTRUCTION_AVAILABLE
+    case 9:   // PF_PAE_ENABLED
+    case 10:  // PF_XMMI64_INSTRUCTIONS_AVAILABLE (SSE2)
+    case 12:  // PF_NX_ENABLED
+    case 13:  // PF_SSE3_INSTRUCTIONS_AVAILABLE
+    case 14:  // PF_COMPARE_EXCHANGE128 (CMPXCHG16B)
+    case 15:  // PF_COMPARE64_EXCHANGE128
+    case 17:  // PF_XSAVE_ENABLED
+    case 20:  // PF_SECOND_LEVEL_ADDRESS_TRANSLATION
+    case 22:  // PF_RDWRFSGSBASE_AVAILABLE
+    case 23:  // PF_FASTFAIL_AVAILABLE (0x17)
+    case 24:  // PF_ARM_DIVIDE_INSTRUCTION_AVAILABLE
+    case 32:  // PF_RDTSCP_INSTRUCTION_AVAILABLE
+    case 36:  // PF_SSSE3_INSTRUCTIONS_AVAILABLE
+    case 37:  // PF_SSE4_1_INSTRUCTIONS_AVAILABLE
+    case 38:  // PF_SSE4_2_INSTRUCTIONS_AVAILABLE
+    case 39:  // PF_AVX_INSTRUCTIONS_AVAILABLE (AMD Jaguar supports 128-bit AVX)
+      return 1;
+    case 40:  // PF_AVX2_INSTRUCTIONS_AVAILABLE
+      // Jaguar (Xbox One / One S / One X) lacks AVX2; Zen 2 (Series S/X) has AVX2.
+      return host_supports_avx2() ? 1 : 0;
+    case 41:  // PF_AVX512F_INSTRUCTIONS_AVAILABLE
+      return 0;
+    case 60:  // PF_BMI2_INSTRUCTIONS_AVAILABLE
+      // Jaguar lacks BMI2; Zen 2 has BMI2.
+      return host_supports_bmi2() ? 1 : 0;
     default:
       return 0;
   }
@@ -1344,16 +1661,28 @@ int TRT_STDCALL trt_WaitOnAddress(volatile void* addr, void* cmp,
         default:
           break;
       }
-      char line[192];
+      u64 cmp_v = 0;
+      switch (size) {
+        case 1: cmp_v = *(u8*)cmp; break;
+        case 2: cmp_v = *(u16*)cmp; break;
+        case 4: cmp_v = *(u32*)cmp; break;
+        case 8: cmp_v = *(u64*)cmp; break;
+        default: break;
+      }
+      char line[224];
       snprintf(line, sizeof(line),
                "kernel32: WaitOnAddress #%llu tid=%u addr=0x%llx size=%u "
-               "ms=%u cur=0x%llx",
+               "ms=%u cur=0x%llx cmp=0x%llx caller=%p",
                (unsigned long long)wa_n + 1, trt_GetCurrentThreadId(),
                (unsigned long long)(uintptr_t)addr, size, ms,
-               (unsigned long long)cur);
+               (unsigned long long)cur, (unsigned long long)cmp_v,
+               __builtin_return_address(0));
       trt_core_log(line);
     }
-    if ((wa_n + 1) % 1000 == 0) {
+    // A retry loop can call this millions of times per second; a summary
+    // every 1000 waits turns the ring itself into the bottleneck (and the
+    // log into gigabytes). One line per million keeps the wedge visible.
+    if ((wa_n + 1) % 1000000 == 0) {
       char line[256];
       snprintf(line, sizeof(line),
                "kernel32: wa: waits=%llu wake_single=%llu wake_all=%llu "
@@ -1618,6 +1947,8 @@ void trt_bridge_boot(const trt_backend* be) {
   trt_bridge_register_shell();
   // shlwapi: Path* string/file helpers
   trt_bridge_register_shlwapi();
+  trt_bridge_register_actctx();
+  trt_bridge_register_version();
   // msacm32/msvfw32/winspool: codec + printer boot probes (M6 coverage)
   trt_bridge_register_mmedia();
   // d3dx10/11: texture/shader helpers for the D3D10/11 generation (M7)
@@ -1665,10 +1996,10 @@ void trt_bridge_boot(const trt_backend* be) {
   t_last_error_epoch = g_err_epoch.load(std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lk(g_fls_mu);
-    g_fls_meta.clear();
+    memset(g_fls_meta, 0, sizeof(g_fls_meta));
   }
   g_fls_epoch.fetch_add(1, std::memory_order_release);
-  t_fls_vals.clear();
+  memset(t_fls_slots, 0, sizeof(t_fls_slots));
 }
 
 // ================= files on the VFS (the game-transfer path) ================
@@ -1715,8 +2046,7 @@ int file_release_locked(u32 idx) {
   if (g_files[idx].mode == 'd') ::CloseHandle((HANDLE)g_files[idx].os);
   else fclose((FILE*)g_files[idx].os);
 #else
-  if (g_files[idx].mode == 'd') (void)0;
-  else fclose((FILE*)g_files[idx].os);
+  fclose((FILE*)g_files[idx].os);
 #endif
   g_files[idx].os = nullptr;
   g_files[idx].refs = 0;
@@ -1741,6 +2071,16 @@ extern "C" const char* trt_file_vpath(void* h) {
   std::lock_guard<std::mutex> lk(g_files_mu);
   file_rec* r = file_at_locked(h);
   return r ? r->vpath : nullptr;
+}
+
+extern "C" int trt_file_copy_vpath(void* handle, char* path, size_t capacity) {
+  std::lock_guard<std::mutex> lock(g_files_mu);
+  const file_rec* record = file_at_locked(handle);
+  if (!record || !record->vpath[0]) return 0;
+  const size_t length = strlen(record->vpath);
+  if (length >= capacity) return 0;
+  memcpy(path, record->vpath, length + 1);
+  return 1;
 }
 
 char g_cwd[512] = "C:\\";   // guest cwd
@@ -1887,6 +2227,50 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
     err_ref_for_current_thread() = 3; // PATH_NOT_FOUND
     return (void*)(uintptr_t)-1;
   }
+  int is_directory = 0;
+  if (disp == 3 && trt_vfs_stat(host, &is_directory, nullptr) == 0 && is_directory) {
+    if (!(flags & 0x02000000u /*FILE_FLAG_BACKUP_SEMANTICS*/)) {
+      err_ref_for_current_thread() = 5;  // ERROR_ACCESS_DENIED
+      return (void*)(uintptr_t)-1;
+    }
+    FILE* directory = nullptr;
+#ifdef _WIN32
+    wchar_t wide[1024];
+    if (::MultiByteToWideChar(CP_UTF8, 0, host, -1, wide, 1024) <= 0) {
+      err_ref_for_current_thread() = 3;  // ERROR_PATH_NOT_FOUND
+      return (void*)(uintptr_t)-1;
+    }
+    CREATEFILE2_EXTENDED_PARAMETERS parameters = {};
+    parameters.dwSize = sizeof(parameters);
+    parameters.dwFileFlags = 0x02000000u;  // FILE_FLAG_BACKUP_SEMANTICS
+    const HANDLE native = ::CreateFile2(wide, access, share, 3, &parameters);
+    if (native == INVALID_HANDLE_VALUE) {
+      err_ref_for_current_thread() = ::GetLastError();
+      return (void*)(uintptr_t)-1;
+    }
+    directory = reinterpret_cast<FILE*>(native);
+#else
+    directory = fopen(host, "rb");
+    if (!directory) {
+      err_ref_for_current_thread() = errno == EACCES ? 5 : 3;
+      return (void*)(uintptr_t)-1;
+    }
+#endif
+    char vpath[512];
+    build_guest_vpath(name, vpath, sizeof(vpath));
+    void* handle = file_alloc(directory, 'd', vpath);
+    if (handle == (void*)(uintptr_t)-1) {
+#ifdef _WIN32
+      ::CloseHandle(reinterpret_cast<HANDLE>(directory));
+#else
+      fclose(directory);
+#endif
+      err_ref_for_current_thread() = 8;  // ERROR_NOT_ENOUGH_MEMORY
+      return handle;
+    }
+    err_ref_for_current_thread() = 0;
+    return handle;
+  }
   if (disp == 1 /*CREATE_NEW*/) {
     char check[1024];
     if (trt_vfs_resolve_utf16_rw(name, 0, check, sizeof(check)) == 0 &&
@@ -1921,7 +2305,13 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
     }
   }
   FILE* os = nullptr;
-  if (disp == 1 || disp == 2) {
+  if (disp == 1) {
+    os = fopen(host, "w+bx");
+    if (!os && errno == EEXIST) {
+      err_ref_for_current_thread() = 80;  // ERROR_FILE_EXISTS
+      return (void*)(uintptr_t)-1;
+    }
+  } else if (disp == 2) {
     os = fopen(host, "w+b");
   } else if (disp == 4) {
     os = fopen(host, "r+b");
@@ -1931,7 +2321,7 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
   } else {
     os = fopen(host, write ? "r+b" : "rb");
   }
-  if (!os && write) {
+  if (!os && write && disp != 1) {
     // Parent directories may not exist yet. Real Windows CreateFileW with
     // CREATE_ALWAYS also fails when the parent dir is absent — but Unity's
     // CrashReporter writes insights-crash-report.json without ever calling
@@ -1940,63 +2330,12 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
     // once and retry, exactly like a fresh Windows install dir.
     trt_vfs_ensure_parents(host);
     os = fopen(host, "r+b");
-    if (!os && (disp == 1 || disp == 2 || disp == 5)) os = fopen(host, "w+b");
+    if (!os && (disp == 2 || disp == 5)) os = fopen(host, "w+b");
   }
   if (!os) {
-    // .250 DIAG: log the flags + whether the host path is a directory +
-    // errno. The .249 Sekiro tail loops 28x opening its own game
-    // directory (access=0, OPEN_EXISTING) and failing; the bridge
-    // ignores flags, so a FILE_FLAG_BACKUP_SEMANTICS directory open
-    // (0x02000000, the only way a directory open succeeds on real
-    // Windows) is dropped here. is_dir + errno say whether the
-    // failure is "is a directory" (EISDIR=21) or "not found".
     const int open_errno = errno;
     int cf_is_dir = 0;
     (void)trt_vfs_stat(host, &cf_is_dir, nullptr);
-    // .252 FIX: directory open with FILE_FLAG_BACKUP_SEMANTICS --
-    // the .251 Sekiro run 2 proves the guest opens its game
-    // directory the correct Windows way (flags=0x02000080,
-    // is_dir=1) and the bridge drops it (fopen cannot open a
-    // directory, errno=EACCES). Open the directory with the
-    // REAL host CreateFileW and return a directory handle
-    // (mode 'd', host HANDLE in os). GetFileType reports
-    // FILE_TYPE_DISK; ReadFile/WriteFile/Seek fail with
-    // ERROR_ACCESS_DENIED / INVALID_HANDLE, as on real Windows.
-#ifdef _WIN32
-    if ((flags & 0x02000000u) && cf_is_dir) {
-      wchar_t wdir[1024];
-      if (::MultiByteToWideChar(CP_UTF8, 0, host, -1, wdir, 1024) > 0) {
-        // .252 FIX: CreateFile2 (not CreateFileW -- CreateFileW is
-        // desktop-partition only; this is a UWP build,
-        // WINAPI_FAMILY_APP, so it is not declared). CreateFile2
-        // is the UWP file-open API; the directory-open flag
-        // (FILE_FLAG_BACKUP_SEMANTICS) rides in dwFileFlags.
-        CREATEFILE2_EXTENDED_PARAMETERS ext = {};
-        ext.dwSize = sizeof(ext);
-        ext.dwFileAttributes = 0x00000080u; /*FILE_ATTRIBUTE_NORMAL*/
-        ext.dwFileFlags = 0x02000000u; /*FILE_FLAG_BACKUP_SEMANTICS*/
-        HANDLE hdir = ::CreateFile2(wdir, 0x80000000u /*GENERIC_READ*/,
-                                    share ? share : 0x00000007u,
-                                    3u /*OPEN_EXISTING*/, &ext);
-        if (hdir != INVALID_HANDLE_VALUE) {
-          char vpath[512];
-          build_guest_vpath(name, vpath, sizeof(vpath));
-          char dlog[1100];
-          snprintf(dlog, sizeof(dlog),
-                   "kernel32: CreateFileW directory open -> handle (path: %s flags=0x%08x)",
-                   host, flags);
-          trt_core_log(dlog);
-          return file_alloc((FILE*)hdir, 'd', vpath);
-        }
-      }
-      // Host open failed -- fall through to the .250 DIAG failure log.
-      char flog[1100];
-      snprintf(flog, sizeof(flog),
-               "kernel32: CreateFileW directory host-open failed (path: %s flags=0x%08x err=%u)",
-               host, flags, (unsigned)::GetLastError());
-      trt_core_log(flog);
-    }
-#endif
     err_ref_for_current_thread() = 2; // FILE_NOT_FOUND
     trt_core_log("kernel32: CreateFileW open failed on host (see path)");
     char plog[1100];
@@ -2010,6 +2349,9 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
   if (for_write) trt_vfs_mark_z_deleted_utf16(name, 0, 0);
   char vpath[512];
   build_guest_vpath(name, vpath, sizeof(vpath));
+  char succ_log[1100];
+  snprintf(succ_log, sizeof(succ_log), "kernel32: CreateFileW opened '%s' (host: '%s')", vpath, host);
+  trt_core_log(succ_log);
   return file_alloc(os, write ? 'w' : 'r', vpath);
 }
 
@@ -2081,7 +2423,8 @@ int TRT_STDCALL trt_ReadFile(void* h, void* buf, u32 bytes, u32* read,
   extern int TRT_STDCALL trt_SetEvent(u64 handle);
   extern void trt_iocp_notify_io(u64 file_handle, u32 bytes, void* overlapped);
   size_t n = 0;
-  if (!buf || !file_xfer_impl(h, buf, bytes, 0, overlapped, &n, nullptr)) {
+  if (!buf || !trt_va_prepare_data_range(buf, bytes) ||
+      !file_xfer_impl(h, buf, bytes, 0, overlapped, &n, nullptr)) {
     if (read) *read = 0;
     return 0;
   }
@@ -2117,7 +2460,8 @@ int TRT_STDCALL trt_WriteFile(void* h, const void* buf, u32 bytes, u32* written,
     return 1;
   }
   size_t n = 0;
-  if (!buf || !file_xfer_impl(h, (void*)buf, bytes, 1, overlapped, &n, nullptr)) {
+  if (!buf || !trt_va_prepare_data_range(buf, bytes) ||
+      !file_xfer_impl(h, (void*)buf, bytes, 1, overlapped, &n, nullptr)) {
     if (written) *written = 0;
     return 0;
   }
@@ -2271,7 +2615,7 @@ static bool file_pread_mmap_locked(FILE* os, u64 offset, void* dst,
 int trt_file_pread(void* handle, u64 offset, void* dst, size_t bytes,
                    size_t* read_out) {
   if (read_out) *read_out = 0;
-  if (!dst && bytes > 0) return 0;
+  if ((!dst && bytes > 0) || !trt_va_prepare_data_range(dst, bytes)) return 0;
   std::lock_guard<std::mutex> lk(g_files_mu);
   file_rec* rec = file_at_locked(handle);
   if (!rec) return 0;
@@ -2298,10 +2642,10 @@ int trt_file_pread(void* handle, u64 offset, void* dst, size_t bytes,
 int trt_file_pwrite(void* handle, u64 offset, const void* src, size_t bytes,
                     size_t* written_out) {
   if (written_out) *written_out = 0;
-  if (!src && bytes > 0) return 0;
+  if ((!src && bytes > 0) || !trt_va_prepare_data_range(src, bytes)) return 0;
   std::lock_guard<std::mutex> lk(g_files_mu);
   file_rec* rec = file_at_locked(handle);
-  if (!rec) return 0;
+  if (!rec || rec->mode == 'd') return 0;
   FILE* os = (FILE*)rec->os;
   const i64 cur = os_tell64(os);
   if (!os_seek64(os, (i64)offset, SEEK_SET)) {
@@ -2758,6 +3102,7 @@ static void* load_library_impl(const u16* path, u32 flags) {
     err_ref_for_current_thread() = 126;  // MOD_NOT_FOUND
     return nullptr;
   }
+
   return trt_images_handle(img);
 }
 
@@ -2796,11 +3141,17 @@ int TRT_STDCALL trt_DisableThreadLibraryCalls(void* handle) {
 
 void* TRT_STDCALL trt_GetProcAddress(void* handle, const char* name) {
   gap_trace_record("GetProcAddress");
-  if (!name) return nullptr;
+  const uintptr_t name_value = reinterpret_cast<uintptr_t>(name);
+  if (!name) {
+    err_ref_for_current_thread() = 127;  // ERROR_PROC_NOT_FOUND
+    return nullptr;
+  }
+  const bool by_ordinal = name_value < 0x10000;
+  const u16 ordinal = by_ordinal ? static_cast<u16>(name_value) : 0;
   // .213 DIAG: log when the game resolves an exit/terminate entry point
   // (dynamic exit path -- a static CRT or PEB-walked exit bypasses this,
   // but a GetProcAddress-resolved one is visible here).
-  if ((uintptr_t)name >= 0x10000) {
+  if (!by_ordinal) {
     static const char* const k_exit_names[] = {
         "ExitProcess", "RtlExitUserProcess", "TerminateProcess", "FatalExit",
         "_exit", "_Exit", "abort", "quick_exit"};
@@ -2823,17 +3174,15 @@ void* TRT_STDCALL trt_GetProcAddress(void* handle, const char* name) {
       err_ref_for_current_thread() = 6;  // ERROR_INVALID_HANDLE
       return nullptr;
     }
-    const u32 v = (u32)(uintptr_t)name;
-    if (v >= 0x10000) {
-      if (void* fn = trt_resolve_module(nullptr, mod, name, 0)) return fn;
-      char line[256];
-      snprintf(line, sizeof(line),
-               "kernel32: GetProcAddress(%s!%s) -> NULL (not in the bridge "
-               "surface — named gap, never a fake success)", mod, name);
-      trt_core_log(line);
-    }
+    if (void* fn = trt_resolve_export(mod, by_ordinal ? nullptr : name, ordinal)) return fn;
+    char ordinal_name[16];
+    if (by_ordinal) snprintf(ordinal_name, sizeof(ordinal_name), "#%u", unsigned(ordinal));
+    char line[256];
+    snprintf(line, sizeof(line), "kernel32: GetProcAddress(%s!%s) -> NULL",
+             mod, by_ordinal ? ordinal_name : name);
+    trt_core_log(line);
     err_ref_for_current_thread() = 127;  // ERROR_PROC_NOT_FOUND
-    return nullptr;  // ordinal or missing export on synthetic module: honest NULL
+    return nullptr;
   }
   trt_image* img = handle ? trt_images_by_handle(handle) : nullptr;
   if (!img) {
@@ -2841,13 +3190,9 @@ void* TRT_STDCALL trt_GetProcAddress(void* handle, const char* name) {
     err_ref_for_current_thread() = 6;  // ERROR_INVALID_HANDLE
     return nullptr;
   }
-  // a low value means "export by ordinal"
-  const u32 v = (u32)(uintptr_t)name;
-  void* fn = (v < 0x10000)
-      ? trt_pe_find_export(trt_runtime_backend(), trt_runtime_resolver(),
-                           img, nullptr, (u16)v)
-      : trt_pe_find_export(trt_runtime_backend(), trt_runtime_resolver(), img,
-                           name, 0);
+  // Resolve forwarded exports with the same lookup rules as direct probes.
+  void* fn = trt_pe_find_export(trt_runtime_backend(), trt_runtime_export_resolver(),
+                               img, by_ordinal ? nullptr : name, ordinal);
   if (!fn) err_ref_for_current_thread() = 127;  // ERROR_PROC_NOT_FOUND
   return fn;
 }
@@ -3963,62 +4308,47 @@ void* TRT_STDCALL trt_FlsGetValue2(u32 idx) {
 static void fls_sync_thread_epoch() {
   const u32 ep = g_fls_epoch.load(std::memory_order_acquire);
   if (t_fls_epoch != ep) {
-    t_fls_vals.clear();
+    memset(t_fls_slots, 0, sizeof(t_fls_slots));
     t_fls_epoch = ep;
   }
 }
 
 u32 TRT_STDCALL trt_FlsAlloc(void* cb) {
   std::lock_guard<std::mutex> lk(g_fls_mu);
-  for (size_t i = 0; i < g_fls_meta.size(); ++i) {
+  for (size_t i = 0; i < k_max_fls_slots; ++i) {
     if (!g_fls_meta[i].used) {
       g_fls_meta[i] = {cb, true};
       return (u32)(i + 1);
     }
   }
-  g_fls_meta.push_back({cb, true});
-  return (u32)g_fls_meta.size();
+  return 0xFFFFFFFFu;
 }
 
 void* TRT_STDCALL trt_FlsGetValue(u32 idx) {
   fls_sync_thread_epoch();
-  if (idx == 0) return nullptr;
-  {
-    std::lock_guard<std::mutex> lk(g_fls_mu);
-    if ((size_t)idx > g_fls_meta.size() || !g_fls_meta[(size_t)idx - 1].used)
-      return nullptr;
-  }
-  if ((size_t)(idx - 1) >= t_fls_vals.size()) return nullptr;
-  return t_fls_vals[(size_t)idx - 1];
+  if (idx == 0 || idx > k_max_fls_slots) return nullptr;
+  return t_fls_slots[idx - 1];
 }
 
 int TRT_STDCALL trt_FlsSetValue(u32 idx, void* val) {
   fls_sync_thread_epoch();
-  if (idx == 0) return 0;
-  {
-    std::lock_guard<std::mutex> lk(g_fls_mu);
-    if ((size_t)idx > g_fls_meta.size() || !g_fls_meta[(size_t)idx - 1].used)
-      return 0;
-  }
-  if (t_fls_vals.size() < (size_t)idx) t_fls_vals.resize((size_t)idx, nullptr);
-  t_fls_vals[(size_t)idx - 1] = val;
+  if (idx == 0 || idx > k_max_fls_slots) return 0;
+  t_fls_slots[idx - 1] = val;
   return 1;
 }
 
 int TRT_STDCALL trt_FlsFree(u32 idx) {
   fls_sync_thread_epoch();
+  if (idx == 0 || idx > k_max_fls_slots) return 0;
   void* cb = nullptr;
   void* val = nullptr;
   {
     std::lock_guard<std::mutex> lk(g_fls_mu);
-    if (idx == 0 || (size_t)idx > g_fls_meta.size() || !g_fls_meta[(size_t)idx - 1].used)
-      return 0;
-    cb = g_fls_meta[(size_t)idx - 1].cb;
-    g_fls_meta[(size_t)idx - 1] = {nullptr, false};
-    if ((size_t)(idx - 1) < t_fls_vals.size()) {
-      val = t_fls_vals[(size_t)(idx - 1)];
-      t_fls_vals[(size_t)idx - 1] = nullptr;
-    }
+    if (!g_fls_meta[idx - 1].used) return 0;
+    cb = g_fls_meta[idx - 1].cb;
+    g_fls_meta[idx - 1] = {nullptr, false};
+    val = t_fls_slots[idx - 1];
+    t_fls_slots[idx - 1] = nullptr;
   }
   if (cb && val) trt_call_guest(cb, (u64)(uintptr_t)val, 0, 0, 0);
   return 1;
@@ -4028,14 +4358,14 @@ void trt_fls_on_thread_exit(void) {
   fls_sync_thread_epoch();
   for (int pass = 0; pass < 4; ++pass) {
     bool fired_any = false;
-    for (size_t i = 0; i < t_fls_vals.size(); ++i) {
-      void* val = t_fls_vals[i];
+    for (size_t i = 0; i < k_max_fls_slots; ++i) {
+      void* val = t_fls_slots[i];
       if (!val) continue;
-      t_fls_vals[i] = nullptr;
+      t_fls_slots[i] = nullptr;
       void* cb = nullptr;
       {
         std::lock_guard<std::mutex> lk(g_fls_mu);
-        if (i < g_fls_meta.size() && g_fls_meta[i].used) cb = g_fls_meta[i].cb;
+        if (g_fls_meta[i].used) cb = g_fls_meta[i].cb;
       }
       if (cb) {
         fired_any = true;
@@ -4044,7 +4374,6 @@ void trt_fls_on_thread_exit(void) {
     }
     if (!fired_any) break;
   }
-  t_fls_vals.clear();
 }
 
 // ---- code pages / string type / locale-ish strings (CRT init probes) ----
@@ -5243,6 +5572,11 @@ void* TRT_STDCALL trt_GetModuleHandleA(const char* name);
 
 static int dispatch_exception_ctx(trt_ex_record* ex, u8* ctx,
                                   bool allow_continue, bool from_signal) {
+  {
+    char dm[128];
+    snprintf(dm, sizeof(dm), "  [deh] start code=0x%x addr=0x%llx\n", ex->code, (unsigned long long)ex->address);
+    ssize_t w = ::write(2, dm, strlen(dm)); (void)w;
+  }
   char line[192];
   // Per-dispatch splice-escape flag: set if a walk in THIS dispatch crossed a
   // funclet splice boundary (rescue fired) and still ended up outside the
@@ -5252,8 +5586,27 @@ static int dispatch_exception_ctx(trt_ex_record* ex, u8* ctx,
   trt_ex_pointers ep = {(u64)(uintptr_t)ex, (u64)(uintptr_t)ctx};
   std::vector<void*> vehs;
   veh_snapshot_ordered(&vehs);
-  for (void* vfn : vehs) {
+  {
+    char dm[64];
+    snprintf(dm, sizeof(dm), "  [deh] vehs count=%zu\n", vehs.size());
+    ssize_t w = ::write(2, dm, strlen(dm)); (void)w;
+  }
+  for (size_t vi = 0; vi < vehs.size(); ++vi) {
+    void* vfn = vehs[vi];
+    {
+      trt_image* mimg = trt_images_find("mono.dll");
+      void* mbase = mimg ? trt_images_handle(mimg) : nullptr;
+      char dm[160];
+      snprintf(dm, sizeof(dm), "  [deh] calling veh[%zu]=%p (mono rva=0x%lx)\n",
+               vi, vfn, mbase ? (unsigned long)((uintptr_t)vfn - (uintptr_t)mbase) : 0UL);
+      ssize_t w = ::write(2, dm, strlen(dm)); (void)w;
+    }
     const i32 vres = (i32)trt_call_guest(vfn, (u64)(uintptr_t)&ep, 0, 0, 0);
+    {
+      char dm[128];
+      snprintf(dm, sizeof(dm), "  [deh] veh[%zu] returned %d\n", vi, vres);
+      ssize_t w = ::write(2, dm, strlen(dm)); (void)w;
+    }
     if (vres == -1 /*EXCEPTION_CONTINUE_EXECUTION*/ && allow_continue) {
       return 1;
     }
@@ -5431,6 +5784,11 @@ extern "C" int trt_dispatch_hw_fault(int sig, void* siginfo_v, void* uctx_v) {
   ucontext_t* uc = (ucontext_t*)uctx_v;
   siginfo_t* si = (siginfo_t*)siginfo_v;
   const u64 rip = (u64)uc->uc_mcontext.gregs[REG_RIP];
+  if (sig == SIGSEGV && si->si_code > 0) {
+    const u64 error = (u64)uc->uc_mcontext.gregs[REG_ERR];
+    const u32 access = (error & 16u) ? 8u : ((error & 2u) ? 1u : 0u);
+    if (trt_va_handle_deferred_data_fault((u64)(uintptr_t)si->si_addr, access)) return 1;
+  }
   if (!is_guest_exec_pc(rip)) return 0;
 
   if (sig == SIGSEGV &&
@@ -5502,72 +5860,14 @@ extern "C" int trt_dispatch_hw_fault(int sig, void* siginfo_v, void* uctx_v) {
   const int handled = dispatch_exception_ctx(&ex, ctx, true, true);
   --t_hw_fault_depth;
   if (handled) {
-    // fail-visible EH bounce counter: a livelock here (the same (rip,fault)
-    // pair "handled" forever) shows up as bounce floods instead of a
-    // silent hang that only a watchdog names. Cap: after 100k bounces on one
-    // thread the guest is provably livelocked (measured: OrTMM spun 14.5M
-    // identical bounces) — abort with a named verdict instead of spinning.
-    static thread_local u64 s_eh_bounces = 0;
-    ++s_eh_bounces;
-    if (s_eh_bounces == 100000ull) {
-      char bl[256];
-      snprintf(bl, sizeof(bl),
-               "ehfix: BOUNCE-LIVELOCK cap hit (100k identical EH bounces, "
-               "rip=%llx) -> guest terminated with named verdict\n",
-               (unsigned long long)rip);
-      ssize_t wrc = ::write(2, bl, strlen(bl));
-      (void)wrc;
-      boot_log("ehfix: guest livelocked in EH bounce loop -> abort (named)");
-      abort();
-    }
-    if (s_eh_bounces % 100000 == 0) {
-      char bl[128];
-      snprintf(bl, sizeof(bl),
-               "ehfix: hw-fault bounce #%llu rip=%llx fault=%llx\n",
-               (unsigned long long)s_eh_bounces,
-               (unsigned long long)rip, (unsigned long long)si->si_addr);
-      ssize_t wrc = ::write(2, bl, strlen(bl));
-      (void)wrc;
-    }
-    if (s_eh_bounces == 1) {
-      char bl[640];
-      // Stack provenance: where does THIS thread's stack actually live, and
-      // is the fault inside it or past its end? Answers main-stack vs fiber
-      // vs pthread-stack without guessing from /proc maps of another proc.
-      void* sbase = nullptr;
-      size_t ssz = 0;
-#if !defined(_WIN32)
-      pthread_attr_t pa;
-      if (pthread_getattr_np(pthread_self(), &pa) == 0) {
-        pthread_attr_getstack(&pa, &sbase, &ssz);
-        pthread_attr_destroy(&pa);
-      }
-#endif
-      snprintf(bl, sizeof(bl),
-               "ehfix: FIRST BOUNCE GPRs rip=%llx rsp=%llx rax=%llx rbx=%llx "
-               "rcx=%llx rdx=%llx rdi=%llx rsi=%llx rbp=%llx r8=%llx r9=%llx | "
-               "thread stack=%p..%p (%zu KB) fault_in_stack=%d fault_dist_from_end=%llx\n",
-               (unsigned long long)rip,
-               (unsigned long long)uc->uc_mcontext.gregs[REG_RSP],
-               (unsigned long long)uc->uc_mcontext.gregs[REG_RAX],
-               (unsigned long long)uc->uc_mcontext.gregs[REG_RBX],
-               (unsigned long long)uc->uc_mcontext.gregs[REG_RCX],
-               (unsigned long long)uc->uc_mcontext.gregs[REG_RDX],
-               (unsigned long long)uc->uc_mcontext.gregs[REG_RDI],
-               (unsigned long long)uc->uc_mcontext.gregs[REG_RSI],
-               (unsigned long long)uc->uc_mcontext.gregs[REG_RBP],
-               (unsigned long long)uc->uc_mcontext.gregs[REG_R8],
-               (unsigned long long)uc->uc_mcontext.gregs[REG_R9],
-               sbase, sbase ? (void*)((char*)sbase + ssz) : nullptr,
-               ssz / 1024,
-               (sbase && ssz) ? ((const char*)si->si_addr >= (const char*)sbase &&
-                                 (const char*)si->si_addr < (const char*)sbase + ssz)
-                              : -1,
-               (sbase && ssz) ? (unsigned long long)((const char*)si->si_addr -
-                                                     (const char*)sbase + ssz)
-                              : 0ULL);
-      ssize_t wrc = ::write(2, bl, strlen(bl));
-      (void)wrc;
+    const u64 stack = (u64)uc->uc_mcontext.gregs[REG_RSP];
+    if (ctx_rip(ctx) != rip || ctx_gpr(ctx, 4) != stack) {
+      t_fault_retry = {};
+    } else if (guest_fault_retry_exhausted(rip, stack, (u64)(uintptr_t)si->si_addr,
+                                            ex.code, static_cast<u32>(ex.info[0]))) {
+      static constexpr char reason[] = "kernel32: repeated guest fault made no progress\n";
+      (void)::write(2, reason, sizeof(reason) - 1);
+      return 0;
     }
     for (u8 r = 0; r < 16; ++r) {
       uc->uc_mcontext.gregs[k_uc_regs[r]] = (greg_t)ctx_gpr(ctx, r);
@@ -5806,6 +6106,26 @@ extern "C" __attribute__((used)) void trt_raise_exception_sysv(
   "movups %xmm14, 0x280(%rsp)\n" \
   "movups %xmm15, 0x290(%rsp)\n"
 
+#define TRT_RESTORE_WIN64_REGS_ASM \
+  "movq 0x90(%rsp), %rbx\n" \
+  "movq 0xA0(%rsp), %rbp\n" \
+  "movq 0xA8(%rsp), %rsi\n" \
+  "movq 0xB0(%rsp), %rdi\n" \
+  "movq 0xD8(%rsp), %r12\n" \
+  "movq 0xE0(%rsp), %r13\n" \
+  "movq 0xE8(%rsp), %r14\n" \
+  "movq 0xF0(%rsp), %r15\n" \
+  "movups 0x200(%rsp), %xmm6\n" \
+  "movups 0x210(%rsp), %xmm7\n" \
+  "movups 0x220(%rsp), %xmm8\n" \
+  "movups 0x230(%rsp), %xmm9\n" \
+  "movups 0x240(%rsp), %xmm10\n" \
+  "movups 0x250(%rsp), %xmm11\n" \
+  "movups 0x260(%rsp), %xmm12\n" \
+  "movups 0x270(%rsp), %xmm13\n" \
+  "movups 0x280(%rsp), %xmm14\n" \
+  "movups 0x290(%rsp), %xmm15\n"
+
 __attribute__((naked, used)) void TRT_STDCALL trt_RtlUnwindEx(
     u64 target, u64 target_ip, void* exrec, u64 retval, void* ctx,
     void* history) {
@@ -5821,7 +6141,9 @@ __attribute__((naked, used)) void TRT_STDCALL trt_RtlUnwindEx(
       "subq $16, %rsp\n"
       "movq %r10, (%rsp)\n"
       "call trt_rtl_unwind_ex_sysv\n"
-      "addq $0x4F0, %rsp\n"
+      "addq $16, %rsp\n"
+      TRT_RESTORE_WIN64_REGS_ASM
+      "addq $0x4E0, %rsp\n"
       "popfq\n"
       "ret\n");
 }
@@ -5840,7 +6162,9 @@ __attribute__((naked, used)) void TRT_STDCALL trt_RtlUnwind(
       "subq $16, %rsp\n"
       "movq %r10, (%rsp)\n"
       "call trt_rtl_unwind_ex_sysv\n"
-      "addq $0x4F0, %rsp\n"
+      "addq $16, %rsp\n"
+      TRT_RESTORE_WIN64_REGS_ASM
+      "addq $0x4E0, %rsp\n"
       "popfq\n"
       "ret\n");
 }
@@ -5855,10 +6179,12 @@ __attribute__((naked, used)) void TRT_STDCALL trt_RaiseException(
       "movl 0xB8(%r8), %edx\n"
       "movq 0xC0(%r8), %rcx\n"
       "call trt_raise_exception_sysv\n"
+      TRT_RESTORE_WIN64_REGS_ASM
       "addq $0x4E0, %rsp\n"
       "popfq\n"
       "ret\n");
 }
+#undef TRT_RESTORE_WIN64_REGS_ASM
 #undef TRT_CAPTURE_WIN64_REGS_ASM
 #else
 void TRT_STDCALL trt_RtlUnwindEx(u64 target, u64 target_ip, void* exrec,
@@ -5902,18 +6228,30 @@ extern "C" int trt_dispatch_hw_fault(int sig, void* siginfo_v, void* uctx_v) {
 extern "C" int TRT_STDCALL trt_dispatch_win32_exception(void* ep_v) {
   if (!ep_v) return 0;
 #ifdef _WIN32
-  PEXCEPTION_POINTERS ep = (PEXCEPTION_POINTERS)ep_v;
-  if (!ep->ExceptionRecord ||
-      !is_guest_exec_pc((u64)(uintptr_t)ep->ExceptionRecord->ExceptionAddress))
+  auto* ep = static_cast<PEXCEPTION_POINTERS>(ep_v);
+  const auto* record = ep->ExceptionRecord;
+  const auto* context = ep->ContextRecord;
+  if (!record || !is_guest_exec_pc((u64)(uintptr_t)record->ExceptionAddress))
     return 0;
-  if (ep->ExceptionRecord->ExceptionCode == 0xC0000005u &&
-      ep->ExceptionRecord->NumberParameters >= 2 &&
-      ep->ExceptionRecord->ExceptionInformation[0] == 8 &&
-      trt_va_try_promote_rx((u64)ep->ExceptionRecord->ExceptionInformation[1])) {
-    return -1;
+  const bool access_fault =
+      context && record->ExceptionCode == 0xC0000005u && record->NumberParameters >= 2;
+  const u32 access = access_fault ? static_cast<u32>(record->ExceptionInformation[0]) : 0;
+  const u64 address = access_fault ? record->ExceptionInformation[1] : 0;
+  if (access_fault && access == 8 && trt_va_try_promote_rx(address)) return -1;
+
+  const u64 pc = context ? context->Rip : 0;
+  const u64 stack = context ? context->Rsp : 0;
+  const int result = trt_run_guest_veh(ep_v);
+  if (result != -1 || !access_fault || context->Rip != pc || context->Rsp != stack) {
+    t_fault_retry = {};
+  } else if (guest_fault_retry_exhausted(pc, stack, address, record->ExceptionCode, access)) {
+    boot_log("kernel32: repeated guest access violation made no progress");
+    return 0;
   }
-#endif
+  return result;
+#else
   return trt_run_guest_veh(ep_v);
+#endif
 }
 
 #ifdef _WIN32
@@ -6319,6 +6657,13 @@ extern "C" void trt_real_exit_hook_install() {
 // own Sleep trips the trap every tick, and 7 log lines per tick
 // would drown the log. Only the launch arm logs.
 extern "C" void trt_syscall_trap_install() {
+#if !defined(TRT_ENABLE_SYSCALL_TRAP_DIAGNOSTICS)
+  // This diagnostic patches shared native wait entry points. With host
+  // threads entering those functions concurrently, the handler and watchdog
+  // can race over page protection and fault while writing the breakpoint.
+  // Keep the instrumentation available for dedicated debug builds.
+  return;
+#endif
   const bool quiet = g_syscall_trap_quiet_rearm;
   g_syscall_trap_quiet_rearm = false;
 #define TRAP_LOG(line) do { if (!quiet) trt_core_log(line); } while (0)
@@ -6866,16 +7211,13 @@ u16 TRT_STDCALL trt_QueryDepthSList(void* head) {
   return d;
 }
 
+// Shared with bridge_thread.cpp: initialises the documented
+// RTL_CRITICAL_SECTION layout (LockCount = -1, SpinCount at its real offset).
+extern "C" void trt_cs_init_layout(void* cs, u32 spin);
+
 int TRT_STDCALL trt_InitializeCriticalSectionAndSpinCount(void* cs, u32 spin) {
   if (!cs) return 0;
-  // 40 bytes for a Win64 RTL_CRITICAL_SECTION, 24 for a PE32 guest's - never
-  // both, or the write runs past the caller's object. Exact-size volunteered
-  // stores, not memset: libc may write past the requested length, and a guest
-  // object ending on a page boundary would fault in the bridge.
-  volatile u32* w = (volatile u32*)cs;
-  const int words = trt_cs_size_for_guest() / 4;  // 6 for PE32, 10 for Win64
-  for (int i = 0; i < words; i++) w[i] = 0;
-  w[3] = spin;
+  trt_cs_init_layout(cs, spin);
   return 1;
 }
 
@@ -7166,6 +7508,7 @@ constexpr int k_gap_ring_n = 32;
 gap_entry g_gap_ring[k_gap_ring_n];
 int g_gap_ring_head = 0;  // next slot to write
 u64 g_gap_seq = 0;        // total records (seq of the last entry)
+u64 g_gap_launch_start = 0;
 u64 g_gap_entries = 0;    // non-duplicate entries ever written
 std::mutex g_gap_mu;
 // The thread that presented frame=1 (the main-thread proxy for Ultrapool).
@@ -7182,13 +7525,33 @@ std::atomic<u64> g_gap_tex_fails{0};
 std::atomic<u64> g_gap_main_cv_waits{0};
 }  // namespace
 
+void gap_trace_begin_launch(void) {
+  std::lock_guard<std::mutex> lock(g_gap_mu);
+  g_gap_launch_start = g_gap_seq;
+}
+
+u32 gap_trace_launch_tail(trt_launch_api_entry* entries, u32 capacity, u64* calls) {
+  std::lock_guard<std::mutex> lock(g_gap_mu);
+  if (calls) *calls = g_gap_seq - g_gap_launch_start;
+  if (!entries) return 0;
+  u32 count = 0;
+  while (count < capacity && count < g_gap_entries) {
+    const auto index = (g_gap_ring_head + k_gap_ring_n - 1 - count) % k_gap_ring_n;
+    const auto& item = g_gap_ring[index];
+    if (item.seq <= g_gap_launch_start) break;
+    entries[count++] = {item.name, item.repeats};
+  }
+  return count;
+}
+
 void gap_trace_record(const char* name) {
   if (!name) return;
   const u32 tid = trt_GetCurrentThreadId();
   std::lock_guard<std::mutex> lk(g_gap_mu);
   if (g_gap_seq > 0) {
     const int last = (g_gap_ring_head + k_gap_ring_n - 1) % k_gap_ring_n;
-    if (g_gap_ring[last].name == name && g_gap_ring[last].tid == tid) {
+    if (g_gap_ring[last].seq > g_gap_launch_start &&
+        g_gap_ring[last].name == name && g_gap_ring[last].tid == tid) {
       ++g_gap_ring[last].repeats;
       ++g_gap_seq;
       return;
@@ -7850,6 +8213,49 @@ void* TRT_STDCALL trt_FindFirstFileW(const u16* name, void* info) {
   return find_first_file(name, info);
 }
 
+// ANSI find wrappers: the W family above is the single implementation; these
+// narrow a guest path and widen the 592-byte WIN32_FIND_DATAW back down to the
+// 320-byte WIN32_FIND_DATAA layout. Plenty of Win32 apps (and packers, and
+// this repo's agent guest) import FindFirstFileA and used to fall through to
+// the real host API, where a guest C:\ path does not exist.
+static void find_w_layout_to_a(const u8* w, u8* a) {
+  memset(a, 0, 320);
+  memcpy(a, w, 44);  // attrs + three FILETIMEs + size hi/lo + two reserved
+  const u16* wn = (const u16*)(w + 44);
+  char* an = (char*)(a + 44);
+  for (int i = 0; i < 259 && wn[i]; ++i) an[i] = (char)wn[i];
+  const u16* wa = (const u16*)(w + 564);
+  char* aa = (char*)(a + 304);
+  for (int i = 0; i < 13 && wa[i]; ++i) aa[i] = (char)wa[i];
+}
+
+void* TRT_STDCALL trt_FindFirstFileA(const char* name, void* info) {
+  if (!name || !info) {
+    err_ref_for_current_thread() = 87;  // ERROR_INVALID_PARAMETER
+    return (void*)(uintptr_t)-1;
+  }
+  u16 wname[520];
+  int i = 0;
+  for (; name[i] && i < 519; ++i) wname[i] = (u16)(u8)name[i];
+  wname[i] = 0;
+  u8 wd[592];
+  void* h = find_first_file(wname, wd);
+  if (h == (void*)(uintptr_t)-1) return h;
+  find_w_layout_to_a(wd, (u8*)info);
+  return h;
+}
+
+int TRT_STDCALL trt_FindNextFileA(void* handle, void* info) {
+  if (!info) {
+    err_ref_for_current_thread() = 87;  // ERROR_INVALID_PARAMETER
+    return 0;
+  }
+  u8 wd[592];
+  int ok = trt_FindNextFileW(handle, wd);
+  if (ok) find_w_layout_to_a(wd, (u8*)info);
+  return ok;
+}
+
 int TRT_STDCALL trt_GetFileAttributesExW(const u16* name, u32 level, void* info) {
   if (!name || !info) return 0;
   (void)level;
@@ -8086,19 +8492,31 @@ struct timer_fire_arg {
   wait_timer_slot* slot;
   uint32_t gen;
   u32 delay_ms;
+  u32 period_ms;
 };
 
 void timer_run(timer_fire_arg* arg) {
-  u32 rem = arg->delay_ms;
-  while (rem > 0) {
-    if (arg->slot->gen.load() != arg->gen) { free(arg); return; }
-    const u32 step = rem > 10 ? 10 : rem;
-    trt_Sleep(step);
-    rem -= step;
+  auto wait_interval = [arg](u32 duration_ms) -> bool {
+    u32 rem = duration_ms;
+    while (rem > 0) {
+      if (arg->slot->gen.load() != arg->gen) return false;
+      const u32 step = rem > 10 ? 10 : rem;
+      trt_Sleep(step);
+      rem -= step;
+    }
+    return arg->slot->gen.load() == arg->gen;
+  };
+
+  if (!wait_interval(arg->delay_ms)) {
+    free(arg);
+    return;
   }
-  if (arg->slot->gen.load() == arg->gen && arg->slot->handle) {
+
+  do {
+    if (arg->slot->gen.load() != arg->gen || !arg->slot->handle) break;
     trt_SetEvent(arg->slot->handle);
-  }
+    if (arg->period_ms == 0 || !wait_interval(arg->period_ms)) break;
+  } while (true);
   free(arg);
 }
 
@@ -8298,13 +8716,15 @@ int TRT_STDCALL trt_SetWaitableTimer(void* h, const int64_t* due_time,
     err_ref_for_current_thread() = 6;
     return 0;
   }
-  if (!due_time) {
+  if (!due_time || period < 0) {
     err_ref_for_current_thread() = 87;
     return 0;
   }
-  if (comp_routine || period != 0) {
-    trt_core_log("kernel32: SetWaitableTimer APC/periodic -> one-shot event signal only");
+  if (comp_routine) {
+    trt_core_log("kernel32: SetWaitableTimer APC completion callback is "
+                 "unsupported; timer event will still be signaled");
   }
+
   const u64 uh = (u64)(uintptr_t)h;
   wait_timer_slot* slot = find_or_alloc_timer(uh, true);
   if (!slot) {
@@ -8313,40 +8733,76 @@ int TRT_STDCALL trt_SetWaitableTimer(void* h, const int64_t* due_time,
   }
   const uint32_t gen = slot->gen.fetch_add(1) + 1;
   trt_ResetEvent(uh);
-  u32 delay_ms = 0;
+
+  // Windows uses a negative due time for a relative delay and a positive
+  // FILETIME for an absolute UTC deadline. Convert both without the old
+  // one-minute cap; retain a u32 millisecond interval for the worker.
+  u64 delay_ms64 = 0;
   if (*due_time < 0) {
-    const int64_t ns100 = -(*due_time);
-    int64_t ms = (ns100 + 9999) / 10000;
-    if (ms > 60000) ms = 60000;
-    delay_ms = (u32)ms;
+    const u64 ticks = (u64)(-(*due_time + 1)) + 1;
+    delay_ms64 = ticks / 10000ull + ((ticks % 10000ull) != 0 ? 1ull : 0ull);
+  } else if (*due_time > 0) {
+    u64 now_ft = 0;
+    if (trt_GetSystemTimeAsFileTime(&now_ft) &&
+        (u64)*due_time > now_ft) {
+      const u64 ticks = (u64)*due_time - now_ft;
+      delay_ms64 = ticks / 10000ull + ((ticks % 10000ull) != 0 ? 1ull : 0ull);
+    }
   }
+  const u32 max_delay = 0xFFFFFFFEu;
+  u32 delay_ms = delay_ms64 > max_delay ? max_delay : (u32)delay_ms64;
+  const u32 period_ms = (u32)period;
+
+  if (period_ms != 0) {
+    char line[192];
+    snprintf(line, sizeof(line),
+             "kernel32: SetWaitableTimer periodic due=%lld initial=%u ms "
+             "period=%u ms handle=%p",
+             (long long)*due_time, delay_ms, period_ms, h);
+    trt_core_log(line);
+  }
+
+  if (delay_ms == 0 && period_ms == 0) {
+    trt_SetEvent(uh);
+    err_ref_for_current_thread() = 0;
+    return 1;
+  }
+
+  // A periodic timer with an immediate due time fires now, then starts its
+  // recurring interval. The timer worker also handles one-shot relative and
+  // absolute deadlines without blocking the caller.
   if (delay_ms == 0) {
     trt_SetEvent(uh);
-    return 1;
+    delay_ms = period_ms;
   }
+
   timer_fire_arg* arg = (timer_fire_arg*)malloc(sizeof(timer_fire_arg));
   if (!arg) {
-    trt_Sleep(delay_ms);
-    trt_SetEvent(uh);
-    return 1;
+    err_ref_for_current_thread() = 8;
+    return 0;
   }
   arg->slot = slot;
   arg->gen = gen;
   arg->delay_ms = delay_ms;
+  arg->period_ms = period_ms;
 #if defined(_WIN32)
   HANDLE th = ::CreateThread(nullptr, 0, timer_win_entry, arg, 0, nullptr);
-  if (th) { ::CloseHandle(th); return 1; }
+  if (th) {
+    ::CloseHandle(th);
+    err_ref_for_current_thread() = 0;
+    return 1;
+  }
 #else
   pthread_t pt;
   if (pthread_create(&pt, nullptr, timer_posix_entry, arg) == 0) {
     pthread_detach(pt);
+    err_ref_for_current_thread() = 0;
     return 1;
   }
 #endif
   free(arg);
-  trt_Sleep(delay_ms);
-  trt_SetEvent(uh);
-  return 1;
+  err_ref_for_current_thread() = 8;
+  return 0;
 }
 
 int TRT_STDCALL trt_CancelWaitableTimer(void* h) {
@@ -8499,26 +8955,57 @@ int TRT_STDCALL trt_FreeEnvironmentStringsA(const char* block) {
   return 1;
 }
 
+extern void* TRT_STDCALL trt_LocalAlloc(u32 flags, u64 bytes);
+
 u32 TRT_STDCALL trt_FormatMessageA(u32 flags, const void* src, u32 msgid,
                                    u32 langid, char* buf, u32 size,
                                    void* args) {
-  if ((flags & 0x100u) || !buf || size == 0) {
-    char line[128];
-    snprintf(line, sizeof(line),
-             "kernel32: FormatMessageA flags=0x%lx unsupported -> 0",
-             (unsigned long)flags);
-    trt_core_log(line);
+  if (!buf) {
     err_ref_for_current_thread() = 87;
     return 0;
   }
-  u16 wbuf[256];
-  const u32 wn = trt_FormatMessageW(flags, src, msgid, langid, wbuf, 256, args);
-  if (wn == 0) return 0;
-  int n = trt_WideCharToMultiByte(65001, 0, wbuf, (int)wn, buf, (int)size - 1,
-                                  nullptr, nullptr);
-  if (n < 0) n = 0;
-  buf[n] = 0;
-  return (u32)n;
+  u16* wbuf_ptr = nullptr;
+  u16 wbuf_stack[256];
+  u32 wflags = flags;
+  u32 wn = 0;
+  if (flags & 0x100u) {
+    wn = trt_FormatMessageW(wflags, src, msgid, langid, (u16*)&wbuf_ptr, size, args);
+  } else {
+    wn = trt_FormatMessageW(wflags, src, msgid, langid, wbuf_stack, 256, args);
+    wbuf_ptr = wbuf_stack;
+  }
+  if (wn == 0 || !wbuf_ptr) return 0;
+
+  if (flags & 0x100u) {
+    int n = trt_WideCharToMultiByte(65001, 0, wbuf_ptr, (int)wn, nullptr, 0, nullptr, nullptr);
+    if (n <= 0) {
+      extern void* TRT_STDCALL trt_LocalFree(void* p);
+      trt_LocalFree(wbuf_ptr);
+      return 0;
+    }
+    char* abuf = (char*)trt_LocalAlloc(0x40, (u64)(n + 1));
+    if (!abuf) {
+      extern void* TRT_STDCALL trt_LocalFree(void* p);
+      trt_LocalFree(wbuf_ptr);
+      err_ref_for_current_thread() = 8;
+      return 0;
+    }
+    trt_WideCharToMultiByte(65001, 0, wbuf_ptr, (int)wn, abuf, n, nullptr, nullptr);
+    abuf[n] = 0;
+    extern void* TRT_STDCALL trt_LocalFree(void* p);
+    trt_LocalFree(wbuf_ptr);
+    *(char**)buf = abuf;
+    return (u32)n;
+  } else {
+    if (size == 0) {
+      err_ref_for_current_thread() = 87;
+      return 0;
+    }
+    int n = trt_WideCharToMultiByte(65001, 0, wbuf_ptr, (int)wn, buf, (int)size - 1, nullptr, nullptr);
+    if (n < 0) n = 0;
+    buf[n] = 0;
+    return (u32)n;
+  }
 }
 
 int TRT_STDCALL trt_CompareStringOrdinal(const u16* s1, int c1,
@@ -8972,6 +9459,7 @@ static const trt_named_fn k_kernel32_fns[] = {
   {"Sleep", (void*)&trt_Sleep},
   {"GetTickCount", (void*)&trt_GetTickCount},
   {"GetTickCount64", (void*)&trt_GetTickCount64},
+  {"GetCurrentThreadStackLimits", (void*)&trt_GetCurrentThreadStackLimits},
   {"CreateFileW", (void*)&trt_CreateFileW},
   {"ReadFile", (void*)&trt_ReadFile},
   {"WriteFile", (void*)&trt_WriteFile},
@@ -9081,6 +9569,8 @@ static const trt_named_fn k_kernel32_fns[] = {
   {"FindFirstFileExW", (void*)&trt_FindFirstFileExW},
   {"FindFirstFileW", (void*)&trt_FindFirstFileW},
   {"FindNextFileW", (void*)&trt_FindNextFileW},
+  {"FindFirstFileA", (void*)&trt_FindFirstFileA},
+  {"FindNextFileA", (void*)&trt_FindNextFileA},
   {"FindClose", (void*)&trt_FindClose},
   {"GetFileAttributesExW", (void*)&trt_GetFileAttributesExW},
   {"SetFilePointerEx", (void*)&trt_SetFilePointerEx},
@@ -9150,7 +9640,31 @@ static const trt_named_fn k_kernel32_fns[] = {
   {"SetFileCompletionNotificationModes", (void*)&trt_SetFileCompletionNotificationModes},
 };
 
+// Bun/V8 query the current thread stack before they scan it.  A synthesised
+// return-0 stub leaves both bounds at zero and the GC walks address 0.
+void TRT_STDCALL trt_GetCurrentThreadStackLimits(u64* low, u64* high) {
+  if (!low || !high) return;
+#if defined(_WIN32)
+  *low = (u64)__readgsqword(0x10);   // NT_TIB.StackLimit
+  *high = (u64)__readgsqword(0x08);  // NT_TIB.StackBase
+#else
+  pthread_attr_t attr;
+  if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+    void* base = nullptr;
+    size_t size = 0;
+    if (pthread_attr_getstack(&attr, &base, &size) == 0) {
+      *low = (u64)(uintptr_t)base;
+      *high = *low + (u64)size;
+    }
+    pthread_attr_destroy(&attr);
+  }
+#endif
+}
+
+void TRT_STDCALL trt_GetCurrentThreadStackLimits(u64* low, u64* high);
+
 int trt_bridge_register_kernel32(void) {
+  trt_bridge_register_prng();
   trt_module_register("kernel32.dll", TRT_ROUTE_BUILTIN, k_kernel32_fns,
                        (int)(sizeof(k_kernel32_fns) / sizeof(k_kernel32_fns[0])));
   // kernelbase forwards: PE games import a mix; route kernelbase to the same

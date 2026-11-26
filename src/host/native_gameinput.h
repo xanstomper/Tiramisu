@@ -97,6 +97,10 @@ class native_gameinput {
     return last != 0 && (GetTickCount64() - last) < within_ms;
   }
   bool mouse_connected() const { return mouse_connected_.load(); }
+  bool wheel_active_recent() const {
+    const ULONGLONG last = last_wheel_ms_.load();
+    return last != 0 && GetTickCount64() - last < 120;
+  }
   bool keyboard_connected() const { return keyboard_connected_.load(); }
 
   using host_key_fn = bool (*)(u16 vk, u16 scan, bool ext, bool down);
@@ -113,6 +117,7 @@ class native_gameinput {
     // The CoreWindow focus handler releases both native and guest input.
     keyboard_active_.store(false);
     mouse_active_.store(false);
+    last_wheel_ms_.store(0);
     keyboard_reading_ = nullptr;
     mouse_reading_ = nullptr;
     keys_ = {};
@@ -141,7 +146,7 @@ class native_gameinput {
       drain(GameInputKindMouse, mouse_reading_, [&](IGameInputReading& reading) {
         clicked |= update_mouse(reading);
       });
-      if (!mouse_active_.load()) clicked |= poll_device_mouse();
+      if (!mouse_active_recent(300)) clicked |= poll_device_mouse();
     }
     return clicked;
   }
@@ -362,6 +367,7 @@ class native_gameinput {
     dev_mouse_baseline_ = false;
     mouse_active_.store(false);
     last_mouse_ms_.store(0);
+    last_wheel_ms_.store(0);
   }
 
   template<class Apply>
@@ -527,11 +533,14 @@ class native_gameinput {
       const auto wheel = delta(next.wheelY, prev.wheelY);
       if (wheel) {
         mouse_active_.store(true);
-        last_mouse_ms_.store(GetTickCount64());
+        const auto now = GetTickCount64();
+        last_mouse_ms_.store(now);
+        last_wheel_ms_.store(now);
         trt_input_wheel(wheel);
       }
     }
     const unsigned changed = next.buttons ^ prev.buttons;
+    bool clicked = false;
     for (unsigned button = 0; button < 5; ++button) {
       const unsigned mask = 1u << button;
       if (!(changed & mask)) continue;
@@ -542,9 +551,9 @@ class native_gameinput {
         log_line("input: native GameInput mouse button applied");
       }
       const bool down = (next.buttons & mask) != 0;
-      if (trt_mouse_button(button) != down) trt_input_mouse_button(button, down);
+      const bool transitioned = trt_input_mouse_button(button, down);
+      clicked |= transitioned && button == 0 && !down;
     }
-    const bool clicked = (changed & 1u) && !(next.buttons & 1u);
     prev = next;
     baseline = true;
     return clicked;
@@ -596,6 +605,7 @@ class native_gameinput {
   std::atomic<bool> keyboard_active_{false};
   std::atomic<bool> mouse_active_{false};
   std::atomic<ULONGLONG> last_mouse_ms_{0};
+  std::atomic<ULONGLONG> last_wheel_ms_{0};
   std::atomic<bool> mouse_connected_{false};
   std::atomic<bool> keyboard_connected_{false};
 };

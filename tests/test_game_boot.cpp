@@ -36,7 +36,7 @@ void* l_alloc(size_t bytes, u64 pref) {
 #endif
   void* p = mmap(pref ? (void*)(uintptr_t)pref : nullptr, bytes,
                  PROT_READ | PROT_WRITE,
-                 pref ? (MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS)
+                 pref ? (MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS)
                       : (MAP_PRIVATE | MAP_ANONYMOUS),
                  -1, 0);
   if (p == MAP_FAILED) return nullptr;

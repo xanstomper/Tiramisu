@@ -22,6 +22,11 @@
 #include <string.h>
 #include <atomic>
 #include <chrono>
+#include <mutex>
+
+extern "C" int trt_user32_client_size(void* hwnd, i32* width, i32* height);
+extern "C" int TRT_STDCALL trt_SetWindowPos(void* hwnd, void* after, i32 x, i32 y,
+                                             i32 width, i32 height, u32 flags);
 
 namespace {
 
@@ -118,6 +123,96 @@ u32 g_sc_width = 1280;
 u32 g_sc_height = 720;
 u32 g_sc_colorspace = 0;
 std::atomic<bool> g_sc_presented{false};
+
+// These counters describe the current launch and carry no game data.
+std::atomic<u32> g_d3d11_devices{0}, g_d3d11_swapchains{0}, g_d3d11_buffers{0};
+std::atomic<u32> g_d3d11_presents{0}, g_d3d11_visible_presents{0};
+std::atomic<int> g_d3d11_last_present{0};
+std::atomic<u32> g_d3d11_swap_effect{3}, g_d3d11_buffer_count{2};
+std::atomic<u32> g_d3d11_stable_backbuffer{0};
+u32 g_d3d11_guest_format = 0;
+std::atomic<u32> g_d3d11_width{0}, g_d3d11_height{0};
+void* g_d3d11_hwnd = nullptr;
+std::mutex g_resize_stats_mutex;
+trt_gpu_resize_stats g_resize_stats{};
+
+void* desktop_swapchain_window(const u32* desc) {
+  void* window = nullptr;
+  // DXGI_SWAP_CHAIN_DESC::OutputWindow at offset 48 in the Win64 ABI.
+  if (desc) memcpy(&window, desc + 12, sizeof(window));
+  return window;
+}
+
+int configure_guest_swapchain(u32 width, u32 height, u32 fmt, u32 count,
+                              u32 effect, void* hwnd, bool creating) {
+  const u32 requested_width = width, requested_height = height;
+  i32 client_width = 0, client_height = 0;
+  if (hwnd && (!width || !height))
+    trt_user32_client_size(hwnd, &client_width, &client_height);
+  if (!width) {
+    width = client_width > 0 ? static_cast<u32>(client_width) :
+        (creating ? g_hooks.width : g_d3d11_width.load());
+    if (!width) width = g_hooks.width ? g_hooks.width : 1280;
+  }
+  if (!height) {
+    height = client_height > 0 ? static_cast<u32>(client_height) :
+        (creating ? g_hooks.height : g_d3d11_height.load());
+    if (!height) height = g_hooks.height ? g_hooks.height : 720;
+  }
+  const u32 effective_count = count ? count : (creating ? 2 : g_d3d11_buffer_count.load());
+  const int hr = g_hooks.configure_d3d11_swapchain
+      ? g_hooks.configure_d3d11_swapchain(width, height, fmt, effective_count, effect) : 0;
+  if (!creating) {
+    std::lock_guard<std::mutex> lock(g_resize_stats_mutex);
+    ++g_resize_stats.buffer_calls;
+    g_resize_stats.buffer_requested_width = requested_width;
+    g_resize_stats.buffer_requested_height = requested_height;
+    g_resize_stats.buffer_client_width = static_cast<u32>(client_width);
+    g_resize_stats.buffer_client_height = static_cast<u32>(client_height);
+    g_resize_stats.buffer_present_count = g_d3d11_visible_presents.load();
+    g_resize_stats.buffer_result = hr;
+  }
+  if (hr < 0) return hr;
+  g_d3d11_width.store(width);
+  g_d3d11_height.store(height);
+  g_d3d11_hwnd = hwnd;
+  if (fmt || creating) g_d3d11_guest_format = fmt;
+  g_d3d11_swap_effect.store(effect);
+  g_d3d11_buffer_count.store(effective_count);
+  g_d3d11_stable_backbuffer.store(g_hooks.configure_d3d11_swapchain &&
+      trt_gpu_d3d11_uses_stable_backbuffer(effective_count, effect));
+  return 0;
+}
+
+void describe_guest_backbuffer(u32* dimensions, u32* format, u32* count, u32* effect) {
+  if (g_sc_is_d3d12) return;
+  const u32 width = g_d3d11_width.load(), height = g_d3d11_height.load();
+  if (width && height) {
+    dimensions[0] = width;
+    dimensions[1] = height;
+  }
+  if (!g_d3d11_stable_backbuffer.load()) return;
+  // Only replace formats the host can create without substituting another.
+  switch (g_d3d11_guest_format) {
+    case 10: case 24: case 28: case 29: case 87: case 91:
+      *format = g_d3d11_guest_format;
+      break;
+    default: break;
+  }
+  *count = g_d3d11_buffer_count.load();
+  *effect = g_d3d11_swap_effect.load();
+}
+
+void record_present(u32 flags, int hr) {
+  if (flags & 1u /* DXGI_PRESENT_TEST */) return;
+  if (!g_sc_is_d3d12) {
+    g_d3d11_last_present.store(hr, std::memory_order_relaxed);
+    if (hr == 0) g_d3d11_visible_presents.fetch_add(1, std::memory_order_relaxed);
+    g_d3d11_presents.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (hr == 0 && !g_sc_presented.exchange(true))
+    trt_core_log("d3d: guest presented its first frame");
+}
 
 struct fake_swapchain {
   const void** vtbl;
@@ -237,9 +332,7 @@ int TRT_GUEST_ABI fake_sc_Present(void* self, u32 sync, u32 flags) {
       g_hooks.prepare_d3d11_present();
     using fn_t = int (TRT_GUEST_ABI *)(void*, u32, u32);
     const int hr = ((fn_t)slot)(sc, sync, safe_flags);
-    if (hr == 0 && !(safe_flags & 1u /*DXGI_PRESENT_TEST*/) &&
-        !g_sc_presented.exchange(true))
-      trt_core_log("d3d: guest presented its first frame");
+    record_present(safe_flags, hr);
     return hr;
   }
   if (g_sc_is_d3d12) {
@@ -250,6 +343,7 @@ int TRT_GUEST_ABI fake_sc_Present(void* self, u32 sync, u32 flags) {
 }
 int TRT_GUEST_ABI fake_sc_GetBuffer(void* self, u32 buffer, const void* riid, void** out) {
   (void)self;
+  if (!g_sc_is_d3d12) g_d3d11_buffers.fetch_add(1, std::memory_order_relaxed);
   void* sc = active_sc();
   void* slot = real_sc_slot(9);
   if (!g_sc_is_d3d12 && g_hooks.get_d3d11_backbuffer) {
@@ -284,15 +378,21 @@ int TRT_GUEST_ABI fake_sc_GetFullscreenState(void* self, int* fullscreen, void**
 }
 int TRT_GUEST_ABI fake_sc_GetDesc(void* self, void* desc) {
   (void)self;
+  if (!desc) return TRT_E_INVALIDARG;
+  u32* d = static_cast<u32*>(desc);
   void* sc = active_sc();
   void* slot = real_sc_slot(12);
   if (slot && sc) {
     using fn_t = int (TRT_GUEST_ABI *)(void*, void*);
-    return ((fn_t)slot)(sc, desc);
+    const int hr = ((fn_t)slot)(sc, desc);
+    if (hr >= 0) {
+      describe_guest_backbuffer(d, &d[4], &d[10], &d[15]);
+      if (!g_sc_is_d3d12 && g_d3d11_hwnd)
+        memcpy(d + 12, &g_d3d11_hwnd, sizeof(g_d3d11_hwnd));
+    }
+    return hr;
   }
-  if (!desc) return (int)0x80070057;
   // DXGI_SWAP_CHAIN_DESC layout (72 bytes on x64)
-  u32* d = (u32*)desc;
   memset(d, 0, 72);
   d[0] = g_sc_width ? g_sc_width : (g_hooks.width ? g_hooks.width : 1280);
   d[1] = g_sc_height ? g_sc_height : (g_hooks.height ? g_hooks.height : 720);
@@ -302,12 +402,16 @@ int TRT_GUEST_ABI fake_sc_GetDesc(void* self, void* desc) {
   d[9] = 0x20; // DXGI_USAGE_RENDER_TARGET_OUTPUT
   d[10] = g_sc_buf_count ? g_sc_buf_count : 2u;  // BufferCount
   d[14] = 1;   // Windowed = TRUE
+  describe_guest_backbuffer(d, &d[4], &d[10], &d[15]);
+  if (!g_sc_is_d3d12 && g_d3d11_hwnd)
+    memcpy(d + 12, &g_d3d11_hwnd, sizeof(g_d3d11_hwnd));
   return 0;
 }
 int TRT_GUEST_ABI fake_sc_ResizeBuffers(void* self, u32 count, u32 w, u32 h, u32 fmt, u32 flags) {
   (void)self;
   if (!g_sc_is_d3d12 && g_hooks.configure_d3d11_swapchain)
-    return g_hooks.configure_d3d11_swapchain(fmt, count);
+    return configure_guest_swapchain(w, h, fmt, count, g_d3d11_swap_effect.load(),
+                                     g_d3d11_hwnd, false);
   void* sc = active_sc();
   void* slot = real_sc_slot(13);
   int hr = 0;
@@ -332,9 +436,31 @@ int TRT_GUEST_ABI fake_sc_ResizeBuffers(void* self, u32 count, u32 w, u32 h, u32
   }
   return 0;
 }
-int TRT_GUEST_ABI fake_sc_ResizeTarget(void* self, const void* mode) {
-  (void)self; (void)mode;
-  return 0;
+int TRT_GUEST_ABI fake_sc_ResizeTarget(void*, const void* mode) {
+  gap_trace_record("DXGI.ResizeTarget");
+  const auto* dimensions = static_cast<const u32*>(mode);
+  const u32 width = dimensions ? dimensions[0] : 0;
+  const u32 height = dimensions ? dimensions[1] : 0;
+  constexpr int invalid_call = static_cast<int>(0x887A0001u);
+  constexpr int unavailable = static_cast<int>(0x887A0022u);
+  int result = invalid_call;
+  if (dimensions && width <= INT32_MAX && height <= INT32_MAX) {
+    result = unavailable;
+    if (!g_sc_is_d3d12 && g_d3d11_hwnd) {
+      // Desktop windowed ResizeTarget changes the client rectangle. A later
+      // ResizeBuffers (including one from WM_SIZE) re-creates the buffers.
+      constexpr u32 flags = 0x0002u | 0x0004u | 0x0010u;  // NOMOVE | NOZORDER | NOACTIVATE
+      result = trt_SetWindowPos(g_d3d11_hwnd, nullptr, 0, 0,
+                               static_cast<i32>(width), static_cast<i32>(height), flags)
+                   ? 0 : invalid_call;
+    }
+  }
+  std::lock_guard<std::mutex> lock(g_resize_stats_mutex);
+  ++g_resize_stats.target_calls;
+  g_resize_stats.target_width = width;
+  g_resize_stats.target_height = height;
+  g_resize_stats.target_result = result;
+  return result;
 }
 static void* out_get_offline_output(u32* addref_done);
 
@@ -375,14 +501,16 @@ int TRT_GUEST_ABI fake_sc_GetLastPresentCount(void* self, u32* count) {
 }
 int TRT_GUEST_ABI fake_sc_GetDesc1(void* self, void* desc1) {
   (void)self;
+  if (!desc1) return TRT_E_INVALIDARG;
+  u32* d = static_cast<u32*>(desc1);
   void* sc = active_sc();
   void* slot = real_sc_slot(18);
   if (slot && sc) {
     using fn_t = int (TRT_GUEST_ABI *)(void*, void*);
-    return ((fn_t)slot)(sc, desc1);
+    const int hr = ((fn_t)slot)(sc, desc1);
+    if (hr >= 0) describe_guest_backbuffer(d, &d[2], &d[7], &d[9]);
+    return hr;
   }
-  if (!desc1) return (int)0x80070057;
-  u32* d = (u32*)desc1;
   memset(d, 0, 48);
   d[0] = g_sc_width ? g_sc_width : (g_hooks.width ? g_hooks.width : 1280);
   d[1] = g_sc_height ? g_sc_height : (g_hooks.height ? g_hooks.height : 720);
@@ -391,19 +519,23 @@ int TRT_GUEST_ABI fake_sc_GetDesc1(void* self, void* desc1) {
   d[6] = 0x20; // DXGI_USAGE_RENDER_TARGET_OUTPUT
   d[7] = g_sc_buf_count ? g_sc_buf_count : 2u;  // BufferCount
   d[9] = 3;    // DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL
+  describe_guest_backbuffer(d, &d[2], &d[7], &d[9]);
   return 0;
 }
 int TRT_GUEST_ABI fake_sc_GetFullscreenDesc(void* self, void* fdesc) {
   (void)self;
   if (!fdesc) return (int)0x80070057;
-  memset(fdesc, 0, 28);
-  ((u32*)fdesc)[6] = 1;  // Windowed = TRUE
+  // DXGI_SWAP_CHAIN_FULLSCREEN_DESC has five DWORD fields.
+  auto* desc = static_cast<u32*>(fdesc);
+  memset(desc, 0, 5 * sizeof(*desc));
+  desc[4] = 1;  // Windowed = TRUE
   return 0;
 }
 int TRT_GUEST_ABI fake_sc_GetHwnd(void* self, void** hwnd) {
   (void)self;
-  if (hwnd) *hwnd = nullptr;
-  return 0x887A0001;  // DXGI_ERROR_INVALID_CALL on CoreWindow
+  if (!hwnd) return TRT_E_INVALIDARG;
+  *hwnd = !g_sc_is_d3d12 ? g_d3d11_hwnd : nullptr;
+  return *hwnd ? 0 : (int)0x887A0001u;  // DXGI_ERROR_INVALID_CALL on CoreWindow
 }
 int TRT_GUEST_ABI fake_sc_GetCoreWindow(void* self, const void* riid, void** unk) {
   (void)self;
@@ -425,7 +557,9 @@ int TRT_GUEST_ABI fake_sc_Present1(void* self, u32 sync, u32 flags, const void* 
         g_hooks.prepare_d3d11_present)
       g_hooks.prepare_d3d11_present();
     using fn_t = int (TRT_GUEST_ABI *)(void*, u32, u32, const void*);
-    return ((fn_t)slot)(sc, sync, flags & ~0x200u, params);
+    const int hr = ((fn_t)slot)(sc, sync, flags & ~0x200u, params);
+    record_present(flags, hr);
+    return hr;
   }
   return fake_sc_Present(self, sync, flags);
 }
@@ -478,6 +612,7 @@ int TRT_GUEST_ABI fake_sc_GetMatrixTransform(void*, void* m) {
   return 0;
 }
 u32 TRT_GUEST_ABI fake_sc_GetCurrentBackBufferIndex(void*) {
+  if (!g_sc_is_d3d12 && g_d3d11_stable_backbuffer.load()) return 0;
   void* sc = active_sc3();
   void* slot = real_sc_slot(36);
   if (slot && sc) {
@@ -509,6 +644,8 @@ int TRT_GUEST_ABI fake_sc_SetColorSpace1(void*, u32 cs) {
 int TRT_GUEST_ABI fake_sc_ResizeBuffers1(void* self, u32 count, u32 w, u32 h,
                                          u32 fmt, u32 flags, const u32* mask,
                                          void* const* queues) {
+  if (!g_sc_is_d3d12 && g_hooks.configure_d3d11_swapchain)
+    return fake_sc_ResizeBuffers(self, count, w, h, fmt, flags);
   void* sc = active_sc3();
   void* slot = real_sc_slot(39);
   if (g_sc_is_d3d12) {
@@ -1062,8 +1199,9 @@ int TRT_GUEST_ABI fake_GetPrivateData(void*, const void*, void*, u32*) { return 
 int TRT_GUEST_ABI fake_GetParent(void*, void**) { return TRT_E_NOTIMPL; }
 
 int create_swapchain_impl(void* device, u32 w, u32 h, u32 fmt, u32 count,
-                          void** swapchain) {
+                          u32 swap_effect, void** swapchain, void* hwnd = nullptr) {
   if (!swapchain) return TRT_E_NOINTERFACE;
+  *swapchain = nullptr;
   g_sc_presented.store(false);
   if (trt_d3d12_is_queue(device)) {
     if (g_hooks.acquire_d3d12_swapchain) {
@@ -1086,15 +1224,12 @@ int create_swapchain_impl(void* device, u32 w, u32 h, u32 fmt, u32 count,
     return 0;
   }
   if (!g_hooks.swapchain) return TRT_E_NOTIMPL;
-  if (g_hooks.configure_d3d11_swapchain) {
-    const int hr = g_hooks.configure_d3d11_swapchain(fmt, count);
-    if (hr < 0) {
-      *swapchain = nullptr;
-      return hr;
-    }
-  }
+  const int hr = configure_guest_swapchain(w, h, fmt, count, swap_effect, hwnd, true);
+  if (hr < 0) return hr;
   g_sc_is_d3d12 = false;
   *swapchain = &g_swapchain_proxy_obj;
+  ++g_swapchain_proxy_obj.refcount;
+  g_d3d11_swapchains.fetch_add(1, std::memory_order_relaxed);
   return 0;
 }
 
@@ -1132,7 +1267,8 @@ int TRT_GUEST_ABI fake_CreateSwapChain(void* self, void* device, void* desc,
            "trt: IDXGIFactory::CreateSwapChain(%ux%u fmt=%u cnt=%u) -> out=%p",
            w, h, fmt, cnt, (void*)swapchain);
   trt_core_log(line);
-  return create_swapchain_impl(device, w, h, fmt, cnt, swapchain);
+  return create_swapchain_impl(device, w, h, fmt, cnt, d ? d[15] : 3,
+                               swapchain, desktop_swapchain_window(d));
 }
 int TRT_GUEST_ABI fake_CreateSoftwareAdapter(void*, void*, void**) { return TRT_E_NOTIMPL; }
 
@@ -1161,7 +1297,7 @@ int TRT_GUEST_ABI fake_IsWindowedStereoEnabled(void*) { return 0; }
 int TRT_GUEST_ABI fake_CreateSwapChainForHwnd(void* self, void* device, void* hwnd,
                                 void* desc, void* fullscreen_desc, void* restrict_info,
                                 void** swapchain) {
-  (void)self; (void)hwnd; (void)fullscreen_desc; (void)restrict_info;
+  (void)self; (void)fullscreen_desc; (void)restrict_info;
   const u32* d = (const u32*)desc;
   const u32 w = d ? d[0] : 0;
   const u32 h = d ? d[1] : 0;
@@ -1172,21 +1308,16 @@ int TRT_GUEST_ABI fake_CreateSwapChainForHwnd(void* self, void* device, void* hw
            "trt: CreateSwapChainForHwnd(%ux%u fmt=%u cnt=%u) -> out=%p",
            w, h, fmt, cnt, (void*)swapchain);
   trt_core_log(line);
-  return create_swapchain_impl(device, w, h, fmt, cnt, swapchain);
+  return create_swapchain_impl(device, w, h, fmt, cnt, d ? d[9] : 3, swapchain, hwnd);
 }
-int TRT_GUEST_ABI fake_CreateSwapChainForCoreWindow(void* self, void* device, void* core_window,
-                                       void* desc, void* fullscreen_desc,
-                                       void* restrict_info,
-                                       void** swapchain) {
-  // REAL Win64 ABI (IDXGIFactory2::CreateSwapChainForCoreWindow): self,
-  // pDevice, pWindow, pDesc, pFullscreenDesc, pRestrictToOutput, ppSwapChain
-  // — 7 params. The fullscreen_desc slot was MISSING (the handler used to
-  // read pRestrictToOutput as the out-pointer); caught by the TRIANGLE GATE
-  // guest on its first run.
-  (void)self; (void)core_window; (void)fullscreen_desc; (void)restrict_info;
+int TRT_GUEST_ABI fake_CreateSwapChainForCoreWindow(void* self, void* device,
+                                                   void* core_window, const void* desc,
+                                                   void* restrict_info, void** swapchain) {
+  // IDXGIFactory2 declares fullscreen_desc only for CreateSwapChainForHwnd.
+  (void)self; (void)core_window; (void)restrict_info;
   const u32* d = (const u32*)desc;
   return create_swapchain_impl(device, d ? d[0] : 0, d ? d[1] : 0,
-                               d ? d[2] : 87, d ? d[7] : 2, swapchain);
+                               d ? d[2] : 87, d ? d[7] : 2, d ? d[9] : 3, swapchain);
 }
 int TRT_GUEST_ABI fake_GetSharedResourceAdapterLuid(void*, void*, void*) { return TRT_E_NOTIMPL; }
 int TRT_GUEST_ABI fake_RegisterStereoStatusWindow(void*, u32, void*) { return TRT_E_NOTIMPL; }
@@ -1200,7 +1331,7 @@ int TRT_GUEST_ABI fake_CreateSwapChainForComposition(void* self, void* device, v
   (void)self; (void)restrict_info;
   const u32* d = (const u32*)desc;
   return create_swapchain_impl(device, d ? d[0] : 0, d ? d[1] : 0,
-                               d ? d[2] : 87, d ? d[7] : 2, swapchain);
+                               d ? d[2] : 87, d ? d[7] : 2, d ? d[9] : 3, swapchain);
 }
 
 // --- IDXGIFactory3 / IDXGIFactory4 / IDXGIFactory5 / IDXGIFactory6 ---------
@@ -1317,6 +1448,7 @@ extern "C" int TRT_GUEST_ABI trt_D3D11CreateDevice(void* adapter, u32 driver_typ
                           u32 feature_level_count, u32 sdk_version,
                           void** out_device, u32* out_level, void** out_context) {
   gap_trace_record("D3D11CreateDevice");
+  g_d3d11_devices.fetch_add(1, std::memory_order_relaxed);
   // .215 DIAG: Sekiro silent death -- does the game reach D3D11 device creation?
   {
     char line[160];
@@ -1353,13 +1485,28 @@ extern "C" int TRT_GUEST_ABI trt_D3D11CreateDeviceAndSwapChain(void* adapter, u3
                                        void* swapchain_desc, void** out_swapchain,
                                        void** out_device, u32* out_level,
                                        void** out_context) {
-  (void)swapchain_desc;
+  if (out_swapchain) *out_swapchain = nullptr;
+  if (out_device) *out_device = nullptr;
+  if (out_context) *out_context = nullptr;
+  u32 level = 0;
   const int hr = trt_D3D11CreateDevice(adapter, driver_type, software, flags,
                                        feature_levels, feature_level_count,
-                                       sdk_version, out_device, out_level,
-                                       out_context);
+                                       sdk_version, nullptr, &level, nullptr);
   if (hr != 0) return hr;
-  if (out_swapchain) *out_swapchain = retain_com_object(g_hooks.swapchain);
+
+  if (out_swapchain) {
+    // DXGI_SWAP_CHAIN_DESC, using the same layout as IDXGIFactory::CreateSwapChain.
+    const auto* desc = static_cast<const u32*>(swapchain_desc);
+    const int result = create_swapchain_impl(g_hooks.device, desc ? desc[0] : 0,
+        desc ? desc[1] : 0, desc ? desc[4] : 0, desc ? desc[10] : 0,
+        desc ? desc[15] : 3, out_swapchain, desktop_swapchain_window(desc));
+    if (result < 0) return result;
+  }
+
+  // Publish references only after both parts have succeeded.
+  if (out_device) *out_device = retain_com_object(g_hooks.device);
+  if (out_context) *out_context = retain_com_object(g_hooks.context);
+  if (out_level) *out_level = level;
   return 0;
 }
 
@@ -1444,6 +1591,71 @@ void trt_gpu_set_hooks(const trt_gpu_hooks* hooks) {
 }
 
 const trt_gpu_hooks* trt_gpu_hooks_get(void) { return &g_hooks; }
+
+// Preflight answers: what the host can actually present or create right now.
+int trt_gpu_host_device_present(void) {
+  return (g_hooks.device && g_hooks.context) ? 1 : 0;
+}
+int trt_gpu_host_d3d12_present(void) { return g_hooks.d3d12_device ? 1 : 0; }
+int trt_gpu_host_swapchain_present(void) {
+  return (g_hooks.swapchain || g_hooks.d3d12_swapchain) ? 1 : 0;
+}
+
+int trt_gpu_d3d11_uses_stable_backbuffer(u32 buffer_count, u32 swap_effect) {
+  return buffer_count == 1 || swap_effect == 0 /* DXGI_SWAP_EFFECT_DISCARD */;
+}
+
+u32 trt_gpu_count_lit_rgb32(const void* pixels, u32 width, u32 height, u32 row_pitch) {
+  if (!pixels || width > row_pitch / 4u) return 0;
+  const auto* row = static_cast<const u8*>(pixels);
+  u32 lit = 0;
+  for (u32 y = 0; y < height; ++y, row += row_pitch) {
+    for (u32 x = 0; x < width; ++x) {
+      const auto* rgb = row + x * 4u;
+      if (rgb[0] > 12 || rgb[1] > 12 || rgb[2] > 12) ++lit;
+    }
+  }
+  return lit;
+}
+
+void trt_gpu_reset_render_stats(void) {
+  g_d3d11_devices.store(0, std::memory_order_relaxed);
+  g_d3d11_swapchains.store(0, std::memory_order_relaxed);
+  g_d3d11_buffers.store(0, std::memory_order_relaxed);
+  g_d3d11_presents.store(0, std::memory_order_relaxed);
+  g_d3d11_visible_presents.store(0, std::memory_order_relaxed);
+  g_d3d11_last_present.store(0, std::memory_order_relaxed);
+  g_d3d11_swap_effect.store(3, std::memory_order_relaxed);
+  g_d3d11_buffer_count.store(2, std::memory_order_relaxed);
+  g_d3d11_stable_backbuffer.store(0, std::memory_order_relaxed);
+  g_d3d11_guest_format = 0;
+  g_d3d11_width.store(0);
+  g_d3d11_height.store(0);
+  g_d3d11_hwnd = nullptr;
+  std::lock_guard<std::mutex> lock(g_resize_stats_mutex);
+  g_resize_stats = {};
+}
+
+void trt_gpu_get_resize_stats(trt_gpu_resize_stats* stats) {
+  if (!stats) return;
+  std::lock_guard<std::mutex> lock(g_resize_stats_mutex);
+  *stats = g_resize_stats;
+}
+
+void trt_gpu_get_render_stats(trt_gpu_render_stats* stats) {
+  if (!stats) return;
+  stats->d3d11_device_calls = g_d3d11_devices.load(std::memory_order_relaxed);
+  stats->d3d11_swapchains = g_d3d11_swapchains.load(std::memory_order_relaxed);
+  stats->d3d11_get_buffer_calls = g_d3d11_buffers.load(std::memory_order_relaxed);
+  stats->d3d11_present_calls = g_d3d11_presents.load(std::memory_order_relaxed);
+  stats->d3d11_successful_presents = g_d3d11_visible_presents.load(std::memory_order_relaxed);
+  stats->d3d11_last_present_result = g_d3d11_last_present.load(std::memory_order_relaxed);
+  stats->d3d11_swap_effect = g_d3d11_swap_effect.load(std::memory_order_relaxed);
+  stats->d3d11_buffer_count = g_d3d11_buffer_count.load(std::memory_order_relaxed);
+  stats->d3d11_stable_backbuffer = g_d3d11_stable_backbuffer.load(std::memory_order_relaxed);
+  stats->d3d11_width = g_d3d11_width.load(std::memory_order_relaxed);
+  stats->d3d11_height = g_d3d11_height.load(std::memory_order_relaxed);
+}
 
 int trt_bridge_register_d3d(void) {
   // ---- dwmapi: the DWM compositor surface UnityPlayer asks for.

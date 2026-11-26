@@ -2,6 +2,7 @@
 #ifndef TIRAMISU_SWAPCHAIN_H
 #define TIRAMISU_SWAPCHAIN_H
 
+#include <cstdint>
 #include <d3d11_1.h>
 #include <dxgi1_2.h>
 #include <winrt/base.h>
@@ -26,9 +27,29 @@ void* swapchain_d3d();                  // ID3D11Device1* for the UI layer
 void swapchain_bind_d3d9();             // bind the D3D9->D3D11 drawing backend
 void swapchain_restore_d3d11();         // rebind D3D11 CoreWindow swapchain if guest used D3D12
 void swapchain_restore_launcher_format();
-void draw_pointer(bool launcher);
-void set_pointer_cursor_mode(bool kbm_active);
-void set_launcher_cursor_visible(bool visible);
+void draw_guest_pointer();
+void set_guest_cursor_visible(bool visible);
+bool guest_cursor_overlay_ready(uint64_t now);
+// Status of the guest D3D11 pipeline query. A successful Present does
+// not imply that the guest issued draws or reached a visible scene.
+struct guest_draw_probe {
+  unsigned state;  // 0 idle, 1 measuring, 2 draw observed, 3 failed, 4 exhausted
+  unsigned samples;
+  unsigned long long vertices;
+  unsigned long long pixel_invocations;
+  int result;
+  unsigned surface_samples;
+  unsigned guest_lit_pixels;
+  unsigned host_lit_pixels;
+  int surface_result;
+  unsigned nonempty_draw_samples, guest_rtv_samples, other_rtv_samples;
+  unsigned other_surface_samples, other_lit_pixels;
+  unsigned other_width, other_height, other_format;
+  int other_surface_result;
+};
+void swapchain_reset_guest_draw_probe();
+guest_draw_probe swapchain_guest_draw_probe();
+
 void swapchain_present();
 void swapchain_shutdown();
 

@@ -518,6 +518,15 @@ int TRT_GUEST_ABI ole_SafeArrayPutElement(u16* h, const i32* idx,
   memcpy((u8*)sa->data + i * sa->element_bytes, v, sa->element_bytes);
   return S_OK_;
 }
+int TRT_GUEST_ABI ole_SafeArrayPtrOfIndex(u16* h, const i32* idx,
+                                         void** ppvData) {
+  safearray* sa = (safearray*)h;
+  if (!sa || !idx || !ppvData) return E_INVALIDARG_;
+  const u32 i = (u32)(*idx - (i32)sa->lower);
+  if (i >= sa->elements) return E_INVALIDARG_;
+  *ppvData = (u8*)sa->data + i * sa->element_bytes;
+  return S_OK_;
+}
 
 // ---- PropVariant head (PropVariantInit) ----
 void TRT_GUEST_ABI ole_PropVariantInit(void* p) {
@@ -908,6 +917,7 @@ int trt_bridge_register_ole(void) {
       {"#25", (void*)&ole_SafeArrayGetElement},
       {"#26", (void*)&ole_SafeArrayPutElement},
       {"#77", (void*)&ole_SafeArrayGetVartype},
+      {"#148", (void*)&ole_SafeArrayPtrOfIndex},
       {"#149", (void*)&ole_SysStringByteLen},
       {"#150", (void*)&ole_SysAllocStringByteLen},
       {"#411", (void*)&ole_SafeArrayCreateVector},
@@ -928,6 +938,7 @@ int trt_bridge_register_ole(void) {
       {"SafeArrayGetLBound", (void*)&ole_SafeArrayGetLBound},
       {"SafeArrayGetElement", (void*)&ole_SafeArrayGetElement},
       {"SafeArrayPutElement", (void*)&ole_SafeArrayPutElement},
+      {"SafeArrayPtrOfIndex", (void*)&ole_SafeArrayPtrOfIndex},
       {"SetErrorInfo", (void*)&ole_SetErrorInfo},
       {"GetErrorInfo", (void*)&ole_GetErrorInfo},
   };

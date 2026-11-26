@@ -34,6 +34,34 @@
       ]
     },
     {
+      "title": "Cuphead",
+      "dir": "cuphead",
+      "build": "Unity, D3D11",
+      "machine": "PE32+ x64",
+      "boots": "yes — guest GPU work verified",
+      "renders": "**no visible game frame** — dark guest framebuffer on 0.2.4.38",
+      "audio": "not measured",
+      "input": "game response unverified",
+      "playable": "**no** — menu unreached",
+      "evidence": [
+        "docs/proof/xbox-series-s-2026-11-26-launch-check.json"
+      ]
+    },
+    {
+      "title": "Sekiro",
+      "dir": "sekiro",
+      "build": "Windows PC",
+      "machine": "PE32+ x64",
+      "boots": "guest entry invoked on 0.2.4.38",
+      "renders": "**no** — process exits before D3D11 initialization",
+      "audio": "not measured",
+      "input": "not reached",
+      "playable": "**no** — menu unreached",
+      "evidence": [
+        "docs/proof/xbox-series-s-2026-11-26-launch-check.json"
+      ]
+    },
+    {
       "title": "God of War (PC)",
       "dir": "god-of-war",
       "build": "AAA in-house engine, D3D11",

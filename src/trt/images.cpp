@@ -4,6 +4,7 @@
 #include "pe_exports.h"
 #include "thunk.h"
 #include "x86_32.h"
+#include "dynamic_api.h"
 
 #include <mutex>
 #include <stdio.h>
@@ -53,6 +54,7 @@ std::mutex g_img_mu;
 const trt_backend* g_be = nullptr;
 trt_resolver g_rs;
 char g_search_dir[512] = "";
+char g_content_root[512] = "";
 char g_set_dll_dir[512] = "";
 struct extra_dll_dir {
   char path[512];
@@ -187,11 +189,17 @@ void trt_runtime_init(const trt_backend* be, const char* search_dir) {
   g_be = be;
   if (search_dir) snprintf(g_search_dir, sizeof(g_search_dir), "%s", search_dir);
   else g_search_dir[0] = 0;
+  g_content_root[0] = 0;
   g_set_dll_dir[0] = 0;
   memset(g_extra_dll_dirs, 0, sizeof(g_extra_dll_dirs));
   g_load_dir_depth = 0;
   g_rs.user = nullptr;
   g_rs.resolve = &trt_resolve_full;
+}
+
+void trt_runtime_set_content_root(const char* host_dir) {
+  const int n = snprintf(g_content_root, sizeof(g_content_root), "%s", host_dir ? host_dir : "");
+  if (n < 0 || static_cast<size_t>(n) >= sizeof(g_content_root)) g_content_root[0] = 0;
 }
 
 void trt_runtime_set_dll_dir(const char* host_dir) {
@@ -244,6 +252,10 @@ int trt_runtime_find_dll(const char* name_or_rel, char* out, size_t cap) {
         probe_dll_in_dir(g_extra_dll_dirs[i].path, name_or_rel, out, cap)) {
       return 0;
     }
+  }
+  // The merged game root may supply DLLs outside the executable directory.
+  if (g_content_root[0] && probe_dll_in_dir(g_content_root, name_or_rel, out, cap)) {
+    return 0;
   }
   return -1;
 }
@@ -323,6 +335,23 @@ void trt_images_register_main(trt_image* img, const char* guest_name) {
   // STAGE 7: HMODULE == image base on Windows (guest code dereferences it:
   // UnityCrashHandler64's CRT does cmp $0x5a4d,(%rax) on the handle right
   // after GetModuleHandleW — a synthetic tag faults there)
+  g.handle = (void*)(uintptr_t)img->base;
+  ++g_image_count;
+}
+
+void trt_images_register_alias(trt_image* img, const char* alias_name) {
+  if (!img || !alias_name || !alias_name[0]) return;
+  std::lock_guard<std::mutex> lk(g_img_mu);
+  if (g_image_count >= TRT_MAX_GUEST_IMAGES) return;
+  const char* base = base_name(alias_name);
+  for (int i = 0; i < g_image_count; ++i) {
+    if (ieq(g_images[i].name, base)) return;
+  }
+  guest_image& g = g_images[g_image_count];
+  memset(&g, 0, sizeof(g));
+  snprintf(g.name, sizeof(g.name), "%s", base);
+  snprintf(g.path, sizeof(g.path), "<alias>");
+  g.img = img;
   g.handle = (void*)(uintptr_t)img->base;
   ++g_image_count;
 }
@@ -466,28 +495,31 @@ static trt_image* try_load_sibling(const char* module) {
   return trt_load_pe(host, base_name(host), 1);
 }
 
-void* trt_resolve_full(void* user, const char* module, const char* symbol,
-                       u16 ordinal) {
-  (void)user;
+static void* resolve_guest_symbol(const char* module, const char* symbol,
+                                  u16 ordinal, bool optional) {
   if (!module) return nullptr;
-
-  // 1. a guest image we already loaded (the game's own DLLs win over the
-  //    system's, exactly like the Windows loader's search order)
+  // Respect the loaded image and normal sibling DLL search in either path.
   trt_image* img = trt_images_find(module);
-  if (!img) {
-    // 2. a DLL the game ships that we have not loaded yet
-    img = try_load_sibling(module);
-  }
+  if (!img) img = try_load_sibling(module);
   if (img) {
-    void* fn = trt_pe_find_export(g_be, &g_rs, img, symbol, ordinal);
-    if (fn) return fn;
-    // the image does not export it: fall through to the module table
+    const auto* resolver = optional ? trt_runtime_export_resolver() : &g_rs;
+    void* fn = trt_pe_find_export(g_be, resolver, img, symbol, ordinal);
+    if (fn || optional) return fn;
   }
+  return optional ? trt_resolve_export(module, symbol, ordinal)
+                  : trt_resolve_module(nullptr, module, symbol, ordinal);
+}
 
-  // 3. system modules (builtin bridges, api-set contracts, console DLLs)
-  extern void* trt_resolve_module(void* user, const char* module,
-                                  const char* symbol, u16 ordinal);
-  return trt_resolve_module(nullptr, module, symbol, ordinal);
+void* trt_resolve_full(void*, const char* module, const char* symbol, u16 ordinal) {
+  return resolve_guest_symbol(module, symbol, ordinal, false);
+}
+
+const trt_resolver* trt_runtime_export_resolver(void) {
+  static const trt_resolver resolver{nullptr,
+      [](void*, const char* module, const char* symbol, u16 ordinal) -> void* {
+    return resolve_guest_symbol(module, symbol, ordinal, true);
+  }};
+  return &resolver;
 }
 
 // ---------------------------------------------------------------------------
