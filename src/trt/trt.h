@@ -261,6 +261,8 @@ void trt_bridge_boot(const trt_backend* be);
 int trt_bridge_register_kernel32(void);
 void trt_bridge_new_thread_id(u32 id);
 void trt_vfs_mount(const char* drive_prefix, const char* host_path);
+// Translate a mounted host path back to its Windows guest path.
+int trt_vfs_host_to_guest(const char* host_path, char* out, size_t out_cap);
 // Disc images: a read-only drive served straight out of a .iso/.bin/.img.
 // Files are extracted lazily into the cache root; the image is never written.
 struct trt_iso;
@@ -423,6 +425,34 @@ u64 gap_trace_note_tex_fail(void);
 u64 gap_trace_tex_fails(void);
 u64 gap_trace_main_cv_waits(void);
 void trt_syscall_trap_install(void);
+
+// Memory budget governor surface (bridge_membudget.cpp)
+u64 trt_mem_budget_bytes(void);
+void trt_mem_budget_set_mb(u32 mb);
+u32 trt_mem_budget_get_mb(void);
+u64 trt_mem_budget_committed(void);
+u64 trt_mem_budget_mapped(void);
+u64 trt_mem_budget_peak(void);
+u64 trt_mem_budget_refusals(void);
+u64 trt_mem_budget_va_bytes(void);
+u64 trt_mem_budget_reserved(void);
+u64 trt_mem_budget_va_peak(void);
+u64 trt_mem_budget_va_refusals(void);
+int trt_mem_budget_charge_commit(u64 bytes);
+void trt_mem_budget_discharge_commit(u64 bytes);
+int trt_mem_budget_charge_map(u64 bytes);
+void trt_mem_budget_discharge_map(u64 bytes);
+void trt_mem_budget_report(char* line, unsigned cap);
+void trt_mem_budget_reset(void);
+
+// ESRAM budget-ledger surface (bridge_esram.cpp; accounting only)
+void trt_esram_init(u32 size_mb);
+int trt_esram_is_active(void);
+int trt_esram_should_place(u32 bind_flags, u64 byte_size);
+int trt_esram_alloc(u64 bytes, const char* debug_name);
+void trt_esram_free(u64 bytes);
+int trt_esram_get_stats(u64* out_used_bytes, u64* out_total_bytes, u64* out_alloc_count);
+void trt_esram_reset(void);
 
 #ifdef __cplusplus
 }

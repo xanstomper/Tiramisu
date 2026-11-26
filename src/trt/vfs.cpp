@@ -477,6 +477,39 @@ void trt_vfs_mount(const char* drive_prefix, const char* host_path) {
     strncpy(g_cwd_drive, m.prefix, sizeof(g_cwd_drive) - 1);
 }
 
+// Resolve a loaded file back to the longest matching guest mount.
+int trt_vfs_host_to_guest(const char* host_path, char* out, size_t out_cap) {
+  if (!host_path || !out || !out_cap) return -1;
+  size_t best = 0;
+  int slot = -1;
+  for (int i = 0; i < g_mount_count; ++i) {
+    const char* root = g_mounts[i].target;
+    size_t n = strlen(root);
+    while (n > 1 && (root[n - 1] == '/' || root[n - 1] == '\\')) --n;
+    if (!n || n < best || strlen(host_path) < n) continue;
+    size_t j = 0;
+    for (; j < n; ++j) {
+      char a = root[j], b = host_path[j];
+      if (a == '\\') a = '/';
+      if (b == '\\') b = '/';
+#if defined(_WIN32)
+      a = lower_of(a); b = lower_of(b);
+#endif
+      if (a != b) break;
+    }
+    if (j != n || (host_path[n] && host_path[n] != '/' && host_path[n] != '\\')) continue;
+    best = n; slot = i;
+  }
+  if (slot < 0) return -1;
+  const char* rest = host_path + best;
+  while (*rest == '/' || *rest == '\\') ++rest;
+  const int written = snprintf(out, out_cap, "%s\\%s", g_mounts[slot].prefix, rest);
+  if (written < 0 || (size_t)written >= out_cap) return -1;
+  out[0] = upper_of(out[0]);
+  for (char* p = out; *p; ++p) if (*p == '/') *p = '\\';
+  return 0;
+}
+
 int trt_vfs_stat(const char* host_path, int* is_dir, u64* size_out) {
   if (!host_path || !*host_path) return -1;
   char tmp[1024];

@@ -145,6 +145,7 @@ void* fake_system_load(const char* module, const char* symbol) {
 extern "C" void* TRT_STDCALL trt_LoadLibraryW(const u16*);
 extern "C" void* TRT_STDCALL trt_GetProcAddress(void*, const char*);
 extern "C" void* TRT_STDCALL trt_GetProcessHeap(void);
+extern "C" u32 TRT_STDCALL trt_GetModuleFileNameW(void*, u16*, u32);
 
 // NOTE: the arguments are read through MEMORY constraints and BEFORE %rsp
 // is adjusted. With register constraints the compiler may pick a register
@@ -241,6 +242,21 @@ int main(int argc, char** argv) {
   CHECK(dll_main_called_host, "DllMain reached the host with the right arguments");
   CHECK(g_fake_calls >= 3, "cross-image calls landed (DllMain + 2 exports)");
 
+  if (argc >= 4) {
+    trt_vfs_mount("z:", argv[3]);
+    char nested_path[1024];
+    snprintf(nested_path, sizeof(nested_path), "%s/sub/nested.dll", argv[3]);
+    trt_image* nested = trt_load_pe(nested_path, "nested.dll", 0);
+    CHECK(nested != nullptr, "nested DLL mapped for module-path check");
+    if (nested) {
+      u16 actual[512] = {};
+      const u32 n = trt_GetModuleFileNameW(trt_images_handle(nested), actual, 512);
+      const char* expected = "Z:\\sub\\nested.dll";
+      bool same = n == strlen(expected);
+      for (u32 i = 0; same && i < n; ++i) same = actual[i] == (u16)expected[i];
+      CHECK(same, "GetModuleFileNameW preserves DLL subdirectory");
+    }
+  }
   printf("\nRESULT: %s\n", failures ? "FAILURES" : "ALL PASS");
   return failures ? 1 : 0;
 }

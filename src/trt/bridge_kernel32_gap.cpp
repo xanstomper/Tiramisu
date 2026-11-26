@@ -59,6 +59,7 @@ extern "C" char* trt_gap_cwd(void);           // the guest cwd (g_cwd)
 extern "C" const char* trt_gap_exepath(void);  // the guest exe path (g_exepath)
 extern "C" void TRT_STDCALL trt_SetLastError(u32 e);
 extern "C" u32 TRT_STDCALL trt_GetLastError(void);
+extern "C" void* TRT_STDCALL trt_LocalAlloc(u32 flags, u64 bytes);
 extern "C" int TRT_STDCALL trt_CreateDirectoryW(const u16* path, void* sa);
 extern "C" u32 TRT_STDCALL trt_GetCurrentProcessId(void);
 extern "C" void* TRT_GUEST_ABI trt_GetStdHandle(u32 handle_id);
@@ -314,23 +315,37 @@ int TRT_STDCALL trt_MulDiv(int a, int b, int c) {
 // ---- diagnostics formatting -------------------------------------------------
 u32 TRT_STDCALL trt_FormatMessageW(u32 flags, const void* src, u32 msgid,
                                    u32 langid, u16* buf, u32 size, void* args) {
-  (void)langid; (void)args;
-  // FORMAT_MESSAGE_FROM_SYSTEM (0x1000): a numeric error code only — the
-  // honest answer is the code itself; full message tables are a named gap.
-  if (flags & 0x1000) {
-    char narrow[96];
-    snprintf(narrow, sizeof(narrow), "error %lu", (unsigned long)msgid);
-    u32 n = 0;
-    for (; narrow[n] && n < size - 1; ++n) buf[n] = (u16)(u8)narrow[n];
-    buf[n] = 0;
-    return n;
+  (void)src; (void)langid; (void)args;
+  constexpr u32 k_allocate_buffer = 0x100u;
+  constexpr u32 k_from_system = 0x1000u;
+  if (!buf) { trt_SetLastError(87); return 0; }
+  if (!(flags & k_from_system)) {
+    LOG("kernel32: FormatMessageW unsupported message source -> 0");
+    trt_SetLastError(317); // ERROR_MR_MID_NOT_FOUND
+    return 0;
   }
-  char line[128];
-  snprintf(line, sizeof(line),
-           "kernel32: FormatMessageW flags=0x%lx unsupported (only "
-           "FROM_SYSTEM) -> 0", (unsigned long)flags);
-  LOG(line);
-  return 0;
+  char diag[128];
+  snprintf(diag, sizeof(diag), "kernel32: FormatMessageW flags=0x%lx message_id=%lu",
+           (unsigned long)flags, (unsigned long)msgid);
+  LOG(diag);
+  char narrow[96];
+  const int n = snprintf(narrow, sizeof(narrow), "error %lu", (unsigned long)msgid);
+  if (n < 0 || (size_t)n >= sizeof(narrow)) { trt_SetLastError(87); return 0; }
+  u16* dest = buf;
+  if (flags & k_allocate_buffer) {
+    // lpBuffer is really an LPWSTR* with this flag; LocalFree owns it.
+    *reinterpret_cast<u16**>(buf) = nullptr;
+    const u64 count = (u64)n + 1 > size ? (u64)n + 1 : size;
+    dest = (u16*)trt_LocalAlloc(0, count * sizeof(u16));
+    if (!dest) { trt_SetLastError(8); return 0; }
+    *reinterpret_cast<u16**>(buf) = dest;
+  } else if (size <= (u32)n) {
+    trt_SetLastError(122); // ERROR_INSUFFICIENT_BUFFER
+    return 0;
+  }
+  for (int i = 0; i < n; ++i) dest[i] = (u16)(u8)narrow[i];
+  dest[n] = 0;
+  return (u32)n;
 }
 
 // ---- loader search path ------------------------------------------------------
@@ -590,23 +605,66 @@ int TRT_STDCALL trt_SetEndOfFile(void* h) {
 // < 2GB in the VFS so long works on both hosts. (_ftelli64 exists but the
 // handle table stores FILE* only — no size caching needed for <2GB.)
 
+// ---- forward declarations ---------------------------------------------------
+int TRT_STDCALL trt_GetFileTime(void* h, u64* created, u64* accessed, u64* modified);
+
+// Win32 BY_HANDLE_FILE_INFORMATION ABI (52 bytes on x86 and x64):
+// Exactly 13 32-bit DWORD fields. Any 64-bit field inside forces alignment/padding
+// that breaks callers (such as Mono's _fstat which reads nFileSizeLow at offset 0x24).
+struct trt_by_handle_file_information {
+  u32 dwFileAttributes;
+  u32 ftCreationTime_low;
+  u32 ftCreationTime_high;
+  u32 ftLastAccessTime_low;
+  u32 ftLastAccessTime_high;
+  u32 ftLastWriteTime_low;
+  u32 ftLastWriteTime_high;
+  u32 dwVolumeSerialNumber;
+  u32 nFileSizeHigh;
+  u32 nFileSizeLow;
+  u32 nNumberOfLinks;
+  u32 nFileIndexHigh;
+  u32 nFileIndexLow;
+};
+static_assert(sizeof(trt_by_handle_file_information) == 52,
+              "BY_HANDLE_FILE_INFORMATION must be exactly 52 bytes");
+
 int TRT_STDCALL trt_GetFileInformationByHandle(void* h, void* info) {
-  // BY_HANDLE_FILE_INFORMATION: attributes u32, times 8+8, volume/serial
-  // u32+u32... 52 bytes total on x64. Size + attributes are the fields
-  // games actually read; times are zero (named gap).
-  struct bhfi { u32 attrs; u64 created, accessed, modified;
-                u32 vol_serial, index_hi, index_lo; u64 size; };
   FILE* os = trt_file_os(h);
   if (!os) { trt_SetLastError(6); return 0; }
   if (!info) { trt_SetLastError(87); return 0; }
-  bhfi* b = (bhfi*)info;
+  trt_by_handle_file_information* b = (trt_by_handle_file_information*)info;
   memset(b, 0, sizeof(*b));
-  b->attrs = 0x80;  // FILE_ATTRIBUTE_NORMAL
-  const long pos = ftell(os);
-  fseek(os, 0, SEEK_END);
-  const long sz = ftell(os);
-  fseek(os, pos, SEEK_SET);
-  b->size = (u64)sz;
+  b->dwFileAttributes = 0x80;  // FILE_ATTRIBUTE_NORMAL
+  b->nNumberOfLinks = 1;
+
+  u64 ft = 0;
+  trt_GetFileTime(h, &ft, nullptr, nullptr);
+  b->ftCreationTime_low = (u32)ft;
+  b->ftCreationTime_high = (u32)(ft >> 32);
+  b->ftLastAccessTime_low = (u32)ft;
+  b->ftLastAccessTime_high = (u32)(ft >> 32);
+  b->ftLastWriteTime_low = (u32)ft;
+  b->ftLastWriteTime_high = (u32)(ft >> 32);
+
+  u64 sz = 0;
+  struct stat st;
+#ifdef _WIN32
+  const int fd = _fileno(os);
+#else
+  const int fd = fileno(os);
+#endif
+  if (fd >= 0 && fstat(fd, &st) == 0) {
+    sz = (u64)st.st_size;
+  } else {
+    const long pos = ftell(os);
+    fseek(os, 0, SEEK_END);
+    const long lsz = ftell(os);
+    fseek(os, pos, SEEK_SET);
+    if (lsz >= 0) sz = (u64)lsz;
+  }
+  b->nFileSizeLow = (u32)(sz & 0xFFFFFFFFull);
+  b->nFileSizeHigh = (u32)(sz >> 32);
   return 1;
 }
 

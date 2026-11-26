@@ -7,6 +7,7 @@
 #endif
 #include "iso.h"
 #include "trt.h"
+#include "pe.h"
 #include "thunk.h"
 #include "images.h"
 #include "apiset.h"
@@ -32,6 +33,8 @@ extern "C" int trt_cs_size_for_guest(void);
 // Linux-only syscalls: guarded so the UWP host build uses VirtualQuery.
 #ifdef __linux__
 #include <errno.h>
+#include <pthread.h>
+#include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #endif
@@ -991,7 +994,7 @@ u64 TRT_STDCALL trt_VirtualQuery(const void* addr, void* mbi_out, u64 len) {
     return 0;
   }
   const uintptr_t a = (uintptr_t)addr;
-  if (a >= 0x7FFFFFFF0000ULL) {
+  if (a > 0x7FFFFFFFFFFFULL) {
     set_err_for_current_thread(87);
     return 0;
   }
@@ -1037,10 +1040,37 @@ u64 TRT_STDCALL trt_VirtualQuery(const void* addr, void* mbi_out, u64 len) {
       m->BaseAddress = (u64)page;
       m->AllocationBase = (u64)b;
       m->AllocationProtect = 0x20u;  // PAGE_EXECUTE_READ
-      m->RegionSize = (u64)(e - page);
-      m->State = 0x1000u;            // MEM_COMMIT
-      m->Protect = (page == b) ? 0x02u : 0x20u;
       m->Type = 0x1000000u;          // MEM_IMAGE
+      m->State = 0x1000u;            // MEM_COMMIT
+      u32 prot = (page == b) ? 0x02u : 0x20u;
+      u64 reg_end = (u64)e;
+      const trt_dos_header* dos = (const trt_dos_header*)img->base;
+      if (dos->e_magic == 0x5A4D && dos->e_lfanew > 0 && (u64)dos->e_lfanew < img->size_of_image) {
+        const trt_nt_headers64* nt = (const trt_nt_headers64*)(img->base + dos->e_lfanew);
+        if (nt->signature == 0x00004550) {
+          const u32 rva = (u32)(a - b);
+          const u16 nsec = nt->file_header.number_of_sections;
+          const trt_section_header* secs =
+              (const trt_section_header*)((const u8*)&nt->optional_header +
+                                         nt->file_header.size_of_optional_header);
+          for (u16 s = 0; s < nsec; ++s) {
+            const u32 sva = secs[s].virtual_address;
+            const u32 ssz = secs[s].virtual_size ? secs[s].virtual_size : secs[s].size_of_raw_data;
+            const u32 salign = (ssz + 4095) & ~4095;
+            if (rva >= sva && rva < sva + salign) {
+              const u32 ch = secs[s].characteristics;
+              if ((ch & 0x20000000) && (ch & 0x80000000)) prot = 0x40;  // PAGE_EXECUTE_READWRITE
+              else if (ch & 0x20000000) prot = 0x20;                   // PAGE_EXECUTE_READ
+              else if (ch & 0x80000000) prot = 0x04;                   // PAGE_READWRITE
+              else prot = 0x02;                                        // PAGE_READONLY
+              reg_end = (u64)(b + sva + salign);
+              break;
+            }
+          }
+        }
+      }
+      m->RegionSize = (reg_end > page) ? (reg_end - page) : 4096;
+      m->Protect = prot;
       return sizeof(mbi64);
     }
   }
@@ -1049,20 +1079,41 @@ u64 TRT_STDCALL trt_VirtualQuery(const void* addr, void* mbi_out, u64 len) {
   const SIZE_T nr =
       ::VirtualQuery(addr, (PMEMORY_BASIC_INFORMATION)mbi_out, (SIZE_T)len);
   if (nr) return (u64)nr;
-#endif
+#else
+  void* sb = nullptr;
+  size_t ss = 0;
+  pthread_attr_t attr;
+  if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+    if (pthread_attr_getstack(&attr, &sb, &ss) == 0 && sb && ss) {
+      const uintptr_t stack_low = (uintptr_t)sb;
+      const uintptr_t stack_high = (uintptr_t)sb + (uintptr_t)ss;
+      if (a >= stack_low && a < stack_high) {
+        m->BaseAddress = (u64)page;
+        m->AllocationBase = (u64)stack_low;
+        m->AllocationProtect = 0x04u;  // PAGE_READWRITE
+        m->RegionSize = (u64)(stack_high - page);
+        m->State = 0x1000u;            // MEM_COMMIT
+        m->Protect = 0x04u;            // PAGE_READWRITE
+        m->Type = 0x20000u;            // MEM_PRIVATE
+        pthread_attr_destroy(&attr);
+        return sizeof(mbi64);
+      }
+    }
+    pthread_attr_destroy(&attr);
+  }
 
-  int stack_probe = 0;
-  const intptr_t diff = (intptr_t)a - (intptr_t)&stack_probe;
-  if (diff > -8388608 && diff < 8388608) {
+  unsigned char mincore_vec = 0;
+  if (mincore((void*)page, 4096, &mincore_vec) == 0) {
     m->BaseAddress = (u64)page;
     m->AllocationBase = (u64)page;
     m->AllocationProtect = 0x04u;
-    m->RegionSize = 0x10000u;
-    m->State = 0x1000u;
-    m->Protect = 0x04u;
-    m->Type = 0x20000u;
+    m->RegionSize = 4096;
+    m->State = 0x1000u;      // MEM_COMMIT
+    m->Protect = 0x04u;      // PAGE_READWRITE
+    m->Type = 0x20000u;      // MEM_PRIVATE
     return sizeof(mbi64);
   }
+#endif
 
   m->BaseAddress = (u64)page;
   m->RegionSize = 0x10000u;
@@ -1186,19 +1237,92 @@ int TRT_STDCALL trt_QueryPerformanceFrequency(i64* out) {
   return 1;
 }
 
+#if defined(_WIN32)
+#include <intrin.h>
+#endif
+
+static bool host_supports_avx2() {
+  static int cached = -1;
+  if (cached != -1) return cached == 1;
+#if defined(__x86_64__) || defined(_M_X64)
+  int info[4] = {0};
+#if defined(_WIN32)
+  __cpuidex(info, 7, 0);
+#elif defined(__GNUC__) || defined(__clang__)
+  __asm__ __volatile__("cpuid"
+                       : "=a"(info[0]), "=b"(info[1]), "=c"(info[2]), "=d"(info[3])
+                       : "a"(7), "c"(0));
+#endif
+  cached = (info[1] & (1 << 5)) ? 1 : 0;
+#else
+  cached = 0;
+#endif
+  return cached == 1;
+}
+
+static bool host_supports_bmi2() {
+  static int cached = -1;
+  if (cached != -1) return cached == 1;
+#if defined(__x86_64__) || defined(_M_X64)
+  int info[4] = {0};
+#if defined(_WIN32)
+  __cpuidex(info, 7, 0);
+#elif defined(__GNUC__) || defined(__clang__)
+  __asm__ __volatile__("cpuid"
+                       : "=a"(info[0]), "=b"(info[1]), "=c"(info[2]), "=d"(info[3])
+                       : "a"(7), "c"(0));
+#endif
+  cached = (info[1] & (1 << 8)) ? 1 : 0;
+#else
+  cached = 0;
+#endif
+  return cached == 1;
+}
+
 u32 TRT_STDCALL trt_IsProcessorFeaturePresent(u32 feature) {
-  // x64 baseline: SSE/SSE2/SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT/NX present.
+  // x64 baseline: SSE/SSE2/SSE3/SSSE3/SSE4.1/SSE4.2/CMPXCHG16B/POPCNT/AVX present.
   // STAGE 7 (OrTMM): 0x17 = PF_FASTFAIL_AVAILABLE — MSVC 2019+ CRT startup
   // queries it before __security_init; returning 0 sends _set_Fflag to
   // __fastfail(FAST_FAIL_FATAL_APP_EXIT) and the EXE dies at CRT-STARTUP
   // with int 0x29 (measured: OrTMM.exe SIGSEGV/UD at image+0xd1d4, the
   // `int $0x29` guarding call IsProcessorFeaturePresent(0x17)).
-  // 0x17=PF_FASTFAIL_AVAILABLE, 0x14=PF_ARM_V8... (unused); also name the
-  // common x64 extras real CRTs ask about.
+  // AMD Jaguar (Xbox One, One S, One X) has SSE3, CMPXCHG16B, SSSE3, SSE4.1,
+  // SSE4.2, and split-128 AVX, but lacks AVX2 and BMI2. Zen 2 (Series S/X) has AVX2 & BMI2.
   switch (feature) {
-    case 0: case 1: case 6: case 7: case 8: case 9: case 10:
-    case 0x14: case 0x17: case 0x18:  // 0x17=PF_FASTFAIL_AVAILABLE
+    case 0:   // PF_FLOATING_POINT_PRECISION_ERRATA
       return 1;
+    case 1:   // PF_FLOATING_POINT_EMULATED
+      return 0;
+    case 2:   // PF_COMPARE_EXCHANGE_DOUBLE (CMPXCHG8B)
+    case 3:   // PF_MMX_INSTRUCTIONS_AVAILABLE
+    case 6:   // PF_XMMI_INSTRUCTIONS_AVAILABLE (SSE)
+    case 7:   // PF_3DNOW_INSTRUCTIONS_AVAILABLE
+    case 8:   // PF_RDTSC_INSTRUCTION_AVAILABLE
+    case 9:   // PF_PAE_ENABLED
+    case 10:  // PF_XMMI64_INSTRUCTIONS_AVAILABLE (SSE2)
+    case 12:  // PF_NX_ENABLED
+    case 13:  // PF_SSE3_INSTRUCTIONS_AVAILABLE
+    case 14:  // PF_COMPARE_EXCHANGE128 (CMPXCHG16B)
+    case 15:  // PF_COMPARE64_EXCHANGE128
+    case 17:  // PF_XSAVE_ENABLED
+    case 20:  // PF_SECOND_LEVEL_ADDRESS_TRANSLATION
+    case 22:  // PF_RDWRFSGSBASE_AVAILABLE
+    case 23:  // PF_FASTFAIL_AVAILABLE (0x17)
+    case 24:  // PF_ARM_DIVIDE_INSTRUCTION_AVAILABLE
+    case 32:  // PF_RDTSCP_INSTRUCTION_AVAILABLE
+    case 36:  // PF_SSSE3_INSTRUCTIONS_AVAILABLE
+    case 37:  // PF_SSE4_1_INSTRUCTIONS_AVAILABLE
+    case 38:  // PF_SSE4_2_INSTRUCTIONS_AVAILABLE
+    case 39:  // PF_AVX_INSTRUCTIONS_AVAILABLE (AMD Jaguar supports 128-bit AVX)
+      return 1;
+    case 40:  // PF_AVX2_INSTRUCTIONS_AVAILABLE
+      // Jaguar (Xbox One / One S / One X) lacks AVX2; Zen 2 (Series S/X) has AVX2.
+      return host_supports_avx2() ? 1 : 0;
+    case 41:  // PF_AVX512F_INSTRUCTIONS_AVAILABLE
+      return 0;
+    case 60:  // PF_BMI2_INSTRUCTIONS_AVAILABLE
+      // Jaguar lacks BMI2; Zen 2 has BMI2.
+      return host_supports_bmi2() ? 1 : 0;
     default:
       return 0;
   }
@@ -2010,6 +2134,9 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
   if (for_write) trt_vfs_mark_z_deleted_utf16(name, 0, 0);
   char vpath[512];
   build_guest_vpath(name, vpath, sizeof(vpath));
+  char succ_log[1100];
+  snprintf(succ_log, sizeof(succ_log), "kernel32: CreateFileW opened '%s' (host: '%s')", vpath, host);
+  trt_core_log(succ_log);
   return file_alloc(os, write ? 'w' : 'r', vpath);
 }
 
@@ -2493,14 +2620,15 @@ u32 TRT_STDCALL trt_GetModuleFileNameW(void* mod, u16* buf, u32 len) {
   const char* value = g_exepath;
   if (mod) {
     trt_image* img = trt_images_by_handle(mod);
-    if (img && img != trt_images_first()) {
-      const char* nm = trt_images_name(mod);
-      if (nm && nm[0]) {
-        const char* slash = strrchr(g_exepath, '\\');
-        const size_t dirlen = slash ? (size_t)(slash - g_exepath) : 0;
-        if (dirlen > 0 && dirlen + 1 + strlen(nm) < sizeof(path)) {
-          snprintf(path, sizeof(path), "%.*s\\%s", (int)dirlen, g_exepath, nm);
+    if (img) {
+      // Preserve the path of DLLs loaded from subdirectories.
+      const int count = trt_images_count();
+      for (int i = 0; i < count; ++i) {
+        if (trt_images_nth(i) != img) continue;
+        const char* host_path = trt_images_nth_path(i);
+        if (host_path && trt_vfs_host_to_guest(host_path, path, sizeof(path)) == 0) {
           value = path;
+          break;
         }
       }
     } else if (!img && trt_images_is_synthetic(mod)) {
@@ -2758,6 +2886,7 @@ static void* load_library_impl(const u16* path, u32 flags) {
     err_ref_for_current_thread() = 126;  // MOD_NOT_FOUND
     return nullptr;
   }
+
   return trt_images_handle(img);
 }
 
@@ -5885,9 +6014,64 @@ void TRT_STDCALL trt_RtlUnwind(u64 target, u64 target_ip, void* exrec,
 
 extern "C" int trt_run_guest_veh(void* ep) {
   if (!ep) return 0;
+  // Guest exception handlers may themselves fault. Bound nested dispatch on
+  // the current thread, matching the Linux dispatch limit. Returning SEARCH
+  // preserves the original failure and lets the host SEH chain handle it.
+  static thread_local unsigned depth = 0;
+  if (depth >= 3) {
+    trt_core_log("veh: nested guest dispatch limit reached; continue search");
+    return 0;
+  }
+  struct depth_guard {
+    unsigned& n;
+    explicit depth_guard(unsigned& value) : n(value) { ++n; }
+    ~depth_guard() { --n; }
+  } guard(depth);
+#if defined(_WIN32)
+  static thread_local unsigned s_veh_diag_count = 0;
+  if (s_veh_diag_count++ < 24) {
+    const auto* pointers = (const EXCEPTION_POINTERS*)ep;
+    const auto* record = pointers->ExceptionRecord;
+    if (record) {
+      char line[320];
+      const auto* context = pointers->ContextRecord;
+      const unsigned long long kind = record->NumberParameters >= 1 ? (unsigned long long)record->ExceptionInformation[0] : 0;
+      const unsigned long long address = record->NumberParameters >= 2 ? (unsigned long long)record->ExceptionInformation[1] : 0;
+      snprintf(line, sizeof(line), "veh: dispatch depth=%u code=0x%08lx pc=%p kind=%llu target=%llx rax=%llx rcx=%llx rdx=%llx",
+               depth, (unsigned long)record->ExceptionCode, record->ExceptionAddress,
+               kind, address, context ? (unsigned long long)context->Rax : 0,
+               context ? (unsigned long long)context->Rcx : 0,
+               context ? (unsigned long long)context->Rdx : 0);
+      trt_core_log(line);
+      if (record->ExceptionCode == 0xC0000005u && record->ExceptionAddress) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        const uintptr_t pc = (uintptr_t)record->ExceptionAddress;
+        if (VirtualQuery((const void*)pc, &mbi, sizeof(mbi)) &&
+            mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+            pc >= (uintptr_t)mbi.BaseAddress + 32 &&
+            pc + 32 <= (uintptr_t)mbi.BaseAddress + mbi.RegionSize) {
+          const u8* bytes = (const u8*)(pc - 32);
+          char dump[180];
+          int used = snprintf(dump, sizeof(dump), "veh: code pc-32 ");
+          for (int i = 0; i < 64 && used + 2 < (int)sizeof(dump); ++i)
+            used += snprintf(dump + used, sizeof(dump) - used, "%02x", bytes[i]);
+          trt_core_log(dump);
+        }
+      }
+    }
+  }
+#endif
   std::vector<void*> vehs;
   veh_snapshot_ordered(&vehs);
   for (void* vfn : vehs) {
+#if defined(_WIN32)
+    const auto* record = ((const EXCEPTION_POINTERS*)ep)->ExceptionRecord;
+    if (record && record->ExceptionCode == 0xC0000005u && s_veh_diag_count <= 24) {
+      char line[128];
+      snprintf(line, sizeof(line), "veh: invoke depth=%u handler=%p", depth, vfn);
+      trt_core_log(line);
+    }
+#endif
     const i32 vres = (i32)trt_call_guest(vfn, (u64)(uintptr_t)ep, 0, 0, 0);
     if (vres == -1 /*EXCEPTION_CONTINUE_EXECUTION*/) return -1;
   }

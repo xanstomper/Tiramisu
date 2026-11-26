@@ -216,7 +216,13 @@ rm -f "$out/guestdll.lib"
 clang++ -std=c++20 -O2 -Wall -no-pie \
   tests/test_libload.cpp "$out/libtrt.a" \
   -o "$out/test_libload"
-"$out/test_libload" "$out/guest_libload.exe" "$out"
+mkdir -p "$out/modulepath-fixture/sub"
+cp "$out/guestdll.dll" "$out/modulepath-fixture/sub/nested.dll"
+"$out/test_libload" "$out/guest_libload.exe" "$out" "$out/modulepath-fixture"
+clang++ -std=c++20 -O2 -ffunction-sections -fdata-sections -Isrc/trt \
+  tests/test_modulepath_mount.cpp src/trt/vfs.cpp -Wl,--gc-sections \
+  -o "$out/test_modulepath_mount"
+"$out/test_modulepath_mount"
 
 # --- 8. the graphics bridge: the guest's D3D11 calls must reach the host's GPU ---
 SDK="$HOME/.cache/uwp-crossbuild/xwin/sdk/include"
@@ -806,6 +812,8 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   tests/test_kernel32b.cpp "$out/libtrt.a" -lpthread \
   -o "$out/test_kernel32b"
 "$out/test_kernel32b" "$out/guest_kernel32b.exe"
+clang++ -std=c++20 -O2 -Wall -no-pie tests/test_formatmessage_alloc.cpp "$out/libtrt.a" -lpthread -o "$out/test_formatmessage_alloc"
+"$out/test_formatmessage_alloc"
 
 # --- 39. D3D12 descriptor wave: device slots 17-24 (CBV/SRV/UAV/RTV/DSV/
 #         Sampler/CopyDescriptors/CopyDescriptorsSimple), cmdlist binding
@@ -829,6 +837,12 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   tests/test_membudget.cpp "$out/libtrt.a" -lpthread \
   -o "$out/test_membudget"
 "$out/test_membudget"
+
+# --- 41a. 32 MB ESRAM acceleration & memory tiering for Xbox One / One S ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_esram.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_esram"
+"$out/test_esram"
 
 # --- 41b. file-backed read-only views: MapViewOfFile over a real archive
 #          maps the page cache (address space, NOT the 5 GB commit ledger) so
