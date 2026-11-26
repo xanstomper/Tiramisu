@@ -489,6 +489,13 @@ int TRT_GUEST_ABI dx11_CompileFromFileW(const u16* path, const void* defines,
   return hr;
 }
 
+// D3DX11SaveTextureToFileW: texture dumps to disk are not implemented;
+// answer E_NOTIMPL instead of killing the load (Sekiro audit).
+int TRT_GUEST_ABI dx11_SaveTextureToFileW(void*, void*, u32, const u16*) {
+  log_line("d3dx: SaveTextureToFileW -> E_NOTIMPL (no texture dump)");
+  return k_e_notimpl;
+}
+
 const trt_named_fn k_d3dx_fns[] = {
     {"D3DX11GetImageInfoFromMemory", (void*)&dx11_GetImageInfoFromMemory},
     {"D3DX11GetImageInfoFromFileW", (void*)&dx11_GetImageInfoFromFileW},
@@ -501,6 +508,7 @@ const trt_named_fn k_d3dx_fns[] = {
     {"D3DX11CreateShaderResourceViewFromFileW", (void*)&dx11_CreateSRVFromFileW},
     {"D3DX11CreateShaderResourceViewFromFileA", (void*)&dx11_CreateSRVFromFileA},
     {"D3DX11CompileFromFile", (void*)&dx11_CompileFromFileW},
+    {"D3DX11SaveTextureToFileW", (void*)&dx11_SaveTextureToFileW},
     // d3dx10 aliases
     {"D3DX10GetImageInfoFromMemory", (void*)&dx10_GetImageInfoFromMemory},
     {"D3DX10CreateTextureFromMemory", (void*)&dx10_CreateTextureFromMemory},

@@ -52,7 +52,23 @@ bool host_stat(const u16* guest_path, bool* is_dir) {
 
 // ---- PathFileExistsW / PathFileExistsA ----
 int TRT_GUEST_ABI shw_PathFileExistsW(const u16* path) {
-  return host_stat(path, nullptr) ? 1 : 0;
+  // .152 diagnostic: log existence checks (was silent); a polling loop
+  // on this call is invisible without it.
+  const int r = host_stat(path, nullptr) ? 1 : 0;
+  {
+    char line[320];
+    char u8[256];
+    u8[0] = 0;
+    if (path) {
+      u32 i = 0;
+      for (; path[i] && i < sizeof(u8) - 1; ++i) u8[i] = (char)(path[i] & 0x7Fu);
+      u8[i] = 0;
+    }
+    snprintf(line, sizeof(line), "shlwapi: PathFileExistsW(%.240s) -> %d",
+             u8, r);
+    trt_core_log(line);
+  }
+  return r;
 }
 
 int TRT_GUEST_ABI shw_PathFileExistsA(const char* path) {

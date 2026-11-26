@@ -268,9 +268,34 @@ extern "C" int trt_gap_env_free_wblock(const u16* block) {
 constexpr u32 k_cp1252 = 1252;
 constexpr u32 k_utf8 = 65001;
 
+// .161: full Windows codepage list. The UCRT validates the locale ANSI
+// codepage during _create_locale -- "Japanese" resolves to 932 (Shift-JIS),
+// which the old 5-entry list rejected, failing the locale and surfacing
+// as MSVC runtime_error("bad locale name") (.155-.160). GetCPInfo already
+// answers 1 for any codepage, so accepting the list here is consistent.
 bool valid_cp(u32 cp) {
-  return cp == k_cp1252 || cp == k_utf8 || cp == 0 /*CP_ACP*/ ||
-         cp == 20127 /*US-ASCII*/ || cp == 2019;
+  if (cp == k_cp1252 || cp == k_utf8 || cp == 0 /*CP_ACP*/ ||
+      cp == 20127 /*US-ASCII*/ || cp == 2019)
+    return true;
+  static const u32 kCps[] = {
+      37, 437, 500, 708, 720, 737, 775, 850, 852, 855, 857, 858, 860, 861,
+      862, 863, 864, 865, 866, 869, 874, 932, 936, 949, 950, 1026, 1047,
+      1140, 1141, 1142, 1143, 1144, 1145, 1146, 1147, 1148, 1149, 1200,
+      1201, 12000, 12001, 1250, 1251, 1253, 1254, 1255, 1256, 1257, 1258,
+      1361, 10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008,
+      10010, 10017, 10029, 10079, 10081, 10082, 20105, 20106, 20107, 20108,
+      20261, 20269, 20273, 20277, 20278, 20280, 20284, 20285, 20290, 20297,
+      20420, 20423, 20424, 20833, 20838, 20866, 20871, 20880, 20905, 20924,
+      20932, 20936, 20949, 21025, 21027, 21866, 28591, 28592, 28593, 28594,
+      28595, 28596, 28597, 28598, 28599, 28600, 28601, 28602, 28603, 28604,
+      28605, 29001, 50220, 50221, 50222, 50225, 50226, 50227, 50229, 50930,
+      50931, 50932, 50935, 50936, 50937, 50939, 51932, 51936, 51949, 51950,
+      52936, 54936, 57002, 57003, 57004, 57005, 57006, 57007, 57008, 57009,
+      57010, 57011, 65000,
+  };
+  for (size_t i = 0; i < sizeof(kCps) / sizeof(kCps[0]); ++i)
+    if (kCps[i] == cp) return true;
+  return false;
 }
 
 }  // namespace
@@ -281,7 +306,13 @@ extern "C" {
 void trt_gap_register(void);
 
 // ---- CRT locale boot -------------------------------------------------------
-int TRT_STDCALL trt_IsValidCodePage(u32 cp) { return valid_cp(cp) ? 1 : 0; }
+int TRT_STDCALL trt_IsValidCodePage(u32 cp) {
+  const int ok = valid_cp(cp) ? 1 : 0;
+  char line[64];
+  snprintf(line, sizeof(line), "locale: IsValidCodePage(%u) -> %d", cp, ok);
+  trt_core_log(line);
+  return ok;
+}
 
 // ---- environment -----------------------------------------------------------
 int TRT_STDCALL trt_SetEnvironmentVariableW(const u16* name, const u16* value) {
@@ -689,6 +720,83 @@ static int gap_write_u16_answer(const char* s, u16* out, int cap) {
   return need;
 }
 
+// .160: the .159 theory was wrong in mechanism -- the game NEVER calls
+// LocaleNameToLCID (0 calls in the .159 log). The UCRT's
+// _create_locale("Japanese") fails because GetLocaleInfoEx returns 0 for
+// 13 LCTypes the CRT queries during locale init (0x16/0x17/0x18 monetary
+// strings, 0x19/0x1A currency digits, 0x22-0x27 date numbers, 0x1009
+// calendar type, 0x1001 short time). Any single failure aborts the
+// locale, and MSVC surfaces it as runtime_error("bad locale name").
+// Fix: complete the table with en-US defaults, widen IsValidLocale /
+// LCIDToLocaleName / LocaleNameToLCID to the same locale set, and NEVER
+// fail an unknown LCTYPE again (fallback "" / 0, logged) -- locale data
+// is cosmetic for games.
+// .159: locale-name logging + widened acceptance. Sekiro's std::locale
+// construction threw runtime_error("bad locale name") (.157/.158) because
+// LocaleNameToLCID returned 0 for any name outside {en-US, en, ""}. The
+// console has no real locale database; answering en-US data for any
+// well-formed locale name keeps the game running (locale data fidelity is
+// cosmetic for games). Every name + verdict is logged, so an acceptance
+// is auditable, not silent.
+static void gap_u16_to_narrow(const u16* src, char* dst, size_t cap) {
+  size_t k = 0;
+  if (cap == 0) return;
+  if (src) {
+    while (k + 1 < cap && src[k]) {
+      u16 c = src[k];
+      dst[k] = (c < 0x80) ? (char)c : '?';
+      ++k;
+    }
+  }
+  dst[k] = 0;
+}
+
+static void gap_locale_log(const char* fn, const u16* name, int verdict) {
+  char narrow[64];
+  gap_u16_to_narrow(name, narrow, sizeof(narrow));
+  char lline[192];
+  snprintf(lline, sizeof(lline), "locale: %s(\"%s\") -> %d", fn, narrow,
+           verdict);
+  trt_core_log(lline);
+}
+
+static bool gap_locale_name_ok(const u16* name) {
+  if (!name) return false;
+  if (name[0] == 0) return true;  // LOCALE_NAME_INVARIANT / default
+  static const char* kKnown[] = {
+      "en-US", "en", "C", "POSIX",
+      "ja-JP", "ja", "Japanese", "Japanese_Japan.932",
+      "de-DE", "de", "German_Germany.1252",
+      "fr-FR", "fr", "French_France.1252",
+      "es-ES", "es", "it-IT", "it", "pt-BR", "pt", "ru-RU", "ru",
+      "zh-CN", "zh", "Chinese_China.936", "zh-TW", "ko-KR", "ko",
+      "Korean_Korea.949", "nl-NL", "nl", "pl-PL", "pl", "tr-TR", "tr",
+      "sv-SE", "sv", "da-DK", "da", "fi-FI", "fi", "nb-NO", "nb",
+      "cs-CZ", "cs", "hu-HU", "hu", "el-GR", "el", "uk-UA", "uk",
+      "ar-SA", "ar", "he-IL", "he", "th-TH", "th", "vi-VN", "vi",
+      "id-ID", "id", "ms-MY", "ms",
+  };
+  for (size_t i = 0; i < sizeof(kKnown) / sizeof(kKnown[0]); ++i)
+    if (gap_u16_ieq(name, kKnown[i])) return true;
+  // Structural BCP 47: ll or lll, optionally -CC (2 letters).
+  size_t len = 0;
+  while (len < 12 && name[len]) ++len;
+  if (name[len] != 0) return false;  // longer than 11 chars
+  if (len < 2 || len > 6) return false;
+  auto is_alpha = [](u16 c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+  };
+  if (!is_alpha(name[0]) || !is_alpha(name[1])) return false;
+  if (len == 2) return true;
+  if (len == 3) return is_alpha(name[2]);
+  if (len == 5)
+    return name[2] == '-' && is_alpha(name[3]) && is_alpha(name[4]);
+  if (len == 6)
+    return is_alpha(name[2]) && name[3] == '-' && is_alpha(name[4]) &&
+           is_alpha(name[5]);
+  return false;
+}
+
 // ============================================================================
 // Locale / Date / Time surface (CRT + UnityPlayer + System.Globalization)
 // ============================================================================
@@ -702,21 +810,33 @@ int TRT_STDCALL trt_GetSystemDefaultLocaleName(u16* name, int cch) {
 }
 
 int TRT_STDCALL trt_IsValidLocaleName(const u16* name) {
-  if (!name) return 0;
-  if (name[0] == 0) return 1;  // LOCALE_NAME_INVARIANT
-  if (gap_u16_ieq(name, "en-US") || gap_u16_ieq(name, "en") ||
-      gap_u16_ieq(name, "C"))
-    return 1;
-  return 0;
+  if (!name) {
+    gap_locale_log("IsValidLocaleName", name, 0);
+    return 0;
+  }
+  const int ok = gap_locale_name_ok(name) ? 1 : 0;
+  if (!ok) gap_locale_log("IsValidLocaleName", name, ok);
+  return ok;
 }
 
 int TRT_STDCALL trt_IsValidLocale(u32 lcid, u32 flags) {
   (void)flags;
   const u32 lo = lcid & 0xFFFFu;
-  return (lo == 0x0409u || lo == 0x0009u || lo == 0x007Fu ||
-          lo == 0x0400u || lo == 0x0800u || lo == 0x0C00u || lo == 0)
-             ? 1
-             : 0;
+  if (lo == 0x0409u || lo == 0x0009u || lo == 0x007Fu ||
+      lo == 0x0400u || lo == 0x0800u || lo == 0x0C00u || lo == 0)
+    return 1;
+  // .160: same locale set as gap_locale_name_ok (the UCRT resolves
+  // "Japanese" to 0x0411 internally; rejecting it here would fail the
+  // locale the same way the missing LCTYPEs did).
+  static const u32 kValid[] = {
+      0x0411, 0x0407, 0x040C, 0x040A, 0x0410, 0x0416, 0x0419, 0x0804,
+      0x0404, 0x0412, 0x0413, 0x0415, 0x041F, 0x041D, 0x0406, 0x040B,
+      0x0414, 0x0405, 0x040E, 0x0408, 0x0422, 0x0401, 0x040D, 0x041E,
+      0x042A, 0x0421, 0x043E,
+  };
+  for (size_t i = 0; i < sizeof(kValid) / sizeof(kValid[0]); ++i)
+    if (kValid[i] == lo) return 1;
+  return 0;
 }
 
 u16 TRT_STDCALL trt_GetUserDefaultUILanguage(void) { return 0x0409u; }
@@ -726,23 +846,79 @@ int TRT_STDCALL trt_SetThreadLocale(u32 lcid) {
   return trt_IsValidLocale(lcid, 0) ? 1 : (trt_SetLastError(87), 0);
 }
 int TRT_STDCALL trt_IsDBCSLeadByteEx(u32 cp, u8 ch) {
-  (void)cp; (void)ch;
-  return 0;
+  // .161: real lead-byte ranges for the DBCS codepages (the UCRT uses this
+  // when the locale codepage is double-byte; returning 0 for 932 made every
+  // Shift-JIS byte look single-byte).
+  switch (cp) {
+    case 932:  // Shift-JIS
+      return (ch >= 0x81 && ch <= 0x9F) || (ch >= 0xE0 && ch <= 0xFC) ? 1 : 0;
+    case 936:  // GBK
+    case 949:  // EUC-KR / Unified Hangul
+    case 950:  // Big5
+      return (ch >= 0x81 && ch <= 0xFE) ? 1 : 0;
+    case 1361:  // Johab
+      return (ch >= 0x84 && ch <= 0xD3) ? 1 : 0;
+    default:
+      return 0;
+  }
 }
 
 int TRT_STDCALL trt_LCIDToLocaleName(u32 lcid, u16* name, int cch, u32 flags) {
   (void)flags;
   const u32 lo = lcid & 0xFFFFu;
   if (lo == 0x007Fu) return gap_write_u16_answer("", name, cch);
-  if (trt_IsValidLocale(lcid, 0)) return gap_write_u16_answer("en-US", name, cch);
-  trt_SetLastError(87);
-  return 0;
+  if (!trt_IsValidLocale(lcid, 0)) { trt_SetLastError(87); return 0; }
+  // .160: faithful name for known LCIDs (was "en-US" for everything).
+  static const struct { u32 lcid; const char* name; } kNames[] = {
+      {0x0411, "ja-JP"}, {0x0407, "de-DE"}, {0x040C, "fr-FR"},
+      {0x040A, "es-ES"}, {0x0410, "it-IT"}, {0x0416, "pt-BR"},
+      {0x0419, "ru-RU"}, {0x0804, "zh-CN"}, {0x0404, "zh-TW"},
+      {0x0412, "ko-KR"}, {0x0413, "nl-NL"}, {0x0415, "pl-PL"},
+      {0x041F, "tr-TR"}, {0x041D, "sv-SE"}, {0x0406, "da-DK"},
+      {0x040B, "fi-FI"}, {0x0414, "nb-NO"}, {0x0405, "cs-CZ"},
+      {0x040E, "hu-HU"}, {0x0408, "el-GR"}, {0x0422, "uk-UA"},
+      {0x0401, "ar-SA"}, {0x040D, "he-IL"}, {0x041E, "th-TH"},
+      {0x042A, "vi-VN"}, {0x0421, "id-ID"}, {0x043E, "ms-MY"},
+  };
+  for (size_t i = 0; i < sizeof(kNames) / sizeof(kNames[0]); ++i)
+    if (kNames[i].lcid == lo)
+      return gap_write_u16_answer(kNames[i].name, name, cch);
+  return gap_write_u16_answer("en-US", name, cch);
 }
 
 u32 TRT_STDCALL trt_LocaleNameToLCID(const u16* name, u32 flags) {
   (void)flags;
   if (!name || name[0] == 0) return 0x007Fu;
-  if (gap_u16_ieq(name, "en-US") || gap_u16_ieq(name, "en")) return 0x0409u;
+  if (gap_locale_name_ok(name)) {
+    // .160: return the real LCID for known names (the locale DATA stays
+    // en-US-shaped -- only the identifier is faithful).
+    static const struct { const char* name; u32 lcid; } kLcids[] = {
+        {"ja-JP", 0x0411}, {"ja", 0x0411}, {"Japanese", 0x0411},
+        {"Japanese_Japan.932", 0x0411},
+        {"de-DE", 0x0407}, {"de", 0x0407}, {"German_Germany.1252", 0x0407},
+        {"fr-FR", 0x040C}, {"fr", 0x040C}, {"French_France.1252", 0x040C},
+        {"es-ES", 0x040A}, {"es", 0x040A}, {"it-IT", 0x0410}, {"it", 0x0410},
+        {"pt-BR", 0x0416}, {"pt", 0x0416}, {"ru-RU", 0x0419}, {"ru", 0x0419},
+        {"zh-CN", 0x0804}, {"zh", 0x0804}, {"Chinese_China.936", 0x0804},
+        {"zh-TW", 0x0404}, {"ko-KR", 0x0412}, {"ko", 0x0412},
+        {"Korean_Korea.949", 0x0412},
+        {"nl-NL", 0x0413}, {"nl", 0x0413}, {"pl-PL", 0x0415}, {"pl", 0x0415},
+        {"tr-TR", 0x041F}, {"tr", 0x041F}, {"sv-SE", 0x041D}, {"sv", 0x041D},
+        {"da-DK", 0x0406}, {"da", 0x0406}, {"fi-FI", 0x040B}, {"fi", 0x040B},
+        {"nb-NO", 0x0414}, {"nb", 0x0414}, {"cs-CZ", 0x0405}, {"cs", 0x0405},
+        {"hu-HU", 0x040E}, {"hu", 0x040E}, {"el-GR", 0x0408}, {"el", 0x0408},
+        {"uk-UA", 0x0422}, {"uk", 0x0422}, {"ar-SA", 0x0401}, {"ar", 0x0401},
+        {"he-IL", 0x040D}, {"he", 0x040D}, {"th-TH", 0x041E}, {"th", 0x041E},
+        {"vi-VN", 0x042A}, {"vi", 0x042A}, {"id-ID", 0x0421}, {"id", 0x0421},
+        {"ms-MY", 0x043E}, {"ms", 0x043E},
+    };
+    u32 lcid = 0x0409u;
+    for (size_t i = 0; i < sizeof(kLcids) / sizeof(kLcids[0]); ++i)
+      if (gap_u16_ieq(name, kLcids[i].name)) { lcid = kLcids[i].lcid; break; }
+    gap_locale_log("LocaleNameToLCID", name, (int)lcid);
+    return lcid;
+  }
+  gap_locale_log("LocaleNameToLCID", name, 0);
   trt_SetLastError(87);
   return 0;
 }
@@ -751,6 +927,7 @@ int TRT_STDCALL trt_GetLocaleInfoEx(const u16* locale, u32 lctype, u16* out,
                                     int cch) {
   if (locale && locale[0] && !trt_IsValidLocaleName(locale) &&
       !gap_u16_ieq(locale, "!x-sys-default-locale")) {
+    gap_locale_log("GetLocaleInfoEx-invalid", locale, (int)lctype);
     trt_SetLastError(87);
     return 0;
   }
@@ -758,23 +935,51 @@ int TRT_STDCALL trt_GetLocaleInfoEx(const u16* locale, u32 lctype, u16* out,
   const u32 base_type = lctype & 0x0FFFFFFFu;
   if (want_num) {
     u32 num = 0;
-    bool ok = true;
+    bool known = true;
     switch (base_type) {
       case 0x1004: num = 1252; break;  // LOCALE_IDEFAULTANSICODEPAGE
       case 0x000B: num = 437; break;   // LOCALE_IDEFAULTCODEPAGE
       case 0x0001: num = 0x0409; break;
       case 0x000D: num = 1; break;     // LOCALE_IMEASURE
       case 0x0011: num = 2; break;     // LOCALE_IDIGITS
-      case 0x0018: num = 2; break;     // LOCALE_ICURRDIGITS
+      case 0x0012: num = 0; break;     // LOCALE_ILZERO
+      case 0x0018: num = 2; break;     // (0x18 numeric: no standard type)
+      case 0x0019: num = 2; break;     // LOCALE_ICURRDIGITS
+      case 0x001A: num = 2; break;     // LOCALE_IINTLCURRDIGITS
       case 0x001B: num = 0; break;     // LOCALE_ICURRENCY
       case 0x001C: num = 0; break;     // LOCALE_INEGCURR
-      case 0x100B: num = 1; break;     // LOCALE_ICOUNTRY
+      case 0x0021: num = 0; break;     // LOCALE_IDATE (MDY)
+      case 0x0022: num = 0; break;     // LOCALE_ILDATE
+      case 0x0023: num = 0; break;     // LOCALE_ITIME (12-hour)
+      case 0x0024: num = 0; break;     // LOCALE_ICENTURY
+      case 0x0025: num = 0; break;     // LOCALE_ITLZERO
+      case 0x0026: num = 0; break;     // LOCALE_IDAYLZERO
+      case 0x0027: num = 0; break;     // LOCALE_IMONLZERO
+      case 0x0052: num = 0; break;     // LOCALE_IPOSITIVESIGN
+      case 0x0053: num = 1; break;     // LOCALE_INEGATIVESIGN
+      case 0x0054: num = 1; break;     // LOCALE_IPOSSYMPRECEDES
+      case 0x0055: num = 0; break;     // LOCALE_IPOSSEPBYSPACE
+      case 0x0056: num = 1; break;     // LOCALE_INEGSYMPRECEDES
+      case 0x0057: num = 0; break;     // LOCALE_INEGSEPBYSPACE
+      case 0x1005: num = 0; break;     // LOCALE_ITIMEMARKPOSN
+      case 0x1009: num = 1; break;     // LOCALE_ICALENDARTYPE (Gregorian)
+      case 0x100B: num = 1; break;     // LOCALE_IOPTIONALCALENDAR
       case 0x100C: num = 6; break;     // LOCALE_IFIRSTDAYOFWEEK (Sunday)
       case 0x100D: num = 0; break;     // LOCALE_IFIRSTWEEKOFYEAR
       case 0x1010: num = 1; break;     // LOCALE_INEGNUMBER
-      default: ok = false; break;
+      case 0x1011: num = 10000; break; // LOCALE_IDEFAULTMACCODEPAGE
+      case 0x1012: num = 37; break;    // LOCALE_IDEFAULTEBCDICCODEPAGE
+      default: known = false; break;
     }
-    if (!ok) { trt_SetLastError(1004); return 0; }
+    if (!known) {
+      // .160: never fail -- the UCRT aborts _create_locale on any
+      // GetLocaleInfoEx failure, which surfaces as "bad locale name".
+      char fb[96];
+      snprintf(fb, sizeof(fb),
+               "locale: GetLocaleInfoEx fallback num lctype=0x%x", base_type);
+      trt_core_log(fb);
+      num = 0;
+    }
     if (!out || cch == 0) return 2;
     if (cch < 2) { trt_SetLastError(122); return 0; }
     memcpy(out, &num, sizeof(num));
@@ -789,7 +994,13 @@ int TRT_STDCALL trt_GetLocaleInfoEx(const u16* locale, u32 lctype, u16* out,
     case 0x0059: ans = "en"; break;
     case 0x005A: ans = "US"; break;
     case 0x006E: ans = "en"; break;
-    case 0x0079: ans = ""; break;
+    case 0x0079: ans = "h:mm tt"; break;   // LOCALE_SSHORTTIME
+    case 0x0069: ans = "NaN"; break;       // LOCALE_SNAN
+    case 0x006A: ans = "Infinity"; break;  // LOCALE_SPOSINFINITY
+    case 0x006B: ans = "-Infinity"; break; // LOCALE_SNEGINFINITY
+    case 0x006D: ans = "en"; break;        // LOCALE_SPARENT
+    case 0x006F: ans = "English"; break;   // LOCALE_SLANGDISPLAYNAME
+    case 0x0075: ans = "%"; break;         // LOCALE_SPERCENT
     case 0x000B: ans = "437"; break;
     case 0x1004: ans = "1252"; break;
     case 0x000C: ans = ","; break;
@@ -798,9 +1009,12 @@ int TRT_STDCALL trt_GetLocaleInfoEx(const u16* locale, u32 lctype, u16* out,
     case 0x000F: ans = ","; break;
     case 0x0010: ans = "3;0"; break;
     case 0x0011: ans = "2"; break;
+    case 0x0013: ans = "0123456789"; break;  // LOCALE_SNATIVEDIGITS
     case 0x0014: ans = "$"; break;
     case 0x0015: ans = "USD"; break;
-    case 0x0018: ans = "2"; break;
+    case 0x0016: ans = "."; break;     // LOCALE_SMONDECIMALSEP
+    case 0x0017: ans = ","; break;     // LOCALE_SMONTHOUSANDSEP
+    case 0x0018: ans = "3;0"; break;   // LOCALE_SMONGROUPING
     case 0x001B: ans = "0"; break;
     case 0x001D: ans = "/"; break;
     case 0x001E: ans = ":"; break;
@@ -811,9 +1025,14 @@ int TRT_STDCALL trt_GetLocaleInfoEx(const u16* locale, u32 lctype, u16* out,
     case 0x0050: ans = ""; break;
     case 0x0051: ans = "-"; break;
     case 0x1003: ans = "h:mm:ss tt"; break;
+    case 0x1001: ans = "English"; break;        // LOCALE_SENGLANGUAGE
+    case 0x1002: ans = "United States"; break;  // LOCALE_SENGCOUNTRY
     case 0x100B: ans = "1"; break;
     case 0x100C: ans = "6"; break;
     case 0x1010: ans = "1"; break;
+    case 0x1014: ans = "US Dollar"; break;  // LOCALE_SENGCURRNAME
+    case 0x1015: ans = "US Dollar"; break;  // LOCALE_SNATIVECURRNAME
+    case 0x1017: ans = "MMMM yyyy"; break;  // LOCALE_SYEARMONTH
     case 0x002A: ans = "Monday"; break;    case 0x002B: ans = "Tuesday"; break;
     case 0x002C: ans = "Wednesday"; break; case 0x002D: ans = "Thursday"; break;
     case 0x002E: ans = "Friday"; break;    case 0x002F: ans = "Saturday"; break;
@@ -834,7 +1053,14 @@ int TRT_STDCALL trt_GetLocaleInfoEx(const u16* locale, u32 lctype, u16* out,
     case 0x004A: ans = "Jul"; break;       case 0x004B: ans = "Aug"; break;
     case 0x004C: ans = "Sep"; break;       case 0x004D: ans = "Oct"; break;
     case 0x004E: ans = "Nov"; break;       case 0x004F: ans = "Dec"; break;
-    default: trt_SetLastError(1004); return 0;
+    default: break;  // .160: unknown string type -> "" below, never fail
+  }
+  if (!ans) {
+    char fb[96];
+    snprintf(fb, sizeof(fb),
+             "locale: GetLocaleInfoEx fallback str lctype=0x%x", base_type);
+    trt_core_log(fb);
+    ans = "";
   }
   return gap_write_u16_answer(ans, out, cch);
 }

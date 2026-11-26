@@ -108,6 +108,53 @@ u32 TRT_GUEST_ABI trt_mciSendStringW(const u16* cmd, u16* ret, u32 ret_len, void
   return 263;
 }
 
+// ---- MCI command interface (.154): fmodex64.dll imports
+// mciSendCommandA; without it the DLL fails to map and the game
+// cannot load. No MCI devices exist on the console, so every call
+// answers with the API's own named failure and the engine falls back.
+
+u32 TRT_GUEST_ABI trt_mciSendCommandA(u32 mci_id, u32 msg, u64 p1, u64 p2) {
+  char line[192];
+  snprintf(line, sizeof(line),
+           "winmm: mciSendCommandA(id=%u msg=0x%x) -> MCIERR_INVALID_DEVICE_ID",
+           mci_id, msg);
+  trt_core_log(line);
+  (void)p1; (void)p2;
+  return 257;  // MCIERR_INVALID_DEVICE_ID
+}
+
+u32 TRT_GUEST_ABI trt_mciSendCommandW(u32 mci_id, u32 msg, u64 p1, u64 p2) {
+  char line[192];
+  snprintf(line, sizeof(line),
+           "winmm: mciSendCommandW(id=%u msg=0x%x) -> MCIERR_INVALID_DEVICE_ID",
+           mci_id, msg);
+  trt_core_log(line);
+  (void)p1; (void)p2;
+  return 257;  // MCIERR_INVALID_DEVICE_ID
+}
+
+u32 TRT_GUEST_ABI trt_mciSendStringA(const char* cmd, char* ret, u32 ret_len,
+                                     void* hwnd) {
+  char line[192];
+  snprintf(line, sizeof(line), "winmm: mciSendStringA(\"%.80s\") -> "
+           "MCIERR_INVALID_DEVICE_NAME", cmd ? cmd : "");
+  trt_core_log(line);
+  (void)ret; (void)ret_len; (void)hwnd;
+  return 263;  // MCIERR_INVALID_DEVICE_NAME
+}
+
+u32 TRT_GUEST_ABI trt_mciGetErrorStringA(u32 err, char* buf, u32 len) {
+  (void)err;
+  if (buf && len > 0) buf[0] = 0;
+  return 0;  // FALSE: no error text available
+}
+
+u32 TRT_GUEST_ABI trt_mciGetErrorStringW(u32 err, u16* buf, u32 len) {
+  (void)err;
+  if (buf && len > 0) buf[0] = 0;
+  return 0;  // FALSE: no error text available
+}
+
 // ---- media key helpers some engines import ----
 
 u32 TRT_GUEST_ABI trt_GetProfileStringW(const u16* app, const u16* key,
@@ -167,6 +214,10 @@ u32 TRT_GUEST_ABI trt_waveOutMessage(u64, u32, u64, u64) { return 4; }
 u32 TRT_GUEST_ABI trt_waveOutBreakLoop(u64) { return 4; }
 u32 TRT_GUEST_ABI trt_waveOutRestart(u64) { return 4; }
 u32 TRT_GUEST_ABI trt_waveOutPause(u64) { return 4; }
+// waveOutSetVolume: no legacy wave device exists, so there is no volume
+// to set; answer the API own named failure like the rest of the
+// waveOut surface (Sekiro audit: bink2w64.dll imports it).
+u32 TRT_GUEST_ABI trt_waveOutSetVolume(u64, u32) { return 4; }
 // waveInMessage / waveOutMessage twins; GetErrorText* answer "no such
 // error for an invalid device" with the API's own bad-device code.
 u32 TRT_GUEST_ABI trt_waveInMessage(u64, u32, u64, u64) { return 4; }
@@ -222,6 +273,7 @@ int trt_bridge_register_winmm(void) {
       {"waveOutBreakLoop", (void*)&trt_waveOutBreakLoop},
       {"waveOutRestart", (void*)&trt_waveOutRestart},
       {"waveOutPause", (void*)&trt_waveOutPause},
+      {"waveOutSetVolume", (void*)&trt_waveOutSetVolume},
       {"waveInMessage", (void*)&trt_waveInMessage},
       {"waveOutGetErrorTextW", (void*)&trt_waveOutGetErrorTextW},
       {"waveOutGetErrorTextA", (void*)&trt_waveOutGetErrorTextW},
@@ -240,6 +292,11 @@ int trt_bridge_register_winmm(void) {
       {"joyGetNumDevs", (void*)&trt_joyGetNumDevs},
       {"joyGetPosEx", (void*)&trt_joyGetPosEx},
       {"mciSendStringW", (void*)&trt_mciSendStringW},
+      {"mciSendCommandA", (void*)&trt_mciSendCommandA},
+      {"mciSendCommandW", (void*)&trt_mciSendCommandW},
+      {"mciSendStringA", (void*)&trt_mciSendStringA},
+      {"mciGetErrorStringA", (void*)&trt_mciGetErrorStringA},
+      {"mciGetErrorStringW", (void*)&trt_mciGetErrorStringW},
       {"GetProfileStringW", (void*)&trt_GetProfileStringW},
       {"PlaySoundW", (void*)&trt_PlaySoundW},
   };

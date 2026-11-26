@@ -123,7 +123,7 @@ bool is_overridable_module(const char* name) {
       "ucrtbase.dll", "vcruntime140.dll", "vcruntime140_1.dll",
       "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
       "combase.dll", "dwrite.dll", "d2d1.dll", "d3d10.dll", "d3d12.dll",
-      "dxgi.dll", "version.dll",
+      "dxgi.dll", "version.dll", "steam_api64.dll", "steam_api.dll",
   };
   for (const char* no : kNoOverride)
     if (name_eq(name, no)) return false;
@@ -480,6 +480,11 @@ const mod_default k_defaults[] = {
     {"mpr.dll", TRT_ROUTE_BUILTIN},
     {"dhcpcsvc.dll", TRT_ROUTE_BUILTIN},
     {"normaliz.dll", TRT_ROUTE_BUILTIN},
+    // wldap32: sekiro.exe imports 16 LDAP ordinals by number (ldap_init,
+    // ldap_search_s, ldap_simple_bind_s, ldap_first_entry, ...); no LDAP
+    // server exists on a console, so STUB binds them fail-visible instead
+    // of killing the load. Any call names itself in the log.
+    {"wldap32.dll", TRT_ROUTE_STUB},
 
     // ---- crypto / security / services ----
     {"bcrypt.dll", TRT_ROUTE_SYSTEM},

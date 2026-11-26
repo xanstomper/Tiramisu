@@ -125,6 +125,7 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   --link-arg mfplat.lib --link-arg mfreadwrite.lib --link-arg mfuuid.lib \
   --link-arg bcrypt.lib --link-arg "$MONO_LIB" \
   --link-arg /STACK:0x800000 \
+  --link-arg /SECTION:.rdata,rw \
   --link-arg "/DEF:$PWD/third_party/mono-bridges/host-bridges.def" \
   -- /MT /O2 /EHsc /DNDEBUG /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN \
      /D_CRT_SECURE_NO_WARNINGS /DWINRT_NOCRASH_ON_UNHANDLED \
@@ -133,6 +134,23 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
      /DMOJOSHADER_NO_VERSION_INCLUDE /DMOJOSHADER_EFFECT_SUPPORT \
      /DFAUDIO_WIN32_PLATFORM /DFAUDIO_UWP_PLATFORM /DFAUDIO_DISABLE_DEBUGCONFIGURATION \
      "/FI$here/third_party/faudio/uwp/faudio_uwp_compat.h"
+
+# Harden MSVC STL atomic dynamic-loader against Xbox AppContainer crash:
+# Replace lazy LoadLibrary("api-ms-win-core-synch-l1-2-0.dll") function entry with RET (0xc3)
+python3 -c '
+p = "'"$out"'/layout/tiramisu.exe"
+with open(p, "rb") as f:
+    d = bytearray(f.read())
+sig = bytes.fromhex("41565657534883ec28488d0d")
+idx = d.find(sig)
+if idx != -1 and d.count(sig) == 1:
+    d[idx] = 0xc3
+    with open(p, "wb") as f:
+        f.write(d)
+    print("build-host: hardened MSVC STL atomic sync loader (patched 0x%x to RET)" % idx)
+else:
+    print("build-host: WARNING: MSVC STL atomic sync signature not found or not unique")
+'
 
 # --- 2b. explicit check: the FNA3D D3D11 driver object built under the
 #         UWP toolchain (compile-level gate for Path B step 3). The link
@@ -197,9 +215,10 @@ echo "FNA3D exports present in tiramisu.exe"
 MONO_FW="${MONO_FRAMEWORK_DIR:-/usr/lib/mono}"
 [[ -d "$MONO_FW/4.5" && -f "$MONO_FW/4.5/mscorlib.dll" ]] \
   || { echo "ERROR: Mono framework assemblies not found: $MONO_FW/4.5" >&2; exit 6; }
+rm -rf "$out/layout/mono" "$out/layout/etc/mono"
 mkdir -p "$out/layout/mono" "$out/layout/etc/mono"
-cp -r "$MONO_FW/4.5" "$out/layout/mono/4.5"
-[[ -d "$MONO_FW/gac" ]] && cp -r "$MONO_FW/gac" "$out/layout/mono/gac"
+cp -rL "$MONO_FW/4.5" "$out/layout/mono/4.5"
+[[ -d "$MONO_FW/gac" ]] && cp -rL "$MONO_FW/gac" "$out/layout/mono/gac"
 [[ -f /etc/mono/config ]] && cp /etc/mono/config "$out/layout/etc/mono/config"
 # Tiramisu UWP: map every managed P/Invoke library to the host exe's
 # exports. Programmatic dllmaps (assembly_load_hook) do not apply to all

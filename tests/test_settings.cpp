@@ -55,6 +55,7 @@ int main() {
   // 1. defaults when no file exists
   longan::settings_load(root);
   const auto d = longan::settings_get();
+  CHECK(d.auto_launch.empty(), "defaults with no settings.ini has empty auto_launch");
   CHECK(d.mouse_speed == 50 && d.wheel_speed == 50 && d.pad_vibration &&
             d.write_watch && d.os_major == 10 && d.os_build == 19045 &&
             d.default_input == "auto" && d.log_lines == 14,
@@ -62,6 +63,7 @@ int main() {
 
   // 2. store -> save -> load round-trip
   longan::host_settings s{};
+  s.auto_launch = "Sekiro";
   s.default_input = "pad2kbm";
   s.mouse_speed = 88;
   s.wheel_speed = 12;
@@ -80,6 +82,7 @@ int main() {
         "settings.ini written");
   longan::settings_load(root);
   const auto r = longan::settings_get();
+  CHECK(r.auto_launch == "Sekiro", "round-trip restores auto_launch");
   CHECK(r.default_input == "pad2kbm" && r.mouse_speed == 88 &&
             r.wheel_speed == 12 && !r.pad_vibration && !r.write_watch &&
             !r.steam_auth && !r.show_qr && r.log_lines == 30 &&

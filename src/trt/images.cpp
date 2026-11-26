@@ -3,8 +3,14 @@
 #include "images.h"
 #include "pe_exports.h"
 #include "thunk.h"
+#include "trt_trace.h"
 
+#include <atomic>
+#include <chrono>
+#include <memory>
 #include <mutex>
+#include <string>
+#include <thread>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -578,15 +584,54 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
       void* cb = img->base + img->tls_callback_rvas[i];
       trt_call_guest_img(cb, img, (u64)(uintptr_t)img->base, 1, 0, 0);
     }
-  if (!img->is_pe32 && run_entry && g_run_image_code && img->entry_rva) {
+  // .153: steam_api64.dll's DllMain hangs (pure spin, zero API calls -
+  // proven by .151/.152 diagnostics) and wedges the launch. Skip its
+  // entry call; the game's SteamAPI_Init is the real init path. Logged
+  // loudly so the skip is visible. If SteamAPI_Init needs DllMain init,
+  // its failure mode will say so.
+  const bool skip_entry = (base && ieq(base, "steam_api64.dll"));
+  if (skip_entry) {
+    char skipline[320];
+    snprintf(skipline, sizeof(skipline),
+             "trt: %s entry call SKIPPED (.153 hang workaround)", base);
+    trt_core_log(skipline);
+  }
+  if (!img->is_pe32 && run_entry && g_run_image_code && img->entry_rva && !skip_entry) {
     void* handle = trt_images_handle(img);
     char line[320];
     snprintf(line, sizeof(line),
              "trt: %s entry call handle=%p reason=1 (DLL_PROCESS_ATTACH)",
              base, handle);
     trt_core_log(line);
+    // .151 diagnostic: a DllMain that never returns wedges the launch
+    // (and the server thread) with zero log output. Watchdog thread:
+    // if the entry call is still running after 2/4/6s, leave a
+    // (.152: was 10/30/60 — the OS kills a hung UWP app at ~5-10s,
+    // so the 10s mark never fired under .151)
+    // marker via the allocation-free trace writer (survives a stuck
+    // g_file_mu). Detached; exits early when the call returns.
+    auto entry_done = std::make_shared<std::atomic<bool>>(false);
+    {
+      std::string wd_name(base);
+      std::thread([entry_done, wd_name]() {
+        const int marks[3] = {2, 4, 6};
+        int waited = 0;
+        for (int i = 0; i < 3; ++i) {
+          const int sleep_s = marks[i] - waited;
+          std::this_thread::sleep_for(std::chrono::seconds(sleep_s));
+          waited = marks[i];
+          if (entry_done->load()) return;
+          char wline[256];
+          snprintf(wline, sizeof(wline),
+                   "TRACE DLLMAIN-HANG: %s entry call still running after %ds",
+                   wd_name.c_str(), marks[i]);
+          trt_trace(wline);
+        }
+      }).detach();
+    }
     const u64 rc_entry = trt_call_guest_img(img->base + img->entry_rva, img,
                                         (u64)(uintptr_t)handle, 1, 0, 0);
+    entry_done->store(true);
     snprintf(line, sizeof(line), "trt: %s entry returned 0x%llx", base,
              (unsigned long long)rc_entry);
     trt_core_log(line);

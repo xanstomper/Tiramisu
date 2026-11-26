@@ -711,6 +711,14 @@ static void win32_prot_to_trt(u32 page, unsigned* prot, u32* old_code) {
 
 int TRT_STDCALL trt_VirtualProtect(void* addr, u64 size, u32 new_protect,
                                    u32* old_protect) {
+  {
+    // .152 diagnostic: log VirtualProtect calls (was silent on success).
+    char line[256];
+    snprintf(line, sizeof(line),
+             "kernel32: VirtualProtect(addr=%p size=%llu prot=0x%x)",
+             addr, (unsigned long long)size, new_protect);
+    trt_core_log(line);
+  }
   const trt_backend* be = trt_core_backend();
   if (!be || !be->protect) return 0;
   if (!addr || size == 0) {

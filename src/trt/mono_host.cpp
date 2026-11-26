@@ -206,10 +206,40 @@ LONG WINAPI mono_veh(EXCEPTION_POINTERS* ep) {
   const DWORD code = ep->ExceptionRecord->ExceptionCode;
   if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_ILLEGAL_INSTRUCTION ||
       code == EXCEPTION_STACK_OVERFLOW || code == EXCEPTION_BREAKPOINT) {
-    char line[320];
-    std::snprintf(line, sizeof(line), "VEH: exception 0x%08lX at %p",
-                  (unsigned long)code, ep->ExceptionRecord->ExceptionAddress);
-    mono_log(line);
+    // .151: cap identical repeats — a fault-retry loop used to bury the
+    // log under hundreds of identical VEH lines (259 in one tail).
+    static DWORD last_code = 0;
+    static void* last_addr = nullptr;
+    static int repeat_count = 0;
+    static int suppressed = 0;
+    void* addr = ep->ExceptionRecord->ExceptionAddress;
+    if (code == last_code && addr == last_addr) {
+      ++repeat_count;
+      if (repeat_count <= 5) {
+        char line[320];
+        std::snprintf(line, sizeof(line), "VEH: exception 0x%08lX at %p",
+                      (unsigned long)code, addr);
+        mono_log(line);
+      } else {
+        ++suppressed;
+        if (suppressed % 100 == 0) {
+          char line[320];
+          std::snprintf(line, sizeof(line),
+                        "VEH: exception 0x%08lX at %p (suppressed %d repeats)",
+                        (unsigned long)code, addr, suppressed);
+          mono_log(line);
+        }
+      }
+    } else {
+      last_code = code;
+      last_addr = addr;
+      repeat_count = 1;
+      suppressed = 0;
+      char line[320];
+      std::snprintf(line, sizeof(line), "VEH: exception 0x%08lX at %p",
+                    (unsigned long)code, addr);
+      mono_log(line);
+    }
   }
   return EXCEPTION_CONTINUE_SEARCH;
 }

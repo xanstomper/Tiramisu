@@ -678,9 +678,7 @@ static u64 win_call_guest_seh(void* routine, u64 arg) {
 }
 
 DWORD WINAPI win_thread_trampoline(LPVOID raw) {
-  thread_start* ts = (thread_start*)raw;
-  const u64 obj_h = ts->object;
-  free(ts);
+  const u64 obj_h = (u64)(uintptr_t)raw;
 
   const u32 my_tid = current_tid();
   void* routine = nullptr;
@@ -698,6 +696,12 @@ DWORD WINAPI win_thread_trampoline(LPVOID raw) {
 
   trt_guest_tls_sync_thread();
   trt_images_notify_thread(2 /*DLL_THREAD_ATTACH*/);
+  {
+    char tline[96];
+    snprintf(tline, sizeof(tline), "thread: win_thread_trampoline started obj=%llu tid=%u routine=%p",
+             (unsigned long long)obj_h, my_tid, routine);
+    trt_core_log(tline);
+  }
   const u64 ret = win_call_guest_seh(routine, arg);
   notify_thread_exit_once();
 
@@ -719,9 +723,7 @@ DWORD WINAPI win_thread_trampoline(LPVOID raw) {
 }
 #else
 void* thread_trampoline(void* raw) {
-  thread_start* ts = (thread_start*)raw;
-  const u64 obj_h = ts->object;
-  free(ts);
+  const u64 obj_h = (u64)(uintptr_t)raw;
 
   u32 my_tid = 0;
   void* routine = nullptr;
@@ -864,11 +866,6 @@ u64 TRT_STDCALL trt_CreateThread(void* attrs, void* stack_size, void* routine,
     return 0;
   }
   u64 obj = 0;
-  thread_start* ts = (thread_start*)malloc(sizeof(thread_start));
-  if (!ts) {
-    trt_SetLastError(8);
-    return 0;
-  }
 
   const bool suspended = (flags & 0x4u /*CREATE_SUSPENDED*/) != 0;
   const u32 child_tid = trt_alloc_guest_thread_id();
@@ -876,7 +873,6 @@ u64 TRT_STDCALL trt_CreateThread(void* attrs, void* stack_size, void* routine,
     std::lock_guard<std::mutex> lk(g_obj_mu);
     obj = alloc_object_locked(OBJ_THREAD);
     if (!obj) {
-      free(ts);
       trt_SetLastError(8);
       return 0;
     }
@@ -894,25 +890,27 @@ u64 TRT_STDCALL trt_CreateThread(void* attrs, void* stack_size, void* routine,
   {
     // thread provenance: pairs with the CS-stall probe's owner_tid so a
     // wedge can be traced back to the routine that created the owner.
-    char tline[96];
-    snprintf(tline, sizeof(tline), "thread: CreateThread tid=%u routine=%p",
-             child_tid, routine);
+    char tline[128];
+    snprintf(tline, sizeof(tline), "thread: CreateThread tid=%u routine=%p stack=%p flags=0x%x",
+             child_tid, routine, stack_size, flags);
     trt_core_log(tline);
   }
-  ts->object = obj;
 
   // the new thread's stack reserve is VA for the thread's lifetime (the
   // requested stack_size, else the 1 MB Windows default / 8 MB POSIX
   // pthread default): charge BEFORE creating the thread so a VA refusal
   // fails the creation instead of leaking an uncharged thread
 #if defined(_WIN32)
-  const u64 stack_va = stack_size ? (u64)(uintptr_t)stack_size
-                                  : 1024ull * 1024ull;
+  const u64 host_stack = ((uintptr_t)stack_size < 1024ull * 1024ull)
+                             ? 0
+                             : (SIZE_T)stack_size;
+  const u64 stack_va = (stack_size && (uintptr_t)stack_size >= 1024ull * 1024ull)
+                           ? (u64)(uintptr_t)stack_size
+                           : 2ull * 1024ull * 1024ull;
 #else
   const u64 stack_va = 8ull * 1024ull * 1024ull;  // pthread default stack
 #endif
   if (trt_mem_budget_charge_va(stack_va) != 0) {
-    free(ts);
     std::lock_guard<std::mutex> lk(g_obj_mu);
     u32 idx = 0;
     sync_object* o = object_for_locked(obj, &idx);
@@ -931,11 +929,10 @@ u64 TRT_STDCALL trt_CreateThread(void* attrs, void* stack_size, void* routine,
 
 #if defined(_WIN32)
   DWORD win_tid = 0;
-  HANDLE t = ::CreateThread(nullptr, (SIZE_T)stack_size, &win_thread_trampoline,
-                            ts, suspended ? CREATE_SUSPENDED : 0u, &win_tid);
+  HANDLE t = ::CreateThread(nullptr, (SIZE_T)host_stack, &win_thread_trampoline,
+                            (LPVOID)(uintptr_t)obj, suspended ? CREATE_SUSPENDED : 0u, &win_tid);
   if (!t) {
     const DWORD err = GetLastError();
-    free(ts);
     trt_mem_budget_discharge_va(stack_va);
     std::lock_guard<std::mutex> lk(g_obj_mu);
     u32 idx = 0;
@@ -962,8 +959,7 @@ u64 TRT_STDCALL trt_CreateThread(void* attrs, void* stack_size, void* routine,
   (void)stack_size;
   ensure_sigusr2_installed();
   pthread_t th;
-  if (pthread_create(&th, nullptr, &thread_trampoline, ts) != 0) {
-    free(ts);
+  if (pthread_create(&th, nullptr, &thread_trampoline, (void*)(uintptr_t)obj) != 0) {
     trt_mem_budget_discharge_va(stack_va);
     std::lock_guard<std::mutex> lk(g_obj_mu);
     u32 idx = 0;
@@ -1417,7 +1413,11 @@ u32 TRT_STDCALL trt_ResumeThread(u64 thread) {
     trt_SetLastError(6);
     return (u32)-1;
   }
-  return ::ResumeThread(h);
+  const DWORD res = ::ResumeThread(h);
+  char rline[96];
+  snprintf(rline, sizeof(rline), "kernel32: ResumeThread(obj=%llu) -> prev_count=%lu", (unsigned long long)thread, (unsigned long)res);
+  trt_core_log(rline);
+  return (u32)res;
 #else
   std::lock_guard<std::mutex> lk(g_obj_mu);
   sync_object* o = object_for_locked(thread);

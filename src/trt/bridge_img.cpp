@@ -120,7 +120,10 @@ int parse_png(const u8* d, u32 bytes, trt_img* out) {
 
   // unfilter: per scanline, filter byte + w*ch bytes; bpp = ceil(ch/8)
   const size_t stride = (size_t)w * ch;
-  const int bpp_f = ch >= 8 ? 8 : (ch >= 4 ? 4 : (ch >= 2 ? 2 : 1));
+  // PNG filter bpp = ceil(bitdepth * channels / 8); bitdepth is 8 here,
+  // so bpp == channels. (Was: a ternary yielding 2 for RGB, which
+  // scrambled every RGB PNG's Sub/Average/Paeth unfilter.)
+  const int bpp_f = ch;
   u8* prev = (u8*)calloc(1, stride);
   u8* cur = (u8*)malloc(stride);
   u8* rgba = (u8*)calloc(1, (size_t)w * h * 4);

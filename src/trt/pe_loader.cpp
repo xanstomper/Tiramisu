@@ -260,6 +260,24 @@ void trt_guest_tls_bind_host_slots(void** native, void** guest) {
   const u32 index = (u32)_tls_index;
   if (index < k_guest_tls_first_index) guest[index] = native[index];
 
+  // 1. Walk PEB InLoadOrderModuleList (always readable in AppContainer, zero API calls)
+  __try {
+    const auto* peb = reinterpret_cast<const u8*>(__readgsqword(0x60));
+    if (peb) {
+      const auto* ldr = *reinterpret_cast<const u8* const*>(peb + 0x18);
+      if (ldr) {
+        const auto* head = reinterpret_cast<const LIST_ENTRY*>(ldr + 0x10);
+        for (const LIST_ENTRY* curr = head ? head->Flink : nullptr;
+             curr && curr != head; curr = curr->Flink) {
+          HMODULE hMod = *reinterpret_cast<const HMODULE*>(
+              reinterpret_cast<const u8*>(curr) + 0x30);
+          if (hMod) bind_native_module_tls(hMod, native, guest);
+        }
+      }
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+  // 2. K32EnumProcessModules (if permitted by environment)
   using enum_modules = BOOL (WINAPI*)(HANDLE, HMODULE*, DWORD, LPDWORD);
   static const auto modules = reinterpret_cast<enum_modules>(
       GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32EnumProcessModules"));
@@ -269,15 +287,17 @@ void trt_guest_tls_bind_host_slots(void** native, void** guest) {
     const size_t count = bytes < sizeof(loaded) ? bytes / sizeof(HMODULE)
                                                : sizeof(loaded) / sizeof(HMODULE);
     for (size_t i = 0; i < count; ++i) bind_native_module_tls(loaded[i], native, guest);
-  } else {
-    // The Xbox AppContainer can restrict process enumeration. Preserve the
-    // loaded system components that the direct graphics path calls into.
-    const wchar_t* graphics_modules[] = {
-        L"d3d11.dll", L"d3d11on12.dll", L"d3d12.dll", L"D3D12Core.dll",
-        L"dxgi.dll", L"d3dcompiler_47.dll", L"winrtbase.dll", L"combase.dll"};
-    for (const auto* name : graphics_modules)
-      bind_native_module_tls(GetModuleHandleW(name), native, guest);
   }
+
+  // 3. Fallback explicit list of system modules
+  const wchar_t* const fallback_modules[] = {
+      L"newbe_xs.DLL", L"newbe.dll", L"newbe_xs_d.dll",
+      L"ntdll.dll", L"kernel32.dll", L"kernelbase.dll",
+      L"msvcp140.dll", L"vcruntime140.dll", L"ucrtbase.dll",
+      L"d3d11.dll", L"d3d11on12.dll", L"d3d12.dll", L"D3D12Core.dll",
+      L"dxgi.dll", L"d3dcompiler_47.dll", L"winrtbase.dll", L"combase.dll"};
+  for (const auto* name : fallback_modules)
+    bind_native_module_tls(GetModuleHandleW(name), native, guest);
 #else
   (void)native;
   (void)guest;
@@ -818,10 +838,19 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
           return fail(&img, be, TRT_ERR_IMPORT, det);
         }
         memcpy(img.base + t, &fn, 8);  // bind IAT
-        if (n_symbols == 0) {
+        {  // .151 diagnostic: log EVERY bind (was first-symbol-only),
+           // so a hanging DllMain's import surface is visible.
+           // .152: print the ordinal value for ordinal imports.
+          char sym_display[280];
+          if (sym_name) {
+            snprintf(sym_display, sizeof(sym_display), "%s", sym_name);
+          } else {
+            snprintf(sym_display, sizeof(sym_display), "#ordinal %u",
+                     (unsigned)ordinal);
+          }
           char line[256];
           snprintf(line, sizeof(line), "trt: bind %s!%s -> %p", mod_name,
-                   sym_name ? sym_name : "#ordinal", fn);
+                   sym_display, fn);
           logf_be(be, line);
         }
         ++bound; ++n_symbols;

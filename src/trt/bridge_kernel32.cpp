@@ -459,6 +459,7 @@ struct va_region {
   uintptr_t base;
   size_t size;
   u32 alloc_prot;
+  bool is_demand_commit = false;
   std::vector<va_extent> extents;
 };
 std::mutex g_va_mu;
@@ -546,6 +547,7 @@ void va_record_add(uintptr_t base, size_t size, u32 alloc_prot, u32 cur_prot,
     if (g_va[i].base == base) {
       g_va[i].size = size;
       g_va[i].alloc_prot = alloc_prot & 0xFFu;
+      g_va[i].is_demand_commit = false;
       g_va[i].extents.assign(1, ex);
       return;
     }
@@ -555,7 +557,36 @@ void va_record_add(uintptr_t base, size_t size, u32 alloc_prot, u32 cur_prot,
   rec.base = base;
   rec.size = size;
   rec.alloc_prot = alloc_prot & 0xFFu;
+  rec.is_demand_commit = false;
   rec.extents.push_back(ex);
+  if (free_idx != (size_t)-1) g_va[free_idx] = std::move(rec);
+  else g_va.push_back(std::move(rec));
+}
+
+void va_record_add_demand(uintptr_t base, size_t size, u32 alloc_prot,
+                          size_t precommit_sz) {
+  std::lock_guard<std::mutex> lk(g_va_mu);
+  va_region rec;
+  rec.base = base;
+  rec.size = size;
+  rec.alloc_prot = alloc_prot & 0xFFu;
+  rec.is_demand_commit = true;
+  if (precommit_sz > 0) {
+    rec.extents.push_back({base, precommit_sz, 0x1000u /* MEM_COMMIT */,
+                           alloc_prot & 0xFFu, false});
+  }
+  if (size > precommit_sz) {
+    rec.extents.push_back({base + precommit_sz, size - precommit_sz,
+                           0x2000u /* MEM_RESERVE */, alloc_prot & 0xFFu, false});
+  }
+  size_t free_idx = (size_t)-1;
+  for (size_t i = 0; i < g_va.size(); ++i) {
+    if (g_va[i].base == base) {
+      g_va[i] = std::move(rec);
+      return;
+    }
+    if (g_va[i].base == 0 && free_idx == (size_t)-1) free_idx = i;
+  }
   if (free_idx != (size_t)-1) g_va[free_idx] = std::move(rec);
   else g_va.push_back(std::move(rec));
 }
@@ -638,6 +669,80 @@ extern "C" int trt_va_mark_pending_rx(void* base, size_t size,
     return 1;
   }
   g_extra_pending_rx.push_back({s, e - s, 0x1000u, 0x04u, true});
+  return 1;
+}
+
+extern "C" int trt_va_try_demand_commit(u64 fault_addr) {
+  const uintptr_t a = (uintptr_t)fault_addr;
+  uintptr_t chunk_base = 0;
+  uintptr_t chunk_end = 0;
+  size_t chunk_sz = 0;
+  unsigned tprot = 0;
+  u32 eff_prot = 0;
+  size_t fresh = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_va_mu);
+    const int idx = va_find_idx_locked(a);
+    if (idx < 0) return 0;
+    const va_region& r = g_va[(size_t)idx];
+    if (!r.is_demand_commit) return 0;
+
+    if (const va_extent* ex = va_find_extent_locked(r, a)) {
+      if (ex->state == 0x1000u) {
+        // Already committed: returning 1 on an unresolvable fault causes an infinite loop
+        return 0;
+      }
+    }
+
+    constexpr size_t kChunkSize = 2ULL * 1024ULL * 1024ULL;
+    chunk_base = a & ~(kChunkSize - 1);
+    if (chunk_base < r.base) chunk_base = r.base;
+    chunk_end = (a + kChunkSize) & ~(kChunkSize - 1);
+    if (chunk_end > r.base + r.size) chunk_end = r.base + r.size;
+    chunk_sz = chunk_end - chunk_base;
+
+    fresh = chunk_sz - va_committed_in_locked(r, chunk_base, chunk_end);
+    if (fresh == 0) return 0;
+
+    eff_prot = r.alloc_prot ? r.alloc_prot : 0x04u;
+    tprot = va_prot_bits(eff_prot);
+  }
+
+  trt_vmem_commit_fn cfn = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(g_va_mu);
+    cfn = g_vmem_commit;
+  }
+  if (!cfn) return 0;
+
+  if (trt_mem_budget_charge_commit((u64)fresh) != 0) {
+    trt_core_log("[trt] demand-commit: budget exhausted");
+    return 0;
+  }
+
+  if (cfn((void*)chunk_base, chunk_sz, tprot) != 0) {
+    char err[160];
+    snprintf(err, sizeof(err), "[trt] demand-commit: cfn failed on chunk %p..%p",
+             (void*)chunk_base, (void*)chunk_end);
+    trt_core_log(err);
+    trt_mem_budget_discharge_commit((u64)fresh);
+    return 0;
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(g_va_mu);
+    const int idx = va_find_idx_locked(chunk_base);
+    if (idx >= 0) {
+      va_split_and_set_locked(g_va[(size_t)idx], chunk_base, chunk_end,
+                              0x1000u /* MEM_COMMIT */, eff_prot, 0);
+    }
+  }
+
+  char msg[128];
+  snprintf(msg, sizeof(msg),
+           "[trt] mem: demand-commit tid=%lu at %p (chunk %p..%p)",
+           (unsigned long)::GetCurrentThreadId(), (void*)a, (void*)chunk_base, (void*)chunk_end);
+  trt_core_log(msg);
   return 1;
 }
 
@@ -878,10 +983,25 @@ u32 TRT_STDCALL trt_ResetWriteWatch(void* addr, u64 bytes) {
 }
 
 void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
-  // MEM_WRITE_WATCH is a REQUEST modifier, not an allocation type: real
-  // Windows accepts it silently alongside MEM_RESERVE|COMMIT (bdwgc probes
-  // with exactly this combination). Rejecting it fails the whole GC probe.
-  type &= ~0x00200000u;
+  // MEM_WRITE_WATCH, MEM_TOP_DOWN, MEM_LARGE_PAGES, MEM_PHYSICAL are request
+  // modifiers, not allocation types.
+  type &= ~0x00200000u; // MEM_WRITE_WATCH
+  type &= ~0x00100000u; // MEM_TOP_DOWN
+  type &= ~0x20000000u; // MEM_LARGE_PAGES
+  type &= ~0x00400000u; // MEM_PHYSICAL
+
+  // Windows API contract: if lpAddress is NULL and MEM_COMMIT is requested
+  // without MEM_RESERVE, the system automatically reserves and commits new pages.
+  if (!addr && (type & 0x1000u)) {
+    type |= 0x2000u;
+  }
+
+  char valog[192];
+  snprintf(valog, sizeof(valog),
+           "kernel32: VirtualAlloc(addr=%p, bytes=0x%llx, type=0x%x, prot=0x%x)",
+           addr, (unsigned long long)bytes, type, prot);
+  trt_core_log(valog);
+
   if (!(type & 0x3000u)) {
     set_err_for_current_thread(87);  // INVALID_PARAMETER
     return nullptr;
@@ -1000,6 +1120,45 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
   }
 
   // reserve+commit: the bytes are both reserved VA and committed memory
+  // Demand-commit path for large anonymous allocations (>= 16 MB)
+  if (want_commit && !addr && sz >= (16ULL * 1024ULL * 1024ULL)) {
+    trt_vmem_reserve_fn rfn = nullptr;
+    trt_vmem_commit_fn cfn = nullptr;
+    {
+      std::lock_guard<std::mutex> lk(g_va_mu);
+      rfn = g_vmem_reserve;
+      cfn = g_vmem_commit;
+    }
+    if (rfn && cfn) {
+      if (trt_mem_budget_charge_va((u64)sz) == 0) {
+        void* p = rfn(sz, 0);
+        if (p) {
+          // Pre-commit the initial 2 MB so allocator headers can be written without faulting
+          const size_t pre_sz = (sz < (2ULL * 1024ULL * 1024ULL)) ? sz : (2ULL * 1024ULL * 1024ULL);
+          if (trt_mem_budget_charge_commit((u64)pre_sz) == 0) {
+            u32 eff_prot = pclean;
+            if (cfn(p, pre_sz, tprot) == 0) {
+              va_record_add_demand((uintptr_t)p, sz, eff_prot, pre_sz);
+              char dlog[192];
+              snprintf(dlog, sizeof(dlog),
+                       "kernel32: VirtualAlloc(DEMAND %llu MB) -> %p (precommitted %llu MB)",
+                       (unsigned long long)(sz >> 20), p,
+                       (unsigned long long)(pre_sz >> 20));
+              trt_core_log(dlog);
+              return p;
+            }
+            trt_mem_budget_discharge_commit((u64)pre_sz);
+          }
+          trt_mem_budget_discharge_va((u64)sz);
+          if (g_be.release) g_be.release(p, sz);
+          set_err_for_current_thread(8);
+          return nullptr;
+        }
+        trt_mem_budget_discharge_va((u64)sz);
+      }
+    }
+  }
+
   if (trt_mem_budget_charge_va((u64)sz) != 0) return nullptr;  // 8 set
   if (trt_mem_budget_charge_commit(sz) != 0) {
     trt_mem_budget_discharge_va((u64)sz);
@@ -1014,8 +1173,12 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
     trt_mem_budget_discharge_commit(sz);
     trt_mem_budget_discharge_va((u64)sz);
     set_err_for_current_thread(8);  // NOT_ENOUGH_MEMORY
+    trt_core_log("kernel32: VirtualAlloc -> NULL (g_be.alloc failed)");
     return nullptr;
   }
+  char rlog[128];
+  snprintf(rlog, sizeof(rlog), "kernel32: VirtualAlloc -> %p", p);
+  trt_core_log(rlog);
   u32 eff_prot = pclean;
   bool pending_rx = false;
   if (pclean != 0x04u && g_be.protect) {
@@ -1147,6 +1310,7 @@ u64 TRT_STDCALL trt_VirtualQuery(const void* addr, void* mbi_out, u64 len) {
   bool found = false;
   uintptr_t r_base = 0;
   u32 r_alloc_prot = 0;
+  bool r_is_demand = false;
   va_extent hit{};
   {
     std::lock_guard<std::mutex> lk(g_va_mu);
@@ -1156,6 +1320,7 @@ u64 TRT_STDCALL trt_VirtualQuery(const void* addr, void* mbi_out, u64 len) {
       if (const va_extent* ex = va_find_extent_locked(r, page)) {
         r_base = r.base;
         r_alloc_prot = r.alloc_prot;
+        r_is_demand = r.is_demand_commit;
         hit = *ex;
         found = true;
       }
@@ -1166,8 +1331,13 @@ u64 TRT_STDCALL trt_VirtualQuery(const void* addr, void* mbi_out, u64 len) {
     m->AllocationBase = (u64)r_base;
     m->AllocationProtect = r_alloc_prot;
     m->RegionSize = (u64)((hit.start + hit.size) - page);
-    m->State = hit.state;
-    m->Protect = (hit.state == 0x1000u) ? hit.prot : 0u;
+    if (r_is_demand) {
+      m->State = 0x1000u;  // MEM_COMMIT
+      m->Protect = r_alloc_prot;
+    } else {
+      m->State = hit.state;
+      m->Protect = (hit.state == 0x1000u) ? hit.prot : 0u;
+    }
     m->Type = 0x20000u;  // MEM_PRIVATE
     return sizeof(mbi64);
   }
@@ -1895,11 +2065,13 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
   }
   if (!os) {
     err_ref_for_current_thread() = 2; // FILE_NOT_FOUND
+    char guest_u8[512] = {};
+    if (name) trt_utf16_to_utf8(name, guest_u8, sizeof(guest_u8));
     trt_core_log("kernel32: CreateFileW open failed on host (see path)");
-    char plog[1100];
+    char plog[1200];
     snprintf(plog, sizeof(plog),
-             "  path was: %s (access=0x%08x disposition=%u write=%d)",
-             host, access, disp, write);
+             "  guest: %s\n  host:  %s (access=0x%08x disp=%u write=%d)",
+             guest_u8, host, access, disp, write);
     trt_core_log(plog);
     return (void*)(uintptr_t)-1;
   }
@@ -2645,7 +2817,15 @@ void* TRT_STDCALL trt_GetProcAddress(void* handle, const char* name) {
     }
     const u32 v = (u32)(uintptr_t)name;
     if (v >= 0x10000) {
-      if (void* fn = trt_resolve_module(nullptr, mod, name, 0)) return fn;
+      if (void* fn = trt_resolve_module(nullptr, mod, name, 0)) {
+        // .151 diagnostic: log dynamic resolves (a hanging DllMain's
+        // GetProcAddress calls were invisible).
+        char line[320];
+        snprintf(line, sizeof(line),
+                 "kernel32: GetProcAddress(%s!%s) -> %p", mod, name, fn);
+        trt_core_log(line);
+        return fn;
+      }
       char line[256];
       snprintf(line, sizeof(line),
                "kernel32: GetProcAddress(%s!%s) -> NULL (not in the bridge "
@@ -2669,6 +2849,20 @@ void* TRT_STDCALL trt_GetProcAddress(void* handle, const char* name) {
       : trt_pe_find_export(trt_runtime_backend(), trt_runtime_resolver(), img,
                            name, 0);
   if (!fn) err_ref_for_current_thread() = 127;  // ERROR_PROC_NOT_FOUND
+  {
+    // .151 diagnostic: log dynamic resolves.
+    char line[320];
+    if (v < 0x10000) {
+      snprintf(line, sizeof(line),
+               "kernel32: GetProcAddress(handle=%p #ordinal %u) -> %p",
+               handle, (unsigned)v, fn);
+    } else {
+      snprintf(line, sizeof(line),
+               "kernel32: GetProcAddress(handle=%p %s) -> %p",
+               handle, name ? name : "?", fn);
+    }
+    trt_core_log(line);
+  }
   return fn;
 }
 
@@ -3879,6 +4073,16 @@ int TRT_STDCALL trt_GetCPInfo(u32 codepage, void* cpinfo) {
   cpinfo_x* ci = (cpinfo_x*)cpinfo;
   memset(ci, 0, sizeof(cpinfo_x));
   ci->max_size = codepage == 65001 ? 4 : (codepage == 0 || codepage == 1252 ? 1 : 2);
+  // .161: fill the LeadByte ranges for DBCS codepages (was: all zeros, so
+  // the CRT saw no lead bytes for Shift-JIS). Writes stay inside the
+  // 12-byte lead array -- the /GS-cookie warning above still holds.
+  if (codepage == 932) {
+    const u8 lead[12] = {0x81, 0x9F, 0xE0, 0xFC, 0, 0, 0, 0, 0, 0, 0, 0};
+    memcpy(ci->lead, lead, sizeof(lead));
+  } else if (codepage == 936 || codepage == 949 || codepage == 950) {
+    const u8 lead[12] = {0x81, 0xFE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    memcpy(ci->lead, lead, sizeof(lead));
+  }
   boot_log("kernel32: GetCPInfo answered (single/double-byte by codepage)");
   return 1;
 }
@@ -5462,6 +5666,54 @@ extern "C" __attribute__((used)) void trt_raise_exception_sysv(
            code, flags, count,
            (count && args) ? (unsigned long long)args[0] : 0ull);
   boot_log(line);
+  // .156 DIAGNOSTIC: decode the MSVC C++ exception type name so a throw
+  // names itself instead of dying as an anonymous 0xe06d7363. Standard
+  // x64 contract: info[0]=magic 0x19930520, info[1]=object, info[2]=
+  // ThrowInfo* (absolute). ThrowInfo/CatchableType/TypeDescriptor use
+  // image-relative RVAs. Only deref inside a mapped guest image.
+  if (code == 0xe06d7363u && count >= 3 && args) {
+    snprintf(line, sizeof(line),
+             "kernel32: MSVC throw params: obj=0x%llx ti=0x%llx a3=0x%llx",
+             (unsigned long long)args[1], (unsigned long long)args[2],
+             (count > 3) ? (unsigned long long)args[3] : 0ull);
+    boot_log(line);
+    for (int ti_try = 0; ti_try < 2; ++ti_try) {
+      const u64 ti_addr = ti_try ? args[1] : args[2];
+      trt_image* timg = find_guest_image_for_pc(ti_addr);
+      if (!timg) continue;
+      const u64 tbase = (u64)(uintptr_t)timg->base;
+      const u64 tend = tbase + timg->size_of_image;
+      if (ti_addr + 16 >= tend) continue;
+      i32 cta_rva = 0;
+      memcpy(&cta_rva, (const void*)(uintptr_t)(ti_addr + 12), 4);
+      const u64 cta = tbase + (i64)cta_rva;
+      if (cta + 4 >= tend || cta < tbase) continue;
+      u32 nct = 0;
+      memcpy(&nct, (const void*)(uintptr_t)cta, 4);
+      if (nct == 0 || nct > 64) continue;
+      i32 ct_rva = 0;
+      memcpy(&ct_rva, (const void*)(uintptr_t)(cta + 4), 4);
+      const u64 ct = tbase + (i64)ct_rva;
+      if (ct + 8 >= tend || ct < tbase) continue;
+      i32 td_rva = 0;
+      memcpy(&td_rva, (const void*)(uintptr_t)(ct + 4), 4);
+      const u64 td = tbase + (i64)td_rva;
+      if (td + 16 >= tend || td < tbase) continue;
+      char tname[128];
+      memset(tname, 0, sizeof(tname));
+      const char* tsrc = (const char*)(uintptr_t)(td + 16);
+      size_t tmax = (size_t)(tend - (td + 16));
+      if (tmax > 127) tmax = 127;
+      size_t tk = 0;
+      while (tk < tmax && tsrc[tk]) { tname[tk] = tsrc[tk]; ++tk; }
+      snprintf(line, sizeof(line),
+               "kernel32: MSVC throw type (n=%u, arg%d): %s",
+               nct, ti_try ? 1 : 2, tname);
+      boot_log(line);
+      break;
+    }
+  }
+
 
   u8 ctx[k_ctx_size];
   memcpy(ctx, caller_ctx_in, k_ctx_size);
@@ -5490,6 +5742,7 @@ extern "C" __attribute__((used)) void trt_raise_exception_sysv(
     return;
   }
 
+  boot_log("kernel32: RaiseException dispatch: no handler found");
   // Unhandled MSVC C++ exception from an IL2CPP game: ask the game's own
   // runtime what managed exception it was (diagnostic). MSVC x64 C++ EH
   // parameter contract ( RaiseExceptionReference ):
@@ -5706,15 +5959,34 @@ extern "C" int TRT_STDCALL trt_dispatch_win32_exception(void* ep_v) {
   if (!ep_v) return 0;
 #ifdef _WIN32
   PEXCEPTION_POINTERS ep = (PEXCEPTION_POINTERS)ep_v;
-  if (!ep->ExceptionRecord ||
-      !is_guest_exec_pc((u64)(uintptr_t)ep->ExceptionRecord->ExceptionAddress))
-    return 0;
-  if (ep->ExceptionRecord->ExceptionCode == 0xC0000005u &&
-      ep->ExceptionRecord->NumberParameters >= 2 &&
-      ep->ExceptionRecord->ExceptionInformation[0] == 8 &&
-      trt_va_try_promote_rx((u64)ep->ExceptionRecord->ExceptionInformation[1])) {
-    return -1;
+  if (!ep->ExceptionRecord) return 0;
+  const DWORD code = ep->ExceptionRecord->ExceptionCode;
+  if (code == 0xC0000005u &&
+      ep->ExceptionRecord->NumberParameters >= 2) {
+    const ULONG_PTR kind = ep->ExceptionRecord->ExceptionInformation[0];
+    const u64 fault_addr = (u64)ep->ExceptionRecord->ExceptionInformation[1];
+    if ((kind == 0 || kind == 1) && trt_va_try_demand_commit(fault_addr)) {
+      return -1;
+    }
+    if (kind == 8 && trt_va_try_promote_rx(fault_addr)) {
+      return -1;
+    }
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "[trt] EXCEPTION_ACCESS_VIOLATION kind=%lu addr=0x%llx pc=%p not demand-committed",
+             (unsigned long)kind, (unsigned long long)fault_addr,
+             ep->ExceptionRecord->ExceptionAddress);
+    trt_core_log(buf);
+  } else if (code != 0x406d1388u) {
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "[trt] win32_exception code=0x%08lx at pc=%p (params=%lu)",
+             (unsigned long)code, ep->ExceptionRecord->ExceptionAddress,
+             (unsigned long)ep->ExceptionRecord->NumberParameters);
+    trt_core_log(buf);
   }
+  if (!is_guest_exec_pc((u64)(uintptr_t)ep->ExceptionRecord->ExceptionAddress))
+    return 0;
 #endif
   return trt_run_guest_veh(ep_v);
 }
@@ -5736,6 +6008,91 @@ void TRT_STDCALL trt_RaiseException(u32 code, u32 flags, u32 count, u64* args) {
     boot_log(line);
   }
   if (trt_boot_raise_trap) { trt_boot_raise_trap(code); }
+  // .157 DIAGNOSTIC: decode the MSVC C++ exception type name so a throw
+  // names itself instead of dying as an anonymous 0xe06d7363. The .156
+  // diagnostic lived only in the SysV RaiseException path (Linux-only
+  // branch, compiled out on UWP) — the .156 binary contains neither
+  // diagnostic string. The guest calls THIS Win64 trt_RaiseException.
+  // Standard x64 contract: info[0]=magic 0x19930520, info[1]=object,
+  // info[2]=ThrowInfo* (absolute); IL2CPP swaps [1]/[2], so try both.
+  // ThrowInfo/CatchableType/TypeDescriptor use image-relative RVAs.
+  // Only deref inside a mapped guest image.
+  if (code == 0xe06d7363u && count >= 3 && args) {
+    char dline[192];
+    snprintf(dline, sizeof(dline),
+             "kernel32: MSVC throw params: obj=0x%llx ti=0x%llx a3=0x%llx",
+             (unsigned long long)args[1], (unsigned long long)args[2],
+             (count > 3) ? (unsigned long long)args[3] : 0ull);
+    boot_log(dline);
+    int found_ti_try = -1;
+    for (int ti_try = 0; ti_try < 2; ++ti_try) {
+      const u64 ti_addr = ti_try ? args[1] : args[2];
+      trt_image* timg = find_guest_image_for_pc(ti_addr);
+      if (!timg) continue;
+      const u64 tbase = (u64)(uintptr_t)timg->base;
+      const u64 tend = tbase + timg->size_of_image;
+      if (ti_addr + 16 >= tend) continue;
+      i32 cta_rva = 0;
+      memcpy(&cta_rva, (const void*)(uintptr_t)(ti_addr + 12), 4);
+      const u64 cta = tbase + (i64)cta_rva;
+      if (cta + 4 >= tend || cta < tbase) continue;
+      u32 nct = 0;
+      memcpy(&nct, (const void*)(uintptr_t)cta, 4);
+      if (nct == 0 || nct > 64) continue;
+      i32 ct_rva = 0;
+      memcpy(&ct_rva, (const void*)(uintptr_t)(cta + 4), 4);
+      const u64 ct = tbase + (i64)ct_rva;
+      if (ct + 8 >= tend || ct < tbase) continue;
+      i32 td_rva = 0;
+      memcpy(&td_rva, (const void*)(uintptr_t)(ct + 4), 4);
+      const u64 td = tbase + (i64)td_rva;
+      if (td + 16 >= tend || td < tbase) continue;
+      char tname[128];
+      memset(tname, 0, sizeof(tname));
+      const char* tsrc = (const char*)(uintptr_t)(td + 16);
+      size_t tmax = (size_t)(tend - (td + 16));
+      if (tmax > 127) tmax = 127;
+      size_t tk = 0;
+      while (tk < tmax && tsrc[tk]) { tname[tk] = tsrc[tk]; ++tk; }
+      snprintf(dline, sizeof(dline),
+               "kernel32: MSVC throw type (n=%u, arg%d): %s",
+               nct, ti_try ? 1 : 2, tname);
+      boot_log(dline);
+      found_ti_try = ti_try;
+      break;
+    }
+    // .158: read the exception's what() message. MSVC std::exception:
+    // +0 vtable, +8 _Mywhat (const char*). The object is the OTHER arg
+    // from the ThrowInfo (standard layout: info[1]=object, info[2]=
+    // ThrowInfo; IL2CPP swaps them). Every deref is guarded by
+    // page_readable (VirtualQuery: committed + readable) so a wild
+    // pointer fails visibly instead of AV-ing the host.
+    if (found_ti_try >= 0) {
+      const u64 obj_addr = found_ti_try ? args[2] : args[1];
+      if (page_readable((const void*)(uintptr_t)obj_addr) &&
+          page_readable((const void*)(uintptr_t)(obj_addr + 8))) {
+        u64 what_ptr = 0;
+        memcpy(&what_ptr, (const void*)(uintptr_t)(obj_addr + 8), 8);
+        if (what_ptr && page_readable((const void*)(uintptr_t)what_ptr)) {
+          char what[128];
+          memset(what, 0, sizeof(what));
+          size_t wk = 0;
+          const char* wsrc = (const char*)(uintptr_t)what_ptr;
+          while (wk < 127) {
+            if ((wk & 31) == 0 && !page_readable(wsrc + wk)) break;
+            if (!wsrc[wk]) break;
+            what[wk] = wsrc[wk];
+            ++wk;
+          }
+          if (wk > 0) {
+            snprintf(dline, sizeof(dline),
+                     "kernel32: MSVC throw what: %s", what);
+            boot_log(dline);
+          }
+        }
+      }
+    }
+  }
 #ifdef _WIN32
   std::vector<void*> vehs;
   veh_snapshot_ordered(&vehs);

@@ -16,6 +16,7 @@ namespace longan {
 struct host_settings {
   // ---- game defaults ----
   std::string default_input = "auto";  // auto | controller | kbm | pad2kbm
+  std::string auto_launch;             // game directory name to auto-launch on startup, e.g. "Sekiro"
   int mouse_speed = 50;                // gamepad-as-mouse speed, 1..100
   int wheel_speed = 50;                // pad dpad wheel speed, 1..100
   bool pad_vibration = true;           // let guests rumble the pad

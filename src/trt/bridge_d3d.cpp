@@ -17,6 +17,7 @@
 #include "bridge_d3d12.h"
 #include "input.h"
 #include "thunk.h"
+#include "trt_trace.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -225,6 +226,104 @@ int TRT_GUEST_ABI fake_sc_GetDevice(void* self, const void* riid, void** dev) {
   *dev = g_sc_is_d3d12 ? g_hooks.d3d12_device : g_hooks.device;
   return *dev ? 0 : TRT_E_NOTIMPL;
 }
+
+#ifndef TRT_FRAME_TIME
+#define TRT_FRAME_TIME 1
+#endif
+#if TRT_FRAME_TIME
+/* TIRAMISU EXTENSION: frame-time measurement for native (non-Mono) games.
+ * Timestamps every guest Present (fake_sc_Present / fake_sc_Present1
+ * below) and logs the rolling average + p95 frame time to tiramisu.log
+ * every 60 frames via trt_trace (allocation-free; same log file the
+ * /api/logs endpoint reads). p95 < 16.7ms proves locked 60fps.
+ *
+ * This is the hook patch 03 could not be: patch 03 instruments the
+ * FNA3D driver's Present, which native games never call -- Sekiro, GoW
+ * and RACCOIN present through the guest DXGI swapchain shimmed here.
+ * The host UI's own swapchain_present() (src/host/swapchain.cpp:500) is
+ * NOT the hook either: it serves the launcher / quick-menu loops only,
+ * and during gameplay the game frame is frozen as far as the host UI is
+ * concerned -- sampling there would report the menu's Sleep(16)
+ * cadence, not the game's framerate.
+ *
+ * Timer: std::chrono::steady_clock -- QPC-backed on MSVC/UWP, i.e. the
+ * same clock QueryPerformanceCounter reads. The trt tree is deliberately
+ * windows.h-free (pe.h), so the Win32 QPC API is not used directly here;
+ * the guest-facing QPC bridge (bridge_kernel32.cpp now_qpc_ticks) is
+ * clock_gettime-based for the same reason.
+ *
+ * Zero allocation in the Present path: fixed-size ring buffer; the sort
+ * + log run once per 60 frames. Threading: D3D11 games present from a
+ * single render thread, so no lock is taken here (a torn sample in a
+ * pathological multi-thread-present case would only skew one window's
+ * numbers; the log write itself goes through trt_trace's mutex).
+ * DXGI_PRESENT_TEST presents are not sampled (no frame is shown).
+ *
+ * Kill switch: -DTRT_FRAME_TIME=0 compiles the whole thing out -- the
+ * call sites vanish too.
+ */
+#define TRT_FRAME_SAMPLES 120
+#define TRT_FRAME_LOG_EVERY 60
+
+double trt_frame_times[TRT_FRAME_SAMPLES];
+int trt_frame_count = 0;
+int trt_frame_index = 0;
+uint64_t trt_frame_total = 0;
+std::chrono::steady_clock::time_point trt_frame_prev{};
+bool trt_frame_have_prev = false;
+
+void trt_host_frame_time_sample() {
+  using clock = std::chrono::steady_clock;
+  const auto now = clock::now();
+  if (!trt_frame_have_prev) {
+    trt_frame_prev = now;
+    trt_frame_have_prev = true;
+    return;
+  }
+  const double dt_ms =
+      std::chrono::duration<double, std::milli>(now - trt_frame_prev).count();
+  trt_frame_prev = now;
+
+  /* Ring buffer: fixed size, no allocation. */
+  trt_frame_times[trt_frame_index] = dt_ms;
+  trt_frame_index = (trt_frame_index + 1) % TRT_FRAME_SAMPLES;
+  if (trt_frame_count < TRT_FRAME_SAMPLES) trt_frame_count += 1;
+  trt_frame_total += 1;
+
+  /* Log every 60 frames once the window has 60 samples. */
+  if (trt_frame_count < TRT_FRAME_LOG_EVERY ||
+      (trt_frame_total % TRT_FRAME_LOG_EVERY) != 0)
+    return;
+
+  /* Average over the window. */
+  double sum = 0.0;
+  const int n = trt_frame_count;
+  for (int i = 0; i < n; i += 1) sum += trt_frame_times[i];
+  const double avg = sum / (double)n;
+
+  /* p95: copy + insertion sort (120 elements, once per 60 frames). */
+  double sorted[TRT_FRAME_SAMPLES];
+  for (int i = 0; i < n; i += 1) sorted[i] = trt_frame_times[i];
+  for (int i = 1; i < n; i += 1) {
+    const double key = sorted[i];
+    int j = i - 1;
+    while (j >= 0 && sorted[j] > key) {
+      sorted[j + 1] = sorted[j];
+      j -= 1;
+    }
+    sorted[j + 1] = key;
+  }
+  int p95i = (int)(0.95 * (double)(n - 1) + 0.5);
+  if (p95i < 0) p95i = 0;
+  if (p95i >= n) p95i = n - 1;
+
+  char line[96];
+  snprintf(line, sizeof(line), "trt: frame avg=%.1fms p95=%.1fms n=%d",
+           avg, sorted[p95i], n);
+  trt_trace(line);
+}
+#endif  // TRT_FRAME_TIME
+
 int TRT_GUEST_ABI fake_sc_Present(void* self, u32 sync, u32 flags) {
   (void)self;
   // DXGI_PRESENT_ALLOW_TEARING (0x200) fails on UWP FLIP_SEQUENTIAL swapchains
@@ -235,6 +334,14 @@ int TRT_GUEST_ABI fake_sc_Present(void* self, u32 sync, u32 flags) {
     if (!g_sc_is_d3d12 && !(safe_flags & 1u /*DXGI_PRESENT_TEST*/) &&
         g_hooks.prepare_d3d11_present)
       g_hooks.prepare_d3d11_present();
+#if TRT_FRAME_TIME
+    /* TIRAMISU EXTENSION: frame-time measurement (ready-patch 14).
+     * Pre-Present timestamp: the interval between samples is the frame
+     * period as the game experiences it, including any vsync block
+     * inside Present. TEST presents show no frame and are not sampled. */
+    if (!(safe_flags & 1u /*DXGI_PRESENT_TEST*/))
+      trt_host_frame_time_sample();
+#endif
     using fn_t = int (TRT_GUEST_ABI *)(void*, u32, u32);
     const int hr = ((fn_t)slot)(sc, sync, safe_flags);
     if (hr == 0 && !(safe_flags & 1u /*DXGI_PRESENT_TEST*/) &&
@@ -424,6 +531,11 @@ int TRT_GUEST_ABI fake_sc_Present1(void* self, u32 sync, u32 flags, const void* 
     if (!g_sc_is_d3d12 && !(flags & 1u /*DXGI_PRESENT_TEST*/) &&
         g_hooks.prepare_d3d11_present)
       g_hooks.prepare_d3d11_present();
+#if TRT_FRAME_TIME
+    /* TIRAMISU EXTENSION: frame-time measurement (ready-patch 14). */
+    if (!(flags & 1u /*DXGI_PRESENT_TEST*/))
+      trt_host_frame_time_sample();
+#endif
     using fn_t = int (TRT_GUEST_ABI *)(void*, u32, u32, const void*);
     return ((fn_t)slot)(sc, sync, flags & ~0x200u, params);
   }

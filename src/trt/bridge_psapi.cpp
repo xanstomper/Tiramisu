@@ -34,6 +34,13 @@ extern "C" {
 int TRT_GUEST_ABI psapi_K32EnumProcessModules(void* proc, void** lphandle,
                                               u32 cb, u32* needed) {
   char line[160];
+  {
+    // .152 diagnostic: log enum calls (was silent on success).
+    char eline[160];
+    snprintf(eline, sizeof(eline),
+             "psapi: K32EnumProcessModules(cb=%u)", cb);
+    log_line(eline);
+  }
   if (!lphandle) {
     snprintf(line, sizeof(line),
              "psapi: K32EnumProcessModules -> FALSE (null lphandle)");

@@ -38,6 +38,10 @@ std::string host_settings::to_ini() const {
   s += "# Missing keys keep their built-in defaults.\n";
   snprintf(buf, sizeof(buf), "default_input=%s\n", default_input.c_str());
   s += buf;
+  if (!auto_launch.empty()) {
+    snprintf(buf, sizeof(buf), "auto_launch=%s\n", auto_launch.c_str());
+    s += buf;
+  }
   snprintf(buf, sizeof(buf), "mouse_speed=%d\nwheel_speed=%d\n",
            mouse_speed, wheel_speed);
   s += buf;
@@ -86,6 +90,8 @@ int host_settings::apply_ini(const std::string& text) {
       if (val == "auto" || val == "controller" || val == "kbm" ||
           val == "pad2kbm")
         default_input = val;
+    } else if (key == "auto_launch") {
+      auto_launch = val;
     } else if (key == "mouse_speed") {
       mouse_speed = clampi(atoi(val.c_str()), 1, 100);
     } else if (key == "wheel_speed") {

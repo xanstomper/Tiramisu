@@ -66,6 +66,19 @@ u16 cp1252_to_u16(u8 c) {
   return k_cp1252_80_9f[c - 0x80];
 }
 
+u8 u16_to_cp1252(u16 c, u8 def_ch) {
+  if (c < 0x80 || (c >= 0xA0 && c <= 0xFF)) return (u8)c;
+  static const u16 k_cp1252_80_9f[32] = {
+    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+    0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
+  };
+  for (int i = 0; i < 32; ++i)
+    if (k_cp1252_80_9f[i] == c) return (u8)(0x80 + i);
+  return def_ch;
+}
+
 // Decode one UTF-8 sequence; always consumes >= 1 byte. Invalid, overlong,
 // truncated, surrogate, or out-of-range input yields U+FFFD and consumes
 // 1 byte (Windows' default without MB_ERR_INVALID_CHARS).
@@ -325,19 +338,52 @@ int TRT_STDCALL trt_WideCharToMultiByte(u32 codepage, u32 flags,
                                           const u16* src, int srclen, char* dst,
                                           int dstlen, const char* def,
                                           void* used) {
-  (void)codepage; (void)flags; (void)def; (void)used;
-  if (!src) return 0;
+  (void)flags;
+  if (used) *(int*)used = 0;
+  if (!src || srclen == 0) return 0;
+  const bool utf8 = (codepage == 65001u);  // CP_UTF8
   const int len = srclen < 0 ? (int)wcslen_(src) : srclen;
-  if (!dst || dstlen <= 0) return len;
+  const u8 def_ch = (def && def[0]) ? (u8)def[0] : (u8)'?';
+  int need = 0;
+  for (int i = 0; i < len; ++i) {
+    const u16 c = src[i];
+    if (!utf8) {
+      need += 1;
+    } else if (c < 0x80) {
+      need += 1;
+    } else if (c < 0x800) {
+      need += 2;
+    } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < len &&
+               src[i + 1] >= 0xDC00 && src[i + 1] <= 0xDFFF) {
+      need += 4;
+      ++i;
+    } else {
+      need += 3;
+    }
+  }
+  if (srclen < 0) need += 1;  // terminating NUL is part of the conversion
+  if (!dst || dstlen <= 0) return need;
   int n = 0;
   for (int i = 0; i < len && n < dstlen; ++i) {
     const u16 c = src[i];
-    if (c < 0x80) {
+    if (!utf8) {
+      dst[n++] = (char)u16_to_cp1252(c, def_ch);
+    } else if (c < 0x80) {
       dst[n++] = (char)c;
     } else if (c < 0x800) {
       if (n + 1 >= dstlen) break;
       dst[n++] = (char)(0xC0 | (c >> 6));
       dst[n++] = (char)(0x80 | (c & 0x3F));
+    } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < len &&
+               src[i + 1] >= 0xDC00 && src[i + 1] <= 0xDFFF) {
+      if (n + 3 >= dstlen) break;
+      const u32 cp = 0x10000u + (((u32)(c - 0xD800) << 10) |
+                                 (u32)(src[i + 1] - 0xDC00));
+      dst[n++] = (char)(0xF0 | (cp >> 18));
+      dst[n++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+      dst[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+      dst[n++] = (char)(0x80 | (cp & 0x3F));
+      ++i;
     } else {
       if (n + 2 >= dstlen) break;
       dst[n++] = (char)(0xE0 | (c >> 12));
@@ -345,6 +391,7 @@ int TRT_STDCALL trt_WideCharToMultiByte(u32 codepage, u32 flags,
       dst[n++] = (char)(0x80 | (c & 0x3F));
     }
   }
+  if (srclen < 0 && n < dstlen) dst[n++] = 0;
   return n;
 }
 

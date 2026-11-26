@@ -504,6 +504,13 @@ void TRT_GUEST_ABI crypt_CertFreeCertificateContext(void* ctx) {
   (void)ctx;
 }
 
+void* TRT_GUEST_ABI crypt_CertDuplicateCertificateContext(void* ctx) {
+  // Duplicate is AddRef + return the same pointer; the console never
+  // issues a real context, so returning the input is the honest no-op.
+  log_line("crypt32: CertDuplicateCertificateContext -> input (no store)");
+  return ctx;
+}
+
 void TRT_GUEST_ABI crypt_CertFreeCertificateChain(void* chain) {
   char line[128];
   snprintf(line, sizeof(line),
@@ -618,6 +625,7 @@ int trt_bridge_register_crypt32(void) {
       {"CertVerifyCertificateChainPolicy",
        (void*)&crypt_CertVerifyCertificateChainPolicy},
       {"CertFreeCertificateContext", (void*)&crypt_CertFreeCertificateContext},
+      {"CertDuplicateCertificateContext", (void*)&crypt_CertDuplicateCertificateContext},
       {"CertFindCertificateInStore",
        (void*)&crypt_CertFindCertificateInStore},
       {"CertFreeCertificateChain", (void*)&crypt_CertFreeCertificateChain},

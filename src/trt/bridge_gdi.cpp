@@ -891,6 +891,23 @@ int TRT_GUEST_ABI gdi_GetICMProfileW(void* hdc, u32* name_len, u16* name) {
   return 0;
 }
 
+// Sekiro audit gaps: ExtEscape (AMD AGS GPU queries), GetGlyphOutlineW
+// and GetKerningPairsW (font metrics). No driver escapes and no font
+// engine exist on the console; answer the APIs' own failure values.
+int TRT_GUEST_ABI trt_ExtEscape(void*, int, int, const char*, int, char*) {
+  log_line("gdi32: ExtEscape -> 0 (no driver escapes on console)");
+  return 0;
+}
+u32 TRT_GUEST_ABI trt_GetGlyphOutlineW(void*, u32, u32, void*, u32, void*,
+                                       const void*) {
+  log_line("gdi32: GetGlyphOutlineW -> GDI_ERROR (no font engine)");
+  return 0xFFFFFFFFu;  // GDI_ERROR
+}
+u32 TRT_GUEST_ABI trt_GetKerningPairsW(void*, u32, void*) {
+  log_line("gdi32: GetKerningPairsW -> 0 (no font engine)");
+  return 0;
+}
+
 int trt_bridge_register_gdi(void) {
   static const trt_named_fn k_gdi32_fns[] = {
       {"GetICMProfileW", (void*)&gdi_GetICMProfileW},
@@ -982,6 +999,9 @@ int trt_bridge_register_gdi(void) {
       {"SetDeviceGammaRamp", (void*)&trt_SetDeviceGammaRamp},
       {"GetDeviceGammaRamp", (void*)&trt_GetDeviceGammaRamp},
       {"GetDeviceCaps", (void*)&trt_GetDeviceCaps},
+      {"ExtEscape", (void*)&trt_ExtEscape},
+      {"GetGlyphOutlineW", (void*)&trt_GetGlyphOutlineW},
+      {"GetKerningPairsW", (void*)&trt_GetKerningPairsW},
   };
   trt_module_register("gdi32.dll", TRT_ROUTE_BUILTIN, k_gdi32_fns,
                       (int)(sizeof(k_gdi32_fns) / sizeof(k_gdi32_fns[0])));

@@ -179,14 +179,41 @@ std::string lan_ip() {
 }
 
 // ---------------- UWP memory backend (W^X: no RWX, ever) ----------------
+static std::atomic<uintptr_t> s_guest_va_hint{0x0000030000000000ULL};
+
 void* uwp_alloc(size_t bytes, u64 preferred_base) {
-  (void)preferred_base;  // AppContainer cannot honor fixed bases
-  return VirtualAllocFromApp(nullptr, bytes, MEM_COMMIT | MEM_RESERVE,
-                             PAGE_READWRITE);
+  void* p = nullptr;
+  if (preferred_base) {
+    p = VirtualAllocFromApp((void*)preferred_base, bytes,
+                            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  }
+  if (!p) {
+    const size_t aligned_sz = (bytes + 0x1FFFFFFULL) & ~0x1FFFFFFULL;
+    void* hint = (void*)s_guest_va_hint.fetch_add(aligned_sz);
+    p = VirtualAllocFromApp(hint, bytes, MEM_COMMIT | MEM_RESERVE,
+                            PAGE_READWRITE);
+  }
+  if (!p) {
+    p = VirtualAllocFromApp(nullptr, bytes, MEM_COMMIT | MEM_RESERVE,
+                            PAGE_READWRITE);
+  }
+  return p;
 }
 void* uwp_reserve(size_t bytes, u64 preferred_base) {
-  (void)preferred_base;
-  return VirtualAllocFromApp(nullptr, bytes, MEM_RESERVE, PAGE_NOACCESS);
+  void* p = nullptr;
+  if (preferred_base) {
+    p = VirtualAllocFromApp((void*)preferred_base, bytes, MEM_RESERVE,
+                            PAGE_NOACCESS);
+  }
+  if (!p) {
+    const size_t aligned_sz = (bytes + 0x1FFFFFFULL) & ~0x1FFFFFFULL;
+    void* hint = (void*)s_guest_va_hint.fetch_add(aligned_sz);
+    p = VirtualAllocFromApp(hint, bytes, MEM_RESERVE, PAGE_NOACCESS);
+  }
+  if (!p) {
+    p = VirtualAllocFromApp(nullptr, bytes, MEM_RESERVE, PAGE_NOACCESS);
+  }
+  return p;
 }
 int uwp_commit(void* base, size_t bytes, unsigned prot) {
   DWORD fl = PAGE_READONLY;
@@ -1240,6 +1267,14 @@ void run_guest_trapped(trt_image* img, char* detail, size_t cap) {
   g_guest_tid = 0;
 }
 
+#ifdef _WIN32
+static const wchar_t* const s_disable_dlls[] = {
+    L"newbe_xs.DLL",
+    L"newbe.dll",
+    L"newbe_xs_d.dll"
+};
+#endif
+
 guest_run_result run_game(const std::string& name, const std::string& exe,
                           const std::string& game_dir,
                           const std::string& image = std::string()) {
@@ -1507,6 +1542,17 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     trt_call_guest_img((void*)(img->base + img->tls_callback_rvas[i]), img,
                        (u64)(uintptr_t)img->base, 1, 0, 0);
   }
+#ifdef _WIN32
+  for (const auto* d : s_disable_dlls) {
+    HMODULE hm = ::GetModuleHandleW(d);
+    if (hm) {
+      BOOL dis = ::DisableThreadLibraryCalls(hm);
+      char dbuf[128];
+      snprintf(dbuf, sizeof(dbuf), "host: pre-launch DisableThreadLibraryCalls(%ls) -> %d", d, (int)dis);
+      longan::log_line(dbuf);
+    }
+  }
+#endif
   run_guest_trapped(img, r.detail, sizeof(r.detail));
   return r;
 }
@@ -1803,6 +1849,93 @@ static void TRT_GUEST_ABI host_builtin_log_u32(unsigned tag, unsigned value) {
 static unsigned TRT_GUEST_ABI host_builtin_query_build(void) {
   return 0x00020000u;  // runtime build 0.2.0
 }
+
+#ifdef _WIN32
+extern "C" int TRT_STDCALL trt_InitOnceBeginInitialize(u64* init_once, u32 flags,
+                                                       int* pending, void** context);
+extern "C" int TRT_STDCALL trt_InitOnceComplete(u64* init_once, u32 flags, void* context);
+extern "C" int TRT_STDCALL trt_InitOnceExecuteOnce(u64* init_once, void* cb, void* param,
+                                                   void** context);
+extern "C" void TRT_STDCALL trt_InitOnceInitialize(u64* init_once);
+
+static char s_early_sync_buf[512] = {0};
+
+static bool patch_host_iat(const char* target_dll, const char* func_name, void* hook_fn, void** orig_out = nullptr, bool* vp_res = nullptr) {
+  uintptr_t base = (uintptr_t)::GetModuleHandleW(nullptr);
+  if (!base) return false;
+  auto* dos = (const IMAGE_DOS_HEADER*)base;
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+  auto* nt = (const IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+  if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+
+  const auto& import_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+  if (!import_dir.VirtualAddress || !import_dir.Size) return false;
+
+  auto* desc = (const IMAGE_IMPORT_DESCRIPTOR*)(base + import_dir.VirtualAddress);
+  bool patched = false;
+  for (; desc->Name; ++desc) {
+    const char* dll = (const char*)(base + desc->Name);
+    if (target_dll && _stricmp(dll, target_dll) != 0) continue;
+
+    auto* thunk_orig = (const IMAGE_THUNK_DATA*)(base + (desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk));
+    auto* thunk_iat = (IMAGE_THUNK_DATA*)(base + desc->FirstThunk);
+
+    for (; thunk_orig->u1.AddressOfData; ++thunk_orig, ++thunk_iat) {
+      if (IMAGE_SNAP_BY_ORDINAL(thunk_orig->u1.Ordinal)) continue;
+      auto* import_by_name = (const IMAGE_IMPORT_BY_NAME*)(base + thunk_orig->u1.AddressOfData);
+      if (strcmp((const char*)import_by_name->Name, func_name) == 0) {
+        DWORD old_prot = 0;
+        bool vp_ok = (::VirtualProtectFromApp(&thunk_iat->u1.Function, sizeof(void*), PAGE_READWRITE, &old_prot) != 0);
+        if (vp_res) *vp_res = vp_ok;
+        if (orig_out) *orig_out = (void*)thunk_iat->u1.Function;
+        thunk_iat->u1.Function = (uintptr_t)hook_fn;
+        if (vp_ok) {
+          DWORD dummy = 0;
+          ::VirtualProtectFromApp(&thunk_iat->u1.Function, sizeof(void*), old_prot, &dummy);
+        }
+        patched = true;
+      }
+    }
+  }
+  return patched;
+}
+
+static void host_apply_early_sync_hardening() {
+  static std::atomic<bool> s_done{false};
+  if (s_done.exchange(true)) {
+    if (s_early_sync_buf[0]) {
+      longan::log_line(s_early_sync_buf);
+      s_early_sync_buf[0] = '\0';
+    }
+    return;
+  }
+
+  bool vp1 = false, vp2 = false;
+  bool b1 = patch_host_iat(nullptr, "InitOnceBeginInitialize", (void*)&trt_InitOnceBeginInitialize, nullptr, &vp1);
+  bool b2 = patch_host_iat(nullptr, "InitOnceComplete", (void*)&trt_InitOnceComplete, nullptr, &vp2);
+  bool b3 = patch_host_iat(nullptr, "InitOnceExecuteOnce", (void*)&trt_InitOnceExecuteOnce);
+  bool b4 = patch_host_iat(nullptr, "InitOnceInitialize", (void*)&trt_InitOnceInitialize);
+  snprintf(s_early_sync_buf, sizeof(s_early_sync_buf),
+           "host: early synch hardening (InitOnceBegin=%d[vp=%d] Complete=%d[vp=%d] Exec=%d Init=%d)",
+           (int)b1, (int)vp1, (int)b2, (int)vp2, (int)b3, (int)b4);
+  longan::log_line(s_early_sync_buf);
+
+  // Pre-initialize MSVC STL atomics / condition variable WaitOnAddress subsystem
+  std::atomic<uint32_t> dummy_sync{0};
+  dummy_sync.notify_all();
+  longan::log_line("host: MSVC STL atomic/condition_variable sync primed and completed");
+
+  for (const auto* d : s_disable_dlls) {
+    HMODULE hm = ::GetModuleHandleW(d);
+    if (hm) {
+      BOOL dis = ::DisableThreadLibraryCalls(hm);
+      char dbuf[128];
+      snprintf(dbuf, sizeof(dbuf), "host: DisableThreadLibraryCalls(%ls) -> %d", d, (int)dis);
+      longan::log_line(dbuf);
+    }
+  }
+}
+#endif
 
 struct tiramisu_host
     : implements<tiramisu_host, IFrameworkViewSource, IFrameworkView> {
@@ -2127,6 +2260,176 @@ struct tiramisu_host
     ::timeBeginPeriod(1);
     longan::log_line("tiramisu boot: host timer resolution 1ms (timeBeginPeriod)");
 
+#ifdef _WIN32
+    host_apply_early_sync_hardening();
+#endif
+
+#ifdef _WIN32
+    static auto s_host_veh = [](PEXCEPTION_POINTERS ep) -> LONG {
+      if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+      const DWORD code = ep->ExceptionRecord->ExceptionCode;
+
+      const int res = trt_dispatch_win32_exception((void*)ep);
+      if (res == -1) {
+        return EXCEPTION_CONTINUE_EXECUTION;
+      }
+
+      if (code == 0x406d1388u) {
+        // MS_VC_EXCEPTION: debugger thread naming, not an actual fault
+        return EXCEPTION_CONTINUE_SEARCH;
+      }
+
+      char buf[384];
+      const ULONG_PTR p0 = (ep->ExceptionRecord->NumberParameters > 0) ? ep->ExceptionRecord->ExceptionInformation[0] : 0;
+      const ULONG_PTR p1 = (ep->ExceptionRecord->NumberParameters > 1) ? ep->ExceptionRecord->ExceptionInformation[1] : 0;
+      const u64 rip = ep->ContextRecord ? ep->ContextRecord->Rip : 0ULL;
+      const u64 rsp = ep->ContextRecord ? ep->ContextRecord->Rsp : 0ULL;
+      const u64 rax = ep->ContextRecord ? ep->ContextRecord->Rax : 0ULL;
+      const u64 rcx = ep->ContextRecord ? ep->ContextRecord->Rcx : 0ULL;
+      const u64 rdx = ep->ContextRecord ? ep->ContextRecord->Rdx : 0ULL;
+      const u64 rbx = ep->ContextRecord ? ep->ContextRecord->Rbx : 0ULL;
+      const u64 rsi = ep->ContextRecord ? ep->ContextRecord->Rsi : 0ULL;
+      const u64 rdi = ep->ContextRecord ? ep->ContextRecord->Rdi : 0ULL;
+      const u64 r8 = ep->ContextRecord ? ep->ContextRecord->R8 : 0ULL;
+      const u64 r9 = ep->ContextRecord ? ep->ContextRecord->R9 : 0ULL;
+
+      const DWORD cur_tid = ::GetCurrentThreadId();
+      const u64 r10 = ep->ContextRecord ? ep->ContextRecord->R10 : 0ULL;
+      const u64 r11 = ep->ContextRecord ? ep->ContextRecord->R11 : 0ULL;
+      const u64 r12 = ep->ContextRecord ? ep->ContextRecord->R12 : 0ULL;
+      const u64 r13 = ep->ContextRecord ? ep->ContextRecord->R13 : 0ULL;
+      const u64 r14 = ep->ContextRecord ? ep->ContextRecord->R14 : 0ULL;
+      const u64 r15 = ep->ContextRecord ? ep->ContextRecord->R15 : 0ULL;
+      const u64 rbp = ep->ContextRecord ? ep->ContextRecord->Rbp : 0ULL;
+
+      MEMORY_BASIC_INFORMATION mbi{};
+      wchar_t modname[MAX_PATH] = L"(unknown)";
+      if (VirtualQuery(ep->ExceptionRecord->ExceptionAddress, &mbi, sizeof(mbi))) {
+        GetModuleFileNameW((HMODULE)mbi.AllocationBase, modname, MAX_PATH);
+      }
+      char mod_u8[MAX_PATH * 2] = "(unknown)";
+      WideCharToMultiByte(CP_UTF8, 0, modname, -1, mod_u8, sizeof(mod_u8), nullptr, nullptr);
+
+      char hex_bytes[64] = "";
+      const u8* pc_bytes = (const u8*)ep->ExceptionRecord->ExceptionAddress;
+      MEMORY_BASIC_INFORMATION rmbi{};
+      if (VirtualQuery(pc_bytes, &rmbi, sizeof(rmbi)) && rmbi.State == MEM_COMMIT) {
+        snprintf(hex_bytes, sizeof(hex_bytes), "%02x %02x %02x %02x %02x %02x %02x %02x",
+                 pc_bytes[0], pc_bytes[1], pc_bytes[2], pc_bytes[3],
+                 pc_bytes[4], pc_bytes[5], pc_bytes[6], pc_bytes[7]);
+      }
+
+      snprintf(buf, sizeof(buf),
+               "FATAL VEH: unhandled exception 0x%08lx in tid=%lu at %p [%s] (%s) (p0=%llx p1=%llx)",
+               (unsigned long)code, (unsigned long)cur_tid, ep->ExceptionRecord->ExceptionAddress,
+               mod_u8, hex_bytes, (unsigned long long)p0, (unsigned long long)p1);
+      longan::log_line(buf);
+
+      snprintf(buf, sizeof(buf),
+               "  GPRs: rip=%llx rsp=%llx rbp=%llx rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx",
+               (unsigned long long)rip, (unsigned long long)rsp, (unsigned long long)rbp,
+               (unsigned long long)rax, (unsigned long long)rbx,
+               (unsigned long long)rcx, (unsigned long long)rdx,
+               (unsigned long long)rsi, (unsigned long long)rdi);
+      longan::log_line(buf);
+
+      snprintf(buf, sizeof(buf),
+               "  GPRs2: r8=%llx r9=%llx r10=%llx r11=%llx r12=%llx r13=%llx r14=%llx r15=%llx",
+               (unsigned long long)r8, (unsigned long long)r9,
+               (unsigned long long)r10, (unsigned long long)r11,
+               (unsigned long long)r12, (unsigned long long)r13,
+               (unsigned long long)r14, (unsigned long long)r15);
+      longan::log_line(buf);
+
+      if (pc_bytes) {
+        char pre_hex[384] = "";
+        const u8* pre_pc = pc_bytes - 96;
+        MEMORY_BASIC_INFORMATION mbi_pre{};
+        if (VirtualQuery(pre_pc, &mbi_pre, sizeof(mbi_pre)) && mbi_pre.State == MEM_COMMIT) {
+          for (int b = 0; b < 96; ++b) {
+            snprintf(pre_hex + b * 3, sizeof(pre_hex) - b * 3, "%02x ", pre_pc[b]);
+          }
+          snprintf(buf, sizeof(buf), "  code [pc-96..pc]: %s", pre_hex);
+          longan::log_line(buf);
+        }
+        char post_hex[128] = "";
+        if (VirtualQuery(pc_bytes, &mbi_pre, sizeof(mbi_pre)) && mbi_pre.State == MEM_COMMIT) {
+          for (int b = 0; b < 32; ++b) {
+            snprintf(post_hex + b * 3, sizeof(post_hex) - b * 3, "%02x ", pc_bytes[b]);
+          }
+          snprintf(buf, sizeof(buf), "  code [pc..pc+32]: %s", post_hex);
+          longan::log_line(buf);
+        }
+      }
+
+      if (rsp) {
+        const u64* sp = (const u64*)(uintptr_t)rsp;
+        char s_raw[512] = "";
+        for (int k = 0; k < 16; ++k) {
+          MEMORY_BASIC_INFORMATION smbi{};
+          if (!VirtualQuery(&sp[k], &smbi, sizeof(smbi)) || smbi.State != MEM_COMMIT) break;
+          snprintf(s_raw + strlen(s_raw), sizeof(s_raw) - strlen(s_raw), "sp[%d]=%016llx ", k, (unsigned long long)sp[k]);
+        }
+        snprintf(buf, sizeof(buf), "  raw stack: %s", s_raw);
+        longan::log_line(buf);
+
+        // Disassemble the immediate caller in driver / external DLL
+        for (int k = 0; k < 8; ++k) {
+          MEMORY_BASIC_INFORMATION cmbi{};
+          if (VirtualQuery((LPCVOID)(uintptr_t)sp[k], &cmbi, sizeof(cmbi)) &&
+              cmbi.State == MEM_COMMIT && (cmbi.Protect & 0xF0)) {
+            const u8* ret_bytes = (const u8*)(uintptr_t)sp[k];
+            const u8* ret_pre = ret_bytes - 48;
+            MEMORY_BASIC_INFORMATION rmbi{};
+            if (VirtualQuery(ret_pre, &rmbi, sizeof(rmbi)) && rmbi.State == MEM_COMMIT) {
+              char caller_hex[192] = "";
+              for (int b = 0; b < 48; ++b) {
+                snprintf(caller_hex + b * 3, sizeof(caller_hex) - b * 3, "%02x ", ret_pre[b]);
+              }
+              snprintf(buf, sizeof(buf), "  caller sp[%d]=%p [ret-48..ret]: %s", k, (void*)sp[k], caller_hex);
+              longan::log_line(buf);
+            }
+          }
+        }
+      }
+
+      if (rsp) {
+        const u64* sp = (const u64*)(uintptr_t)rsp;
+        for (int i = 0; i < 48; ++i) {
+          MEMORY_BASIC_INFORMATION sp_mbi{};
+          if (!VirtualQuery(&sp[i], &sp_mbi, sizeof(sp_mbi)) || sp_mbi.State != MEM_COMMIT) break;
+          const u64 val = sp[i];
+          MEMORY_BASIC_INFORMATION val_mbi{};
+          if (VirtualQuery((LPCVOID)(uintptr_t)val, &val_mbi, sizeof(val_mbi))) {
+            if (val_mbi.State == MEM_COMMIT && (val_mbi.Protect & 0xF0 /* PAGE_EXECUTE_* */)) {
+              wchar_t smod[MAX_PATH] = L"";
+              GetModuleFileNameW((HMODULE)val_mbi.AllocationBase, smod, MAX_PATH);
+              char smod_u8[MAX_PATH * 2] = "";
+              WideCharToMultiByte(CP_UTF8, 0, smod, -1, smod_u8, sizeof(smod_u8), nullptr, nullptr);
+              char sline[384];
+              snprintf(sline, sizeof(sline), "  frame[%d] rsp+%d: %016llx (%s + 0x%llx)",
+                       i, i * 8, (unsigned long long)val, smod_u8,
+                       (unsigned long long)(val - (uintptr_t)val_mbi.AllocationBase));
+              longan::log_line(sline);
+            }
+          }
+        }
+      }
+
+      return EXCEPTION_CONTINUE_SEARCH;
+    };
+    using pfn_add_veh = PVOID(WINAPI*)(ULONG, PVECTORED_EXCEPTION_HANDLER);
+    HMODULE h_kb = ::GetModuleHandleW(L"kernelbase.dll");
+    if (!h_kb) h_kb = ::GetModuleHandleW(L"kernel32.dll");
+    if (h_kb) {
+      auto p_add_veh = (pfn_add_veh)::GetProcAddress(h_kb, "AddVectoredExceptionHandler");
+      if (p_add_veh) {
+        p_add_veh(1u, +s_host_veh);
+        longan::log_line("tiramisu boot: registered global VEH exception handler");
+      }
+    }
+#endif
+
     // ---- persisted settings (dashboard-editable; consumed by bridges) ----
     const int applied = longan::settings_load(g_local_state);
     snprintf(line, sizeof(line), "settings: %d keys applied from settings.ini",
@@ -2255,6 +2558,16 @@ struct tiramisu_host
                  L"Self-test: " + u82ws(trt_errstr(gr.map_rc))},
                 nullptr, true);
     g_setup_done = true;  // A press on the finished screen opens the shelf
+    const auto st = longan::settings_get();
+    if (!st.auto_launch.empty()) {
+      g_pending_launch = st.auto_launch;
+      g_setup_active = false;
+      longan::ui_dismiss_first_run();
+      char alb[128];
+      snprintf(alb, sizeof(alb), "auto_launch: queued game %s from settings.ini",
+               st.auto_launch.c_str());
+      longan::log_line(alb);
+    }
   }
 
   void enable_keyboard_interceptor() {
@@ -3084,6 +3397,9 @@ struct tiramisu_host
 } // namespace
 
 int __stdcall wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+#ifdef _WIN32
+  host_apply_early_sync_hardening();
+#endif
   init_apartment(apartment_type::multi_threaded);
   CoreApplication::Run(make<tiramisu_host>());
   return 0;

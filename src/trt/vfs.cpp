@@ -258,7 +258,32 @@ int normalize_guest_locked(const char* utf8_in, char drv_out[3],
 
   const char* p = in;
   const char* seed = nullptr;
-  if (lower_of(p[0]) >= 'a' && lower_of(p[0]) <= 'z' && p[1] == ':') {
+  if (lower_of(p[0]) == 'g' && lower_of(p[1]) == 'a' && lower_of(p[2]) == 'm' &&
+      lower_of(p[3]) == 'e' && p[4] == ':') {
+    drv_out[0] = 'z';
+    drv_out[1] = ':';
+    drv_out[2] = 0;
+    p += 5;
+    if (*p == '\\' || *p == '/') {
+      seed = nullptr;
+      while (*p == '\\' || *p == '/') ++p;
+    } else {
+      seed = cur_rel;
+    }
+  } else if (lower_of(p[0]) == 'm' && lower_of(p[1]) == 's' && p[2] == '-' &&
+             lower_of(p[3]) == 'a' && lower_of(p[4]) == 'p' && lower_of(p[5]) == 'p' &&
+             lower_of(p[6]) == 'x' && p[7] == ':') {
+    drv_out[0] = 'z';
+    drv_out[1] = ':';
+    drv_out[2] = 0;
+    p += 8;
+    if (*p == '\\' || *p == '/') {
+      seed = nullptr;
+      while (*p == '\\' || *p == '/') ++p;
+    } else {
+      seed = cur_rel;
+    }
+  } else if (lower_of(p[0]) >= 'a' && lower_of(p[0]) <= 'z' && p[1] == ':') {
     drv_out[0] = lower_of(p[0]);
     drv_out[1] = ':';
     drv_out[2] = 0;

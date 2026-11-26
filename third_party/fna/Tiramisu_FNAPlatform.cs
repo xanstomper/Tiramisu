@@ -64,6 +64,7 @@ namespace Microsoft.Xna.Framework
 		 * dropped (the managed game is the ring's only consumer).
 		 */
 		private const int WM_ACTIVATE = 0x0006;
+		private const int WM_CLOSE = 0x0010;
 		private const int WM_KEYDOWN = 0x0100;
 		private const int WM_KEYUP = 0x0101;
 		private const int WM_CHAR = 0x0102;
@@ -451,6 +452,12 @@ namespace Microsoft.Xna.Framework
 					break;
 				}
 
+				if (!s_diagPollAlive)
+				{
+					s_diagPollAlive = true;
+					DiagFile("diag-poll-alive.txt");
+				}
+
 				/* Window activation (posted by the host's CoreWindow
 				 * Activated handler while a game runs).
 				 */
@@ -461,9 +468,21 @@ namespace Microsoft.Xna.Framework
 						game.IsActive = (wparam & 0xFFFF) != 0;
 					}
 				}
+				else if (message == WM_CLOSE)
+				{
+					/* The host posts WM_CLOSE on /api/stop. Without this the
+					 * guest never exits and the host force-kills it (which
+					 * takes the whole app down with it). */
+					if (game != null)
+					{
+						game.Exit();
+					}
+				}
 				else if (message == WM_KEYDOWN)
 				{
 					Keys key = ToXNAKey((int) wparam);
+					DiagLog("TIRAMISU INPUT: WM_KEYDOWN vk=" + ((int) wparam) + " key=" + key + " wasUp=" + Keyboard.keys.IsKeyUp(key));
+					DiagFile("diag-kd-vk" + ((int) wparam) + "-key" + key + ".txt");
 					if (key == Keys.None)
 					{
 						continue;
@@ -503,7 +522,9 @@ namespace Microsoft.Xna.Framework
 				}
 				else if (message == WM_KEYUP)
 				{
+					DiagFile("diag-ku-vk" + ((int) wparam) + ".txt");
 					Keys key = ToXNAKey((int) wparam);
+					DiagLog("TIRAMISU INPUT: WM_KEYUP vk=" + ((int) wparam) + " key=" + key);
 					if (key == Keys.None)
 					{
 						continue;
@@ -586,6 +607,64 @@ namespace Microsoft.Xna.Framework
 		 * values (Back=8, Escape=27, Space=32, A=65, F1=112,
 		 * LeftShift=160, ...), so the translation is a validity check.
 		 */
+		/* Diagnostic: Console.WriteLine goes to mono-stderr.log (not
+		 * readable via /api/logs), so write input diagnostics straight
+		 * to tiramisu.log via the storage root. Best-effort, never throws.
+		 */
+		private static bool s_diagPollAlive = false;
+
+		private static readonly bool s_diagStartup = DiagStartupFile();
+
+		private static bool DiagStartupFile()
+		{
+			DiagFile("diag-startup.txt");
+			return true;
+		}
+
+		/* Diagnostic: create an empty marker file in the game dir.
+		 * The CWD is the game dir for a Mono guest; fall back to an
+		 * absolute path under the storage root. The file NAME carries
+		 * the diagnosis because no endpoint can read file contents. */
+		private static void DiagFile(string name)
+		{
+			try
+			{
+				System.IO.File.Create(name).Dispose();
+			}
+			catch
+			{
+			}
+			try
+			{
+				IntPtr root = NativeGetStorageRoot();
+				if (root != IntPtr.Zero)
+				{
+					string path = System.Runtime.InteropServices.Marshal.PtrToStringAnsi(root) + "\\games\\celeste\\" + name;
+					System.IO.File.Create(path).Dispose();
+				}
+			}
+			catch
+			{
+			}
+		}
+
+		private static void DiagLog(string msg)
+		{
+			try
+			{
+				IntPtr root = NativeGetStorageRoot();
+				if (root == IntPtr.Zero)
+				{
+					return;
+				}
+				string path = System.Runtime.InteropServices.Marshal.PtrToStringAnsi(root) + "\\tiramisu.log";
+				System.IO.File.AppendAllText(path, msg + "\n");
+			}
+			catch
+			{
+			}
+		}
+
 		private static Keys ToXNAKey(int vk)
 		{
 			if (vk <= 0 || vk >= ValidVK.Length || !ValidVK[vk])

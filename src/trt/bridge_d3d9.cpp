@@ -2418,11 +2418,17 @@ const void* g_sb9_vtbl[6] = {
     (const void*)&sb_Apply,               // 5
 };
 
+// D3DPERF_GetStatus: no profiling tools are attached on the console, so
+// there is no perf status to report (Sekiro audit: sekiro.exe imports it
+// for PIX markers).
+u32 TRT_GUEST_ABI trt_D3DPERF_GetStatus(void) { return 0; }
+
 int trt_bridge_register_d3d9(void) {
   ensure_ex_vtbls();  // Ex objects are servable from the first call
   static const trt_named_fn k_fns[] = {
       {"Direct3DCreate9", (void*)&trt_Direct3DCreate9},
       {"Direct3DCreate9Ex", (void*)&trt_Direct3DCreate9Ex},
+      {"D3DPERF_GetStatus", (void*)&trt_D3DPERF_GetStatus},
   };
   trt_module_register("d3d9.dll", TRT_ROUTE_BUILTIN, k_fns,
                       (int)(sizeof(k_fns) / sizeof(k_fns[0])));

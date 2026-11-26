@@ -1431,6 +1431,126 @@ u32 TRT_GUEST_ABI reg_EnumerateTraceGuidsEx(u32 info_class, const void* in_buf,
   return 0;  // ERROR_SUCCESS (zero active ETW trace sessions)
 }
 
+// ---- Sekiro audit gaps (2026-11-21) ----
+// sekiro.exe and fmodex64.dll import 15 more advapi32 functions than the
+// registry/token/CryptoAPI core above. RegOpenKeyA and RegEnumKeyA are real
+// wrappers onto the ExW implementations; the rest are fail-visible: no
+// crypto-provider keys, no event log, and no security model exist on the
+// console, so they log the call and return the API's own failure value
+// instead of killing the load.
+int TRT_GUEST_ABI trt_RegOpenKeyA(u64 hkey, const char* subkey, void** out) {
+  return trt_RegOpenKeyExA(hkey, subkey, 0, 0, out);
+}
+
+int TRT_GUEST_ABI trt_RegEnumKeyA(u64 hkey, u32 index, char* name,
+                                  u32 cchName) {
+  u16 w[256];
+  u32 len = 0;
+  const int rc =
+      trt_RegEnumKeyExW(hkey, index, w, 256, nullptr, &len, nullptr);
+  if (rc != REG_SUCCESS) return rc;
+  if (!name) return REG_SUCCESS;
+  if (cchName < len) return REG_ERROR_MORE_DATA;
+  for (u32 i = 0; i < len; ++i) name[i] = (char)(w[i] & 0x7f);
+  return REG_SUCCESS;
+}
+
+int TRT_GUEST_ABI trt_CryptDecrypt(u64 hKey, u64 hHash, int final, u32 flags,
+                                   u8* data, u32* data_len) {
+  (void)hKey; (void)hHash; (void)final; (void)flags; (void)data;
+  (void)data_len;
+  trt_core_log("advapi32: CryptDecrypt -> FALSE (no crypto keys on console)");
+  return 0;
+}
+
+int TRT_GUEST_ABI trt_CryptDestroyKey(u64 hKey) {
+  (void)hKey;
+  trt_core_log("advapi32: CryptDestroyKey -> FALSE (no crypto keys)");
+  return 0;
+}
+
+int TRT_GUEST_ABI trt_CryptEnumProvidersW(u32 index, u32* reserved, u32 flags,
+                                          u32* prov_type, u16* prov_name,
+                                          u32* prov_name_len) {
+  (void)index; (void)reserved; (void)flags; (void)prov_type;
+  (void)prov_name; (void)prov_name_len;
+  trt_core_log("advapi32: CryptEnumProvidersW -> FALSE (no providers)");
+  return 0;
+}
+
+int TRT_GUEST_ABI trt_CryptExportKey(u64 hKey, u64 hExpKey, u32 blob_type,
+                                     u32 flags, u8* data, u32* data_len) {
+  (void)hKey; (void)hExpKey; (void)blob_type; (void)flags; (void)data;
+  (void)data_len;
+  trt_core_log("advapi32: CryptExportKey -> FALSE (no crypto keys)");
+  return 0;
+}
+
+int TRT_GUEST_ABI trt_CryptGetProvParam(u64 hProv, u32 param, u8* data,
+                                        u32* data_len, u32 flags) {
+  (void)hProv; (void)param; (void)data; (void)data_len; (void)flags;
+  trt_core_log("advapi32: CryptGetProvParam -> FALSE (no provider params)");
+  return 0;
+}
+
+int TRT_GUEST_ABI trt_CryptGetUserKey(u64 hProv, u32 key_spec, u64* user_key) {
+  (void)hProv; (void)key_spec; (void)user_key;
+  trt_core_log("advapi32: CryptGetUserKey -> FALSE (no user keys)");
+  return 0;
+}
+
+int TRT_GUEST_ABI trt_CryptSetHashParam(u64 hHash, u32 param, const u8* data,
+                                        u32 flags) {
+  (void)hHash; (void)param; (void)data; (void)flags;
+  trt_core_log("advapi32: CryptSetHashParam -> FALSE (hash params unsupported)");
+  return 0;
+}
+
+int TRT_GUEST_ABI trt_CryptSignHashW(u64 hHash, u32 key_spec,
+                                     const u16* description, u32 flags,
+                                     u8* signature, u32* sig_len) {
+  (void)hHash; (void)key_spec; (void)description; (void)flags;
+  (void)signature; (void)sig_len;
+  trt_core_log("advapi32: CryptSignHashW -> FALSE (no signing keys)");
+  return 0;
+}
+
+void* TRT_GUEST_ABI trt_RegisterEventSourceW(const u16* server,
+                                             const u16* source) {
+  (void)server; (void)source;
+  trt_core_log("advapi32: RegisterEventSourceW -> NULL (no event log)");
+  return nullptr;
+}
+
+int TRT_GUEST_ABI trt_DeregisterEventSource(void* hEventLog) {
+  (void)hEventLog;
+  return 1;  // nothing was ever registered
+}
+
+int TRT_GUEST_ABI trt_ReportEventW(void* hEventLog, u16 type, u16 category,
+                                   u32 event_id, void* user_sid,
+                                   u16 num_strings, u32 data_size,
+                                   const u16** strings, void* data) {
+  (void)hEventLog; (void)type; (void)category; (void)event_id;
+  (void)user_sid; (void)num_strings; (void)data_size; (void)strings;
+  (void)data;
+  trt_core_log("advapi32: ReportEventW -> FALSE (no event log)");
+  return 0;
+}
+
+int TRT_GUEST_ABI trt_InitializeSecurityDescriptor(void* sd, u32 revision) {
+  (void)sd; (void)revision;
+  trt_core_log("advapi32: InitializeSecurityDescriptor -> FALSE (no security model)");
+  return 0;
+}
+
+int TRT_GUEST_ABI trt_SetSecurityDescriptorDacl(void* sd, int dacl_present,
+                                                void* acl, int dacl_defaulted) {
+  (void)sd; (void)dacl_present; (void)acl; (void)dacl_defaulted;
+  trt_core_log("advapi32: SetSecurityDescriptorDacl -> FALSE (no security model)");
+  return 0;
+}
+
 int trt_bridge_register_registry(void) {
   static const trt_named_fn k_advapi32_fns[] = {
       {"RegOpenKeyExW", (void*)&trt_RegOpenKeyExW},
@@ -1438,6 +1558,7 @@ int trt_bridge_register_registry(void) {
       {"RegCreateKeyExW", (void*)&trt_RegCreateKeyExW},
       {"RegCreateKeyW", (void*)&trt_RegCreateKeyW},
       {"RegOpenKeyW", (void*)&trt_RegOpenKeyW},
+      {"RegOpenKeyA", (void*)&trt_RegOpenKeyA},
       {"RegQueryValueExW", (void*)&trt_RegQueryValueExW},
       {"RegQueryValueExA", (void*)&trt_RegQueryValueExA},
       {"RegSetValueExW", (void*)&trt_RegSetValueExW},
@@ -1447,6 +1568,7 @@ int trt_bridge_register_registry(void) {
       {"RegQueryInfoKeyW", (void*)&trt_RegQueryInfoKeyW},
       {"RegCloseKey", (void*)&trt_RegCloseKey},
       {"RegEnumKeyExW", (void*)&trt_RegEnumKeyExW},
+      {"RegEnumKeyA", (void*)&trt_RegEnumKeyA},
       {"RegEnumValueW", (void*)&trt_RegEnumValueW},
       {"RegGetValueW", (void*)&trt_RegGetValueW},
       {"GetUserNameW", (void*)&trt_GetUserNameW},
@@ -1462,6 +1584,13 @@ int trt_bridge_register_registry(void) {
       {"ConvertStringSecurityDescriptorToSecurityDescriptorW",
        (void*)&trt_ConvertStringSecurityDescriptorToSecurityDescriptorW},
       {"ConvertSidToStringSidW", (void*)&trt_ConvertSidToStringSidW},
+      // Event log + security descriptor (Sekiro audit: no event log and
+      // no security model on the console -- fail-visible stubs above)
+      {"RegisterEventSourceW", (void*)&trt_RegisterEventSourceW},
+      {"DeregisterEventSource", (void*)&trt_DeregisterEventSource},
+      {"ReportEventW", (void*)&trt_ReportEventW},
+      {"InitializeSecurityDescriptor", (void*)&trt_InitializeSecurityDescriptor},
+      {"SetSecurityDescriptorDacl", (void*)&trt_SetSecurityDescriptorDacl},
       // CryptoAPI + RtlGenRandom
       {"CryptAcquireContextW", (void*)&trt_CryptAcquireContextW},
       {"CryptAcquireContextA", (void*)&trt_CryptAcquireContextA},
@@ -1471,6 +1600,14 @@ int trt_bridge_register_registry(void) {
       {"CryptHashData", (void*)&trt_CryptHashData},
       {"CryptGetHashParam", (void*)&trt_CryptGetHashParam},
       {"CryptDestroyHash", (void*)&trt_CryptDestroyHash},
+      {"CryptDecrypt", (void*)&trt_CryptDecrypt},
+      {"CryptDestroyKey", (void*)&trt_CryptDestroyKey},
+      {"CryptEnumProvidersW", (void*)&trt_CryptEnumProvidersW},
+      {"CryptExportKey", (void*)&trt_CryptExportKey},
+      {"CryptGetProvParam", (void*)&trt_CryptGetProvParam},
+      {"CryptGetUserKey", (void*)&trt_CryptGetUserKey},
+      {"CryptSetHashParam", (void*)&trt_CryptSetHashParam},
+      {"CryptSignHashW", (void*)&trt_CryptSignHashW},
       {"SystemFunction036", (void*)&trt_SystemFunction036},
       // ETW & Dynamic TimeZone
       {"EventRegister", (void*)&reg_EventRegister},
