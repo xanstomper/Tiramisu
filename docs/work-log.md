@@ -567,3 +567,22 @@ Entries are appended as work lands; every claim points at a gate or a file.
   executable hash are in `.git/verification/xbox-0.2.4.42-resume`.
   The integration remains local and Xbox One-family hardware validation
   is pending.
+
+### 2026-11-26 — Recovered dashboard and module-path coverage
+
+- Compared the main Mineplex checkout with `capture/tiramisu-live-resume-42`.
+  All 184 changed source and documentation paths in the live capture match
+  the current live files. There are no additional untracked paths outside
+  that capture. The OpenCode scratch header also matches its saved capture.
+- `ee4505c` restores the module-path mount test from the module-path snapshot.
+  It verifies nested mount selection, directory boundaries, the mount root,
+  and small output buffers. It passed against the integrated runtime and
+  runs as part of the offline gate.
+- Recovered the exported standalone dashboard in `apps/dashboard`, with
+  the source, project assets, controller navigation, and lockfile. The
+  archive uses a sample library and browser state, so the recovered
+  dashboard is labeled as a design preview. The Xbox host serves its
+  existing live controls and first-run setup. No separate mobile app
+  source was found in the audited Mineplex copies.
+- The dashboard type check, all three logic tests, production build, and
+  static asset check passed. This was a source-only integration on Mineplex.
