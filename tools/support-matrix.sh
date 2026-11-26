@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tiramisu/tools/support-matrix.sh
 # Generate docs/support-matrix.md from a real corpus run. Every number comes
 # from test_corpus --coverage, which classifies every bound import as

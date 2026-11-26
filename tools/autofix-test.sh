@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tiramisu/tools/autofix-test.sh
 # Offline gate for the fix DB, fix planner and retry loop. No console needed:
 # real failure logs are replayed from tests/fixtures/logs/.

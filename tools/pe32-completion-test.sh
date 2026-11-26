@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tiramisu/tools/pe32-completion-test.sh
 # Real 32-bit corpus DLLs must execute their entry to a clean return through
 # the clean-room interpreter. Guards the instruction-length fidelity fixes.

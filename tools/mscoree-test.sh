@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tiramisu/tools/mscoree-test.sh — standalone gate for the real mscoree shim.
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"

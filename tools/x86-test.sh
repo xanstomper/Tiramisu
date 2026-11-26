@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tiramisu/tools/x86-test.sh — standalone gate for the clean-room x86-32 core.
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"

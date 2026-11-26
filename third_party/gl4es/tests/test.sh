@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # WARNING: do not execute this file unless you are aware of what you're doing.
 # This file is meant to be executed by ctest.

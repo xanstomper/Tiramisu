@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tiramisu/tools/x86-image-test.sh — PE32 image execution gate.
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"

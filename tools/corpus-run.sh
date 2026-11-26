@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tiramisu/tools/corpus-run.sh
 # STAGE 6/7 run-depth gate: build tests/test_corpus_run.cpp the same way
 # corpus-smoke.sh builds test_corpus.cpp, then EXECUTE real code on the

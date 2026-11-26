@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # third_party/build-fna-stack.sh — build the whole Path B managed stack:
 # FNA-as-MS-names + forwarders, FNA3D, FAudio, and the REAL FMOD +
 # Steamworks dllmap libraries (third_party/mono-bridges). The old

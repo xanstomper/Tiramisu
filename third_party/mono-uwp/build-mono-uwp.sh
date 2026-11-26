@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tiramisu/third_party/mono-uwp/build-mono-uwp.sh — build stock Mono 6.8.0.105
 # (SGen GC, interpreter-capable) as a static library for the UWP/WinRT target.
 #

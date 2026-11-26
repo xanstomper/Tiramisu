@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tiramisu/tools/corpus-smoke.sh
 # Hardware-free verification of the real-game corpus:
 # builds tests/test_corpus.cpp with the same clang++ flag style build-test.sh

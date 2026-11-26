@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tiramisu/tools/pack.sh — package + sign + verify (proven recipe).
 #
 # Normal build:  manifest Identity = Xan.Tiramisu / CN=TiramisuDev

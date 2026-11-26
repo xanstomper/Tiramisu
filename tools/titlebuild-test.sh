@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tiramisu/tools/titlebuild-test.sh
 # Offline gate for the title build + autofix engine: every corpus title must
 # produce a measured verdict with no false "blocked", the generated files must

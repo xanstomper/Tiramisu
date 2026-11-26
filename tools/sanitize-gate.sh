@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tiramisu/tools/sanitize-gate.sh — the certainty layer.
 #
 # The console has 8 cores and a different libc; code that "works" on a

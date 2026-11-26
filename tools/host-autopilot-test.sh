@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tiramisu/tools/host-autopilot-test.sh
 # Standalone gate for the main.cpp-side autopilot state (header-only, no UWP
 # headers needed), so it can run on the Linux build host without build-host.sh.

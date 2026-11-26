@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # deploy.sh — Xbox Device Portal client (single script, no dependencies beyond curl/python3)
 #
 # Env (all overridable):

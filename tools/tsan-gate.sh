@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tiramisu/tools/tsan-gate.sh — the data-race layer (generated from
 # sanitize-gate.sh: same suites under ThreadSanitizer). The console has 8
 # cores; races invisible on a 2-core desktop fire there.

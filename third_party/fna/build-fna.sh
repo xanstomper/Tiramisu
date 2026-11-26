@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # third_party/fna/build-fna.sh — build FNA as Microsoft.Xna.Framework 4.0.0.0
 # plus the .Graphics / .Game type-forwarder assemblies (Path B, Celeste).
 #

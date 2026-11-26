@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tools/build-hermes.sh — build the Hermes console agent and its upload zip.
 #
 #   tools/build-hermes.sh [outdir]

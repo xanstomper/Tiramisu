@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tiramisu/tools/release.sh — build the host once and pack both release flavors.
 #
 #   tools/release.sh [out-dir]           # normal + KBM (Edge identity)

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tiramisu/tools/build-test.sh
 # Offline verification: build the guest PE (clang cross, no SDK needed),
 # build the loader + host-side test on Linux, run it.

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tools/build_guest_res.sh — build the resource-test guest EXE:
 # generate the hand-built .rsrc section -> assemble -> link -> patch the
 # three absolute DataRva fields with the final .rsrc RVA.

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tiramisu/tools/build-host.sh — cross-build the Tiramisu UWP host on Linux.
 #   clang-cl (MSVC ABI, LLVM 19) -> lld-link -> out/layout/tiramisu.exe
 # The host is a UWP image (--uwp): AppContainer + WINAPI_FAMILY_APP.

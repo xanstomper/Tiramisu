@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # third_party/fna3d/build-fna3d.sh — build FNA3D (FNA's 3D renderer) from
 # source as libFNA3D.so.0, SDL2 backend + bundled MojoShader (the graphics
 # backend FNA uses at runtime; the Path B spike ran it under OpenGL/llvmpipe).

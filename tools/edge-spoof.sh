@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tiramisu/tools/edge-spoof.sh — build the experimental Edge-identity package.
 #
 # This is the one-command entry point for the Xbox hardware-mouse experiment in

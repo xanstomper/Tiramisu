@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tiramisu/tools/launch-with-autofix.sh
 # End-to-end host wiring: transfer a game, launch it on the Series S, pull the
 # real tiramisu.log, apply declared fixes and retry — until it boots or a

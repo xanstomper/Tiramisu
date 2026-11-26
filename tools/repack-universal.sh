@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tiramisu/tools/repack-universal.sh — Phase 5: universal-guest round-trip.
 #
 # Translates a cleared PC game's imports (Phase 3, out/pc2xb) and writes the

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # third_party/faudio/build-faudio.sh — build FAudio (FNA's XAudio2
 # reimplementation) from source as libFAudio.so.0, SDL2 backend.
 # Celeste uses FMOD for all its audio, so FAudio is only FNA's audio-device

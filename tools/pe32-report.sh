@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tiramisu/tools/pe32-report.sh — run every corpus PE32 entry through the
 # clean-room x86 interpreter and record the exact named stop per file.
 set -uo pipefail
