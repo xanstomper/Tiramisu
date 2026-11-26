@@ -207,8 +207,11 @@ static const trt_named_fn k_atiadl_fns[] = {
 
 int trt_bridge_register_nvapi(void) {
   // nvapi: the real DLL exports the NvAPI_* gateway (capital N-v-A-P-I);
-  // engines import those names, so that is the honest surface.
+  // engines import those names, so that is the honest surface. Both nvapi.dll (x86)
+  // and nvapi64.dll (x64) receive the honest table so 32-bit and 64-bit titles resolve cleanly.
   trt_module_register("nvapi.dll", TRT_ROUTE_BUILTIN, k_nvapi_fns,
+                      (int)(sizeof(k_nvapi_fns) / sizeof(k_nvapi_fns[0])));
+  trt_module_register("nvapi64.dll", TRT_ROUTE_BUILTIN, k_nvapi_fns,
                       (int)(sizeof(k_nvapi_fns) / sizeof(k_nvapi_fns[0])));
   trt_module_register("nvml.dll", TRT_ROUTE_BUILTIN, k_nvml_fns,
                       (int)(sizeof(k_nvml_fns) / sizeof(k_nvml_fns[0])));
@@ -218,13 +221,17 @@ int trt_bridge_register_nvapi(void) {
                       (int)(sizeof(k_atiadl_fns) / sizeof(k_atiadl_fns[0])));
   trt_module_register("atiadlxy.dll", TRT_ROUTE_BUILTIN, k_atiadl_fns,
                       (int)(sizeof(k_atiadl_fns) / sizeof(k_atiadl_fns[0])));
-  // AMD GPU Services (amd_ags_x64.dll) — Sekiro and other AMD-tuned titles.
+  // AMD GPU Services (amd_ags_x64.dll / amd_ags_x86.dll) — Sekiro and other AMD-tuned titles.
   static const trt_named_fn k_amdags_fns[] = {
       {"agsInit", (void*)&trt_agsInit},
       {"agsDeInit", (void*)&trt_agsDeInit},
+      {"agsInitialize", (void*)&trt_agsInit},
+      {"agsDeInitialize", (void*)&trt_agsDeInit},
       {"agsSetDisplayMode", (void*)&trt_agsSetDisplayMode},
   };
   trt_module_register("amd_ags_x64.dll", TRT_ROUTE_BUILTIN, k_amdags_fns,
+                      (int)(sizeof(k_amdags_fns) / sizeof(k_amdags_fns[0])));
+  trt_module_register("amd_ags_x86.dll", TRT_ROUTE_BUILTIN, k_amdags_fns,
                       (int)(sizeof(k_amdags_fns) / sizeof(k_amdags_fns[0])));
   return 0;
 }

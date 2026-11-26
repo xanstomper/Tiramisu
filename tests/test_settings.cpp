@@ -105,12 +105,12 @@ int main() {
     fclose(f);
   }
   const int applied = longan::settings_load(root);
-  CHECK(applied >= 2, "partial ini applies present keys");
+  CHECK(applied == 2, "partial ini counts recognized keys only");
   CHECK(longan::settings_get().mouse_speed == 33 &&
             longan::settings_get().wheel_speed == 66,
         "partial ini values applied");
-  CHECK(longan::settings_get().default_input == "pad2kbm",
-        "missing keys keep previously-loaded values");
+  CHECK(longan::settings_get().default_input == "auto",
+        "missing keys restore built-in defaults");
 
   // 5. clamping on apply and on store
   longan::host_settings wild{};
@@ -138,7 +138,7 @@ int main() {
           "launch_args is written out for the dashboard to edit");
   }
 
-  // 7. per-title profile: writable store applies, file beside exe wins
+  // 7. per-title profile: writable overrides and launch isolation
   {
     const std::string game = root + "/game";
     const std::string titles = root + "/titles";
@@ -154,20 +154,41 @@ int main() {
     CHECK(n >= 2 && longan::settings_get().launch_args == "-d3d11" &&
               longan::settings_get().frame_rate_cap == 30,
           "profile in the per-title store overrides global settings");
-    // writing a starter beside the exe creates the game folder; from then on
-    // that file is the one this title uses
+    // A shipped profile may supply defaults for a read-only game folder.
     CHECK(longan::settings_write_profile_stub(game, "game") == 1,
           "starter profile written beside the exe");
     CHECK(longan::settings_write_profile_stub(titles, "demo") == 0,
           "an existing per-title profile is never overwritten");
     {
       FILE* f = fopen((game + "/tiramisu.profile.ini").c_str(), "wb");
-      fputs("launch_args=\"-dx12 -fullscreen\"\n", f);
+      fputs("launch_args=\"-dx12 -fullscreen\"\ntexture_quality=1\n", f);
       fclose(f);
     }
     longan::settings_load_profile(game, titles);
-    CHECK(longan::settings_get().launch_args == "-dx12 -fullscreen",
-          "profile beside the exe wins, quotes stripped for the guest");
+    CHECK(longan::settings_get().launch_args == "-d3d11" &&
+              longan::settings_get().texture_quality == 1,
+          "user profile overrides the shipped launch arguments");
+    auto saved = longan::settings_get_global();
+    CHECK(saved.frame_rate_cap != 30 && saved.launch_args == "-windowed -novsync",
+          "global settings editor excludes the active profile");
+    const auto expected_cap = saved.frame_rate_cap;
+    saved.audio_buffer_ms = 1000;
+    CHECK(longan::settings_store(saved, root) &&
+              longan::settings_get().frame_rate_cap == 30 &&
+              longan::settings_get().audio_buffer_ms == 50,
+          "saving defaults validates values and keeps the current profile");
+    longan::settings_clear_profile();
+    CHECK(longan::settings_get().frame_rate_cap == expected_cap &&
+              longan::settings_get().launch_args == "-windowed -novsync",
+          "clearing a profile restores the saved launch defaults");
+    const auto left = longan::settings_title_profile_dir(root, "games/A/demo");
+    const auto right = longan::settings_title_profile_dir(root, "games/B/demo");
+    CHECK(left != right && longan::settings_write_user_profile(left, "mouse_speed=4\n") &&
+              longan::settings_read_user_profile(right).empty(),
+          "same-named games have separate user profiles");
+    CHECK(!longan::settings_store(saved, root + "/missing") &&
+              longan::settings_get_global().audio_buffer_ms == 50,
+          "failed save leaves the last successfully saved settings active");
   }
 
   // 8. garbage ini never fatal

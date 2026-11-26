@@ -37,11 +37,18 @@ extern "C" int trt_bridge_register_oodle(void) {
         {"Oodle_GetErrorHandler", (void*)&oodle_Oodle_GetErrorHandler},
         {"Oodle_SetErrorHandler", (void*)&oodle_Oodle_SetErrorHandler},
     };
-    trt_module_register("oo2core_6_win64.dll", TRT_ROUTE_BUILTIN, k_fns,
-                        (int)(sizeof(k_fns) / sizeof(k_fns[0])));
-    trt_module_register("oo2core_8_win64.dll", TRT_ROUTE_BUILTIN, k_fns,
-                        (int)(sizeof(k_fns) / sizeof(k_fns[0])));
-    trt_module_register("oo2core_5_win64.dll", TRT_ROUTE_BUILTIN, k_fns,
-                        (int)(sizeof(k_fns) / sizeof(k_fns[0])));
+    static const char* const k_oodle_mods[] = {
+        "oo2core_9_win64.dll", "oo2core_8_win64.dll", "oo2core_7_win64.dll",
+        "oo2core_6_win64.dll", "oo2core_5_win64.dll", "oo2core_4_win64.dll",
+        "oo2core_3_win64.dll", "oo2core_2_win64.dll", "oo2core_1_win64.dll",
+        "oo2core_win64.dll",
+        "oo2core_9_win32.dll", "oo2core_8_win32.dll", "oo2core_7_win32.dll",
+        "oo2core_6_win32.dll", "oo2core_5_win32.dll", "oo2core_4_win32.dll",
+        "oo2core_3_win32.dll", "oo2core_win32.dll",
+    };
+    for (size_t i = 0; i < sizeof(k_oodle_mods) / sizeof(k_oodle_mods[0]); ++i) {
+        trt_module_register(k_oodle_mods[i], TRT_ROUTE_BUILTIN, k_fns,
+                            (int)(sizeof(k_fns) / sizeof(k_fns[0])));
+    }
     return 0;
 }

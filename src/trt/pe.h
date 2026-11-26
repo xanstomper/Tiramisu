@@ -63,7 +63,8 @@ enum {
   TRT_ERR_BAD_ARGS = 15,
   TRT_ERR_MANAGED = 16,  // .NET assembly (COM descriptor present); no CLR here
   TRT_ERR_MONO = 17,          // Mono embedding failure (see trt_mono_last_error)
-  TRT_ERR_FNA3D = 18          // FNA3D host-device handoff failure (see trt_fna3d_last_error)
+  TRT_ERR_FNA3D = 18,         // FNA3D host-device handoff failure (see trt_fna3d_last_error)
+  TRT_ERR_PE32_EXECUTION = 19 // interpreter stopped before normal completion
 };
 
 // min/max PE32/PE64 header offsets/sizes we rely on (SDK-free constants)

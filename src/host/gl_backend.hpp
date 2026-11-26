@@ -8,6 +8,8 @@
 #include <dxgi1_2.h>
 
 #include "../trt/bridge_opengl32.h"
+#include "../trt/bridge_esram.h"
+#include "shader_cache_util.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -299,10 +301,7 @@ inline u32 hk_compile_program(u32 gl_prog, const char* vs_hlsl, u32 vs_len,
 
   auto compile_stage = [](const char* src, u32 len, const char* tgt, ID3DBlob** out) -> bool {
     if (!src || !len) return true;
-    ID3DBlob* err = nullptr;
-    HRESULT hr = D3DCompile(src, len, nullptr, nullptr, nullptr, "main", tgt, 0, 0, out, &err);
-    if (err) err->Release();
-    return SUCCEEDED(hr) && *out != nullptr;
+    return longan::d3d_compile_cached(src, len, tgt, "main", out);
   };
   if (vs_hlsl && vs_len) {
     ID3DBlob* blob = nullptr;
@@ -403,6 +402,9 @@ inline void hk_delete_buffer(u32 gl_buf, void*) {
 }
 
 inline void free_tex_rec(tex_rec& tr) {
+  if (trt_esram_is_active() && (tr.rtv || tr.dsv)) {
+    trt_esram_release_surface(tr.desc.w, tr.desc.h, (uint32_t)gl_to_dxgi_fmt(tr.desc.fmt, tr.dsv != nullptr));
+  }
   if (tr.srv) { tr.srv->Release(); tr.srv = nullptr; }
   if (tr.rtv) { tr.rtv->Release(); tr.rtv = nullptr; }
   if (tr.dsv) { tr.dsv->Release(); tr.dsv = nullptr; }
@@ -473,6 +475,9 @@ inline u32 hk_sync_texture(u32 gl_tex, const trt_gl_tex_desc* desc, const void* 
         g_glrt.dev->CreateDepthStencilView(tr.tex2d, &dd, &tr.dsv);
       } else if (td.BindFlags & D3D11_BIND_RENDER_TARGET) {
         g_glrt.dev->CreateRenderTargetView(tr.tex2d, nullptr, &tr.rtv);
+      }
+      if (trt_esram_is_active() && (td.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL))) {
+        trt_esram_qualify_and_alloc(td.Width, td.Height, (uint32_t)td.Format, td.BindFlags, "gl_surface");
       }
       if (td.BindFlags & D3D11_BIND_UNORDERED_ACCESS) {
         g_glrt.dev->CreateUnorderedAccessView(tr.tex2d, nullptr, &tr.uav);
@@ -946,7 +951,7 @@ inline void bind(ID3D11Device1* dev, ID3D11DeviceContext1* ctx,
   hk.read_pixels = &hk_read_pixels;
   hk.draw = &hk_draw;
   hk.dispatch_compute = &hk_dispatch_compute;
-  trt_gl_set_hooks(&hk);
+  trt_gl_set_hooks(g_glrt.initialized && swap ? &hk : nullptr);
 }
 
 }  // namespace gl_rt

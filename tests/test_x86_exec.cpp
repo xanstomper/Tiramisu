@@ -650,6 +650,291 @@ int main() {
         x86_mem_free(&b);
     }
 
+    printf("== x86: unsigned CRT startup loop ==\n");
+    {
+        // The MSVC startup loop increments an offset by sizeof(CRITICAL_SECTION).
+        // JB must fall through when CMP finds the offset equals the upper bound.
+        const uint8_t bytes[] = {0x31, 0xF6, 0x83, 0xC6, 0x18, 0x83, 0xFE, 0x18,
+                                 0x72, 0xF8, 0xF4};
+        for (int jit = 0; jit <= 1; ++jit) {
+            x86_context c = {};
+            run_prog(&c, bytes, sizeof(bytes), jit, 64);
+            CHECK(c.execution == X86_EXEC_OK && c.regs.esi == 24,
+                  "JB falls through on equal operands");
+            x86_mem_free(&c);
+        }
+    }
+
+    printf("== x86: positive and negated condition codes ==\n");
+    {
+        // Independent reference masks for the final EFLAGS of selected CMPs.
+        const struct { uint32_t flags; uint16_t mask; } cases[] = {
+            {0, 0xAAAA},                      // O, B, E, BE, S, P, L, LE all false
+            {X86_CF | X86_PF | X86_SF, 0x5566},
+            {X86_PF | X86_ZF, 0x665A},
+            {X86_OF | X86_SF, 0xA9A9},
+        };
+        for (const auto& example : cases) {
+            x86_context c = {};
+            setup(&c);
+            for (unsigned code = 0; code < 16; ++code) {
+                x86_mem_write8(&c, 0x10000, 0x0F);
+                x86_mem_write8(&c, 0x10001, static_cast<uint8_t>(0x90 + code));
+                x86_mem_write8(&c, 0x10002, 0xC0);  // SETcc AL
+                c.regs.eip = 0x10000;
+                c.regs.eflags = example.flags;
+                CHECK(x86_step(&c) == 0 && (c.regs.eax & 0xFF) == ((example.mask >> code) & 1),
+                      "SETcc matches the x86 flags");
+            }
+            x86_mem_free(&c);
+        }
+    }
+
+    printf("== x86: indirect JMP preserves the caller's return address ==\n");
+    {
+        // A common import thunk is FF /4 [IAT]. Its target's RET must
+        // return directly to the original caller.
+        const uint8_t bytes[] = {
+            0xC7, 0x05, 0x00, 0x10, 0x01, 0x00,  // mov [0x11000],target
+            0x1C, 0x00, 0x01, 0x00,
+            0xE8, 0x06, 0x00, 0x00, 0x00,        // call thunk
+            0x83, 0xC0, 0x01, 0xF4,             // add eax,1; hlt
+            0x90, 0x90,
+            0xFF, 0x25, 0x00, 0x10, 0x01, 0x00,  // thunk: jmp [0x11000]
+            0xCC,
+            0xB8, 0x29, 0x00, 0x00, 0x00, 0xC3   // target: mov eax,41; ret
+        };
+        for (int jit = 0; jit <= 1; ++jit) {
+            x86_context c = {};
+            run_prog(&c, bytes, sizeof(bytes), jit, 64);
+            CHECK(c.execution == X86_EXEC_OK && c.regs.eax == 42 &&
+                      c.regs.esp == 0x0010F000,
+                  "indirect tail jump returns to the original caller");
+            x86_mem_free(&c);
+        }
+    }
+
+    printf("== x86: signed register IMUL and overflow ==\n");
+    {
+        x86_context c = {};
+        setup(&c);
+        const uint8_t imul[] = {0x0F, 0xAF, 0xC1};  // imul eax,ecx
+        memcpy(c.mem.base + 0x10000, imul, sizeof(imul));
+        c.regs.eip = 0x10000;
+        c.regs.eax = uint32_t(-16);
+        c.regs.ecx = 3;
+        CHECK(x86_step(&c) == 0 && c.regs.eax == uint32_t(-48) &&
+                  !(c.regs.eflags & (X86_CF | X86_OF)),
+              "signed IMUL computes and clears overflow for a fitting product");
+        c.regs.eip = 0x10000;
+        c.regs.eax = 0x7FFFFFFF;
+        CHECK(x86_step(&c) == 0 && c.regs.eax == 0x7FFFFFFD &&
+                  (c.regs.eflags & (X86_CF | X86_OF)) == (X86_CF | X86_OF),
+              "signed IMUL truncates and sets carry and overflow");
+        CHECK(x86_arg_count("kernel32.dll", "FlsGetValue2") == 1,
+              "FlsGetValue2 pops just the index");
+        x86_mem_free(&c);
+    }
+
+    printf("== x86: GetStartupInfo uses the guest structure size ==\n");
+    {
+        x86_context c = {};
+        setup(&c);
+        constexpr uint32_t info = 0x00100000;
+        x86_mem_write32(&c, c.regs.esp + 4, info);
+        const char* const functions[] = {"GetStartupInfoA", "GetStartupInfoW"};
+        for (const char* name : functions) {
+            x86_mem_write32(&c, info + 64, 0xFFFFFFFF);
+            x86_mem_write32(&c, info + 68, 0x11223344);
+            int nargs = 0, is_cdecl = 0;
+            x86_dispatch_import(&c, -1, "kernel32.dll", name, &nargs, &is_cdecl);
+            CHECK(nargs == 1 && x86_mem_read32(&c, info) == 68 &&
+                      x86_mem_read32(&c, info + 64) == 0 &&
+                      x86_mem_read32(&c, info + 68) == 0x11223344,
+                  "startup info initializes 68 guest bytes and preserves the stack");
+        }
+        x86_mem_free(&c);
+    }
+
+    printf("== x86: rotate through CL and shift through memory ==\n");
+    {
+        const uint8_t bytes[] = {
+            0xB8, 0x01, 0x00, 0x00, 0x80,             // mov eax,0x80000001
+            0xB9, 0x01, 0x00, 0x00, 0x00,             // mov ecx,1
+            0xD3, 0xC8,                               // ror eax,cl
+            0x0F, 0x92, 0xC2,                         // setc dl
+            0xA3, 0x04, 0x10, 0x01, 0x00,             // mov [0x11004],eax
+            0xBB, 0x00, 0x10, 0x01, 0x00,             // mov ebx,0x11000
+            0xC1, 0x63, 0x04, 0x01,                   // shl [ebx+4],1
+            0xF4
+        };
+        x86_context c = {};
+        run_prog(&c, bytes, sizeof(bytes), 0, 64);
+        CHECK(c.execution == X86_EXEC_OK && c.regs.eax == 0xC0000000u &&
+                  c.regs.edx == 1 && x86_mem_read32(&c, 0x11004) == 0x80000000u,
+              "rotate sets carry and memory shift writes back to the right address");
+        x86_mem_free(&c);
+    }
+
+    printf("== x86: command line stays in guest memory ==\n");
+    {
+        x86_context c = {};
+        setup(&c);
+        trt_bridge_set_exe_path("Z:\\Fixture.exe");
+        trt_bridge_set_cmd_args("--example");
+        int nargs = 0, is_cdecl = 0;
+        const auto ansi = x86_dispatch_import(&c, -1, "kernel32.dll", "GetCommandLineA",
+                                              &nargs, &is_cdecl);
+        const auto wide = x86_dispatch_import(&c, -1, "kernel32.dll", "GetCommandLineW",
+                                              &nargs, &is_cdecl);
+        const auto again = x86_dispatch_import(&c, -1, "kernel32.dll", "GetCommandLineA",
+                                               &nargs, &is_cdecl);
+        const char expected[] = "\"Z:\\Fixture.exe\" --example";
+        bool matches = ansi && wide && ansi != wide && ansi == again;
+        for (size_t i = 0; matches && i < sizeof(expected); ++i)
+            matches = x86_mem_read8(&c, ansi + static_cast<uint32_t>(i)) == expected[i] &&
+                      x86_mem_read16(&c, wide + static_cast<uint32_t>(2 * i)) == expected[i];
+        CHECK(matches, "ANSI and UTF-16 calls return stable guest addresses and correct text");
+        trt_bridge_set_cmd_args("");
+        x86_mem_free(&c);
+    }
+
+    printf("== x86: bit tests with immediate and signed memory indices ==\n");
+    {
+        x86_context c = {};
+        setup(&c);
+        const uint8_t bytes[] = {
+            0x0F, 0xBA, 0x25, 0x04, 0x00, 0x10, 0x00, 0x21, // bt [0x100004],33
+            0x0F, 0xBB, 0x48, 0x04,                         // btc [eax+4],ecx
+        };
+        memcpy(c.mem.base + 0x10000, bytes, sizeof(bytes));
+        x86_mem_write32(&c, 0x100000, 0x80000000u);
+        x86_mem_write32(&c, 0x100004, 2);
+        c.regs.eip = 0x10000;
+        c.regs.eax = 0x100000;
+        c.regs.ecx = uint32_t(-1);
+        CHECK(x86_step(&c) == 0 && (c.regs.eflags & X86_CF),
+              "immediate bit index wraps inside the addressed dword");
+        CHECK(x86_step(&c) == 0 && (c.regs.eflags & X86_CF) &&
+                  x86_mem_read32(&c, 0x100000) == 0 && x86_mem_read32(&c, 0x100004) == 2,
+              "negative bit index updates the preceding dword");
+        x86_mem_free(&c);
+    }
+
+    printf("== x86: register ADC and SBB use the incoming carry ==\n");
+    {
+        const uint8_t bytes[] = {
+            0xF9,                                     // stc
+            0x1B, 0xC0,                               // sbb eax,eax
+            0x0F, 0x92, 0xC2,                         // setc dl
+            0x13, 0xC8,                               // adc ecx,eax
+            0xF4
+        };
+        x86_context c = {};
+        run_prog(&c, bytes, sizeof(bytes), 0, 64);
+        CHECK(c.execution == X86_EXEC_OK && c.regs.eax == 0xFFFFFFFFu &&
+                  c.regs.ecx == 0 && c.regs.edx == 1 &&
+                  (c.regs.eflags & (X86_CF | X86_ZF)) == (X86_CF | X86_ZF),
+              "borrow survives SBB and rolls ADC over with carry");
+        x86_mem_free(&c);
+    }
+
+    printf("== x86: INC/DEC byte keeps the instruction stream aligned ==\n");
+    {
+        const uint8_t bytes[] = {
+            0xB9, 0x00, 0x10, 0x01, 0x00,             // mov ecx,0x11000
+            0xB8, 0xFF, 0x80, 0x00, 0x00,             // mov eax,0x80ff
+            0x88, 0x41, 0x5C,                         // mov [ecx+0x5c],al
+            0xF9,                                     // stc
+            0xFE, 0x81, 0x5C, 0x00, 0x00, 0x00,       // inc byte [ecx+0x5c]
+            0x0F, 0x94, 0xC2,                         // setz dl
+            0xFE, 0xCC,                               // dec ah
+            0xF4
+        };
+        x86_context c = {};
+        run_prog(&c, bytes, sizeof(bytes), 0, 64);
+        CHECK(c.execution == X86_EXEC_OK && c.regs.eax == 0x7FFF &&
+                  c.regs.edx == 1 && x86_mem_read8(&c, 0x1105C) == 0 &&
+                  (c.regs.eflags & (X86_CF | X86_OF)) == (X86_CF | X86_OF),
+              "memory INC and high-byte DEC update operands and preserve carry");
+        x86_mem_free(&c);
+    }
+
+    printf("== x86: MOV immediate honors the encoded destination width ==\n");
+    {
+        const uint8_t bytes[] = {
+            0xC7, 0x05, 0x00, 0x10, 0x01, 0x00,  // mov dword [0x11000],0x44332211
+            0x11, 0x22, 0x33, 0x44,
+            0x66, 0xC7, 0x05, 0x00, 0x10, 0x01, 0x00, 0xAA, 0xBB, // mov word [0x11000],0xbbaa
+            0xB8, 0x00, 0x00, 0xFE, 0xCA,       // mov eax,0xcafe0000
+            0x66, 0xB8, 0x78, 0x56,             // mov ax,0x5678
+            0xC6, 0xC4, 0x21,                   // mov ah,0x21
+            0xF4
+        };
+        x86_context c = {};
+        run_prog(&c, bytes, sizeof(bytes), 0, 64);
+        CHECK(c.execution == X86_EXEC_OK && c.regs.eax == 0xCAFE2178 &&
+                  x86_mem_read32(&c, 0x11000) == 0x4433BBAA,
+              "word immediates consume two bytes and byte immediates honor AH");
+        x86_mem_free(&c);
+    }
+
+    printf("== x86: guest exit is separate from a privileged instruction ==\n");
+    {
+        uint8_t normal[] = {0x31, 0xC0, 0xC3}; // xor eax,eax; ret
+        uint8_t bad[] = {0xF4};                // HLT in guest code
+        for (int jit = 0; jit <= 1; ++jit) {
+            x86_context c = {};
+            x86_cpu_init(&c);
+            c.jit_enabled = jit;
+            CHECK(x86_run_pe32(&c, normal, sizeof(normal),
+                                0x400000, 0, 0x100000, 0x10000) == X86_EXEC_OK,
+                  "a PE32 entry can return to the host sentinel");
+            CHECK(x86_run_pe32(&c, bad, sizeof(bad),
+                                0x400000, 0, 0x100000, 0x10000) == X86_EXEC_BAD_INSTRUCTION,
+                  "guest HLT is an execution fault");
+            x86_mem_free(&c);
+        }
+        x86_context c = {};
+        setup(&c);
+        x86_mem_write32(&c, c.regs.esp + 4, 5);
+        int nargs = 0, is_cdecl = 0;
+        CHECK(x86_dispatch_import(&c, -1, "kernel32.dll", "ExitProcess", &nargs, &is_cdecl) == 5 &&
+                  !c.running && c.execution == X86_EXEC_GUEST_ERROR,
+              "ExitProcess stops just the guest and retains its error");
+        x86_mem_free(&c);
+    }
+
+    printf("== x86: unsupported two-byte opcodes fail the run ==\n");
+    {
+        const uint8_t bytes[] = {0x0F, 0x0B};  // UD2
+        x86_context c = {};
+        run_prog(&c, bytes, sizeof(bytes), 0, 64);
+        CHECK(c.execution == X86_EXEC_BAD_INSTRUCTION,
+              "decoded two-byte fault cannot report successful execution");
+        x86_mem_free(&c);
+    }
+
+    printf("== x86: immediate follows memory displacement ==\n");
+    {
+        const uint8_t bytes[] = {
+            0xBB, 0x00, 0x10, 0x01, 0x00,             // mov ebx,0x11000
+            0x83, 0x43, 0x04, 0x13,                   // add dword [ebx+4],19
+            0x81, 0xAB, 0x04, 0x00, 0x00, 0x00,       // sub dword [ebx+4],8
+            0x08, 0x00, 0x00, 0x00,
+            0x8B, 0x43, 0x04,                         // mov eax,[ebx+4]
+            0xF4
+        };
+        for (int jit = 0; jit <= 1; ++jit) {
+            x86_context c = {};
+            run_prog(&c, bytes, sizeof(bytes), jit, 64);
+            CHECK(c.execution == X86_EXEC_OK && c.regs.eax == 11 &&
+                      x86_mem_read32(&c, 0x11004) == 11,
+                  "both immediate widths use the displacement before the operand value");
+            x86_mem_free(&c);
+        }
+    }
+
     printf("== JIT: memory operands, CMP/JE, value round-trip ==\n");
     {
         static const uint8_t prog[] = {
@@ -774,7 +1059,8 @@ int main() {
         c.regs.eip = 0x10000;
         c.jit_enabled = 0;
         c.insn_limit = 300000;
-        x86_run(&c);
+        CHECK(x86_run(&c) == X86_EXEC_INSTRUCTION_LIMIT,
+              "a bounded spin reports exhaustion");
         CHECK(strstr(hot_log, "HOT LOOP") != NULL,
               "stalled window logged by name");
         CHECK(strstr(hot_log, "0x00010000..0x00010000") != NULL,

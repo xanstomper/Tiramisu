@@ -4,7 +4,7 @@
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
   IgnorableNamespaces="uap rescap">
-  <Identity Name="Xan.Tiramisu" Publisher="CN=TiramisuDev" Version="0.2.4.12" ProcessorArchitecture="x64" />
+  <Identity Name="Xan.Tiramisu" Publisher="CN=TiramisuDev" Version="0.2.4.41" ProcessorArchitecture="x64" />
   <Properties>
     <DisplayName>Tiramisu</DisplayName>
     <PublisherDisplayName>TiramisuDev</PublisherDisplayName>
@@ -22,6 +22,19 @@
         BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png">
         <uap:SplashScreen Image="Assets\SplashScreen.png" BackgroundColor="#000000" />
       </uap:VisualElements>
+      <Extensions>
+        <uap:Extension Category="windows.fileTypeAssociation">
+          <uap:FileTypeAssociation Name="tiramisu-game-files">
+            <uap:SupportedFileTypes>
+              <uap:FileType>.zip</uap:FileType>
+              <uap:FileType>.iso</uap:FileType>
+              <uap:FileType>.img</uap:FileType>
+              <uap:FileType>.bin</uap:FileType>
+              <uap:FileType>.cue</uap:FileType>
+            </uap:SupportedFileTypes>
+          </uap:FileTypeAssociation>
+        </uap:Extension>
+      </Extensions>
     </Application>
   </Applications>
   <Capabilities>
@@ -31,5 +44,6 @@
     <Capability Name="codeGeneration" />
     <rescap:Capability Name="inputForegroundObservation" />
     <rescap:Capability Name="expandedResources" />
+    <DeviceCapability Name="removableStorage" />
   </Capabilities>
 </Package>

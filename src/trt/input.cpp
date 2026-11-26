@@ -53,8 +53,9 @@ struct input_state {
 
   // raw input: registered devices + a ring of RAWINPUT blobs
   u8  raw_mouse_reg, raw_kbd_reg;
+  u64 raw_mouse_window, raw_kbd_window;
   u64 raw_next_handle;
-  struct raw_rec { u64 handle; u8 blob[48]; u32 size; };
+  struct raw_rec { u64 handle; u64 window; u8 blob[48]; u32 size; };
   raw_rec raw_ring[TRT_MSG_RING];
 
   // message ring
@@ -623,6 +624,30 @@ u16 trt_key_scan(u16 vk) {
   return vk < TRT_MAX_VK ? g.scan[vk] : 0;
 }
 
+void trt_input_copy_dik_state(u8 out[256]) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  memset(out, 0, 256);
+  for (u16 vk = 0; vk < TRT_MAX_VK; ++vk) {
+    // The generic modifier states mirror the left and right states.
+    if (!g.down[vk] || vk == 0x10 || vk == 0x11 || vk == 0x12) continue;
+    u16 scan = g.scan[vk];
+    bool extended = g.extended[vk] != 0;
+    if (!scan) {
+      const u32 mapped = trt_MapVirtualKeyW(vk, 4 /*MAPVK_VK_TO_VSC_EX*/);
+      scan = static_cast<u16>(mapped & 0xff);
+      extended = (mapped & 0xff00) == 0xe000;
+    }
+    if (!scan || scan >= 0x80) continue;
+
+    // DirectInput uses bit 7 for E0 keys, with special indices for
+    // Pause (E1) and Num Lock.
+    u16 dik = scan | (extended ? 0x80 : 0);
+    if (vk == 0x13 /*VK_PAUSE*/) dik = 0xc5;
+    if (vk == 0x90 /*VK_NUMLOCK*/) dik = 0x45;
+    out[dik] = 0x80;
+  }
+}
+
 bool trt_cursor_snapshot(int* x, int* y) {
   std::lock_guard<std::recursive_mutex> lk(g_input_mu);
   *x = g.mouse_init ? g.mx : (g.dw ? g.dw : 1920) / 2;
@@ -705,6 +730,7 @@ void trt_raw_post_mouse(i32 dx, i32 dy, u16 btn_flags, u16 btn_data) {
   g.raw_next_handle = h;
   input_state::raw_rec& r = g.raw_ring[(h - 1) % TRT_MSG_RING];
   r.handle = h;
+  r.window = g.raw_mouse_window;
   r.size = 48;
   memset(r.blob, 0, sizeof(r.blob));
   const u32 type = 0;         // RIM_TYPEMOUSE
@@ -731,6 +757,7 @@ void trt_raw_post_key(u16 vk, u16 scan, bool down, u8 extended) {
   g.raw_next_handle = h;
   input_state::raw_rec& r = g.raw_ring[(h - 1) % TRT_MSG_RING];
   r.handle = h;
+  r.window = g.raw_kbd_window;
   r.size = 40;
   memset(r.blob, 0, sizeof(r.blob));
   const u32 type = 1;          // RIM_TYPEKEYBOARD
@@ -761,8 +788,14 @@ bool trt_raw_register(const void* devices, u32 count) {
   const rid* d = (const rid*)devices;
   for (u32 i = 0; i < count; ++i) {
     const u8 reg = (d[i].flags & 0x00000001u /*RIDEV_REMOVE*/) ? 0 : 1;
-    if (d[i].page == 1 && d[i].usage == 2) g.raw_mouse_reg = reg;  // mouse
-    if (d[i].page == 1 && d[i].usage == 6) g.raw_kbd_reg = reg;    // keyboard
+    if (d[i].page != 1) continue;
+    if (d[i].usage == 2) {
+      g.raw_mouse_reg = reg;
+      g.raw_mouse_window = reg ? d[i].hwnd : 0;
+    } else if (d[i].usage == 6) {
+      g.raw_kbd_reg = reg;
+      g.raw_kbd_window = reg ? d[i].hwnd : 0;
+    }
   }
   return true;
 }
@@ -771,6 +804,12 @@ static const input_state::raw_rec* raw_record_locked(u64 handle) {
   if (!handle) return nullptr;
   const auto& raw = g.raw_ring[(handle - 1) % TRT_MSG_RING];
   return raw.handle == handle ? &raw : nullptr;
+}
+
+u64 trt_raw_target_window(u64 handle) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  const auto* raw = raw_record_locked(handle);
+  return raw ? raw->window : 0;
 }
 
 bool trt_raw_copy(u64 handle, u8 out[48], u32* size) {

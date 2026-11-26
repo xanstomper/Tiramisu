@@ -9,15 +9,19 @@
 //   IDirectInput8W          3 + 8  slots
 //   IDirectInputDevice8W    3 + 31 slots
 // The device hands out the classic states: DIMOUSESTATE (dx/dy/buttons)
-// and the 256-byte keyboard state (one byte per virtual key).
+// and the 256-byte keyboard state (indexed by DIK scan code).
 #include "bridge_dinput.h"
 #include "bridge_ole.h"
 #include "thunk.h"
 #include "input.h"
 
 #include <stdio.h>
+#include <atomic>
 #include <stdlib.h>
 #include <string.h>
+
+// user32 vk<->scan source of truth (defined in input.cpp/bridge_user32.cpp)
+extern "C" u32 TRT_STDCALL trt_MapVirtualKeyW(u32 code, u32 type);
 
 namespace {
 // named-line logging (fail-visible surface, same shape as the other bridges)
@@ -331,13 +335,22 @@ int TRT_GUEST_ABI dd_GetDeviceState(void* self, u32 size, void* buf) {
     memcpy(buf, &j, copy_sz);
     return DI_OK_;
   }
-  // keyboard: one byte per virtual key, 0x80 = down
+  // Keyboard state is indexed by DirectInput scan code. Keep a small,
+  // rate-limited trace so remote keyboard failures can be distinguished from
+  // Unity/game-state stalls without flooding the console log.
   if (size < 256) return E_NOTIMPL_;
-  u8 keys[256];
-  memset(keys, 0, sizeof(keys));
-  for (int vk = 0; vk < 256; ++vk)
-    if (trt_key_down((u16)vk)) keys[vk] = 0x80;
-  memcpy(buf, keys, sizeof(keys));
+  u8 state[256]{};
+  trt_input_copy_dik_state(state);
+  static std::atomic<unsigned> keyboard_state_reads{0};
+  const unsigned read_no = keyboard_state_reads.fetch_add(1, std::memory_order_relaxed);
+  if (read_no < 4 || state[0x1c] || state[0x39] || state[0x2c]) {
+    char line[160];
+    snprintf(line, sizeof(line),
+                  "dinput: keyboard GetDeviceState #%u return=%02x space=%02x z=%02x",
+                  read_no + 1, state[0x1c], state[0x39], state[0x2c]);
+    log_line(line);
+  }
+  memcpy(buf, state, sizeof(state));
   return DI_OK_;
 }
 
@@ -538,8 +551,18 @@ void TRT_GUEST_ABI trt_di_feed_move(i32 dx, i32 dy) {
 void TRT_GUEST_ABI trt_di_feed_button(i32 btn, u32 down) {
   trt_input_mouse_button((int)btn, down != 0);
 }
-void TRT_GUEST_ABI trt_di_feed_key(u16 vk, u32 down) {
-  trt_input_key_event(vk, down != 0);
+// The argument is a DirectInput scan code (DIK_*), matching the layout of a
+// real IDirectInputDevice8 keyboard state (DIK_A = 0x1E, DIK_Z = 0x2C;
+// bit 7 marks E0-extended keys). The state this bridge hands out is indexed
+// by scan code, so the feed must be translated to (vk, scan) or a fed key
+// would never appear in GetDeviceState.
+void TRT_GUEST_ABI trt_di_feed_key(u16 dik, u32 down) {
+  const u16 scan = (u16)(dik & 0x7FU);
+  const u8 extended = (dik & 0x80U) ? 1 : 0;
+  const u32 vsc = (u32)scan | (extended ? 0xE000U : 0U);
+  u16 vk = (u16)(trt_MapVirtualKeyW(vsc, 3 /*MAPVK_VSC_TO_VK_EX*/) & 0xFFU);
+  if (!vk) vk = dik ? dik : scan;  // unknown scan: keep the key visible
+  trt_input_key_event2(vk, down != 0, scan, extended, 0);
 }
 
 // DirectInput8Create(hinst, version, riid, ppv, unk)

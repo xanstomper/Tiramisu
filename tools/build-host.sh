@@ -78,7 +78,7 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   src/host/main.cpp src/host/host_log.cpp src/host/swapchain.cpp \
   src/host/ui.cpp src/host/webxfer.cpp src/host/audio.cpp src/host/settings.cpp \
   src/host/crash_report.cpp src/host/steam_client.cpp src/host/cover_art.cpp \
-  src/host/boot_anim.cpp \
+  src/host/boot_anim.cpp src/host/console_detect.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/vfs.cpp src/trt/iso.cpp \
   src/trt/dynamic_api.cpp src/trt/engine_synthesizer.cpp \
   src/trt/bridge_res.cpp \
@@ -89,8 +89,8 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
   src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp \
   src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp \
-  src/trt/bridge_mmedia.cpp src/trt/acm_codec.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp \
-  src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp \
+  src/trt/bridge_mmedia.cpp src/trt/acm_codec.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_actctx.cpp src/trt/shell_link.cpp src/trt/bridge_version.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/gdi_raster.cpp \
+  src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_prng.cpp src/trt/bridge_dbghelp.cpp \
   src/trt/bridge_ntdll.cpp src/trt/bridge_opengl32.cpp src/trt/glsl_hlsl.cpp \
   src/trt/bridge_vulkan.cpp src/trt/spirv_hlsl.cpp src/trt/pc2xb_translator.cpp src/trt/spirv_cache.cpp src/trt/steam_auth.cpp src/trt/steam_library.cpp src/trt/universal_guest.cpp src/trt/bridge_hid.cpp \
   src/trt/bridge_xinput.cpp src/trt/bridge_wasapi.cpp src/trt/bridge_winrt.cpp src/trt/bridge_ws2.cpp src/trt/bridge_msvcrt.cpp src/trt/bridge_console_pack.cpp \
@@ -102,7 +102,7 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   src/trt/bridge_wldap32.cpp src/trt/bridge_ktmw32.cpp \
   src/trt/bridge_fmod_studio.cpp \
   src/trt/x86_exec.cpp src/trt/x86_bridge.cpp src/trt/x86_image.cpp src/trt/x86_32.cpp src/trt/x86_jit.cpp src/trt/x86_heap.cpp \
-  src/trt/bridge_membudget.cpp src/trt/mono_host.cpp src/trt/fna_platform.cpp \
+  src/trt/bridge_membudget.cpp src/trt/bridge_esram.cpp src/trt/mono_host.cpp src/trt/fna_platform.cpp \
   src/trt/trt_trace.cpp \
   third_party/mono-bridges/mono_steam_door.cpp \
   src/trt/bridge_system_native.cpp \

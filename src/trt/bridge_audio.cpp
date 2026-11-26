@@ -14,6 +14,7 @@
 #include "bridge_ole.h"
 #include "trt.h"
 
+#include <atomic>
 #include <deque>
 #include <math.h>
 #include <mutex>
@@ -324,8 +325,16 @@ void TRT_GUEST_ABI xv_DestroyVoice(void*) {}
 // ---- IXAudio2SourceVoice (slots 22..32) ----
 int TRT_GUEST_ABI xv_Start(void* self, u32 flags, u32 opset) {
   (void)flags; (void)opset;
-  ((xaudio_voice*)self)->started = 1;
-  ((xaudio_voice*)self)->stopped = 0;
+  xaudio_voice* v = (xaudio_voice*)self;
+  v->started = 1;
+  v->stopped = 0;
+  static std::atomic<unsigned> starts{0};
+  if (starts.fetch_add(1, std::memory_order_relaxed) < 16) {
+    char line[128];
+    snprintf(line, sizeof(line), "audio: guest XAudio Start rate=%u ch=%u",
+             v->sample_rate, (unsigned)v->channels);
+    trt_core_log(line);
+  }
   return S_OK_;
 }
 int TRT_GUEST_ABI xv_Stop(void* self, u32 flags, u32 opset) {
@@ -355,6 +364,15 @@ int TRT_GUEST_ABI xv_SubmitSourceBuffer(void* self, const x2_buffer* buf,
   v->bytes_total += buf->audio_bytes;
   // hand the PCM to the host's multi-voice mixer (or legacy hook for offline tests)
   if (buf->audio_data && buf->audio_bytes > 0) {
+    static std::atomic<unsigned> submits{0};
+    if (submits.fetch_add(1, std::memory_order_relaxed) < 16) {
+      char line[144];
+      snprintf(line, sizeof(line),
+               "audio: guest XAudio Submit bytes=%u rate=%u ch=%u started=%u",
+               buf->audio_bytes, v->sample_rate, (unsigned)v->channels,
+               (unsigned)v->started);
+      trt_core_log(line);
+    }
     const u32 bps = v->bits_per_sample >= 8 ? (v->bits_per_sample / 8) : 2;
     if (!trt_audio_submit_voice((u64)(uintptr_t)v, buf->audio_data,
                                 buf->audio_bytes,
@@ -473,6 +491,15 @@ int TRT_GUEST_ABI xe_CreateSourceVoice(void* self, void** out_voice,
     v->bits_per_sample = 16;
   }
   *out_voice = v;
+  static std::atomic<unsigned> creates{0};
+  if (creates.fetch_add(1, std::memory_order_relaxed) < 16) {
+    char line[144];
+    snprintf(line, sizeof(line),
+             "audio: guest XAudio CreateSourceVoice rate=%u ch=%u bits=%u tag=%u",
+             v->sample_rate, (unsigned)v->channels, (unsigned)v->bits_per_sample,
+             (unsigned)v->format_tag);
+    trt_core_log(line);
+  }
   return S_OK_;
 }
 

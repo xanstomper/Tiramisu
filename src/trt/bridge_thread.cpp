@@ -2180,6 +2180,21 @@ static void log_worker_fault(void* ep_v) {
            (unsigned long long)c.R14, (unsigned long long)c.R15,
            (unsigned long)c.EFlags);
   trt_core_log(line);
+  if (record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+      record.NumberParameters >= 2) {
+    const void* target = reinterpret_cast<void*>(record.ExceptionInformation[1]);
+    MEMORY_BASIC_INFORMATION data{};
+    VirtualQuery(target, &data, sizeof(data));
+    void** const active_tls = reinterpret_cast<void**>(__readgsqword(0x58));
+    void** const guest_tls = trt_guest_tls_array();
+    snprintf(line, sizeof(line),
+             "guest fault [worker] memory: target=%p base=%p allocation=%p "
+             "state=0x%lx protect=0x%lx type=0x%lx active_tls=%p guest_tls=%p",
+             target, data.BaseAddress, data.AllocationBase,
+             (unsigned long)data.State, (unsigned long)data.Protect,
+             (unsigned long)data.Type, (void*)active_tls, (void*)guest_tls);
+    trt_core_log(line);
+  }
   // stack walk via .pdata unwind (same shape as the main-thread filter)
   CONTEXT ctx = c;
   int depth = 0;
@@ -2346,10 +2361,13 @@ void* thread_trampoline(void* raw) {
   // name which guest thread is burning CPU. Pairs with the CS-stall probe.
 #if defined(__linux__)
   {
-    char hline[96];
+    // Addresses only: arg is guest memory and may be unmapped (measured: a
+    // CREATE_SUSPENDED thread redirected by SetThreadContext carried a stale
+    // value, and dereferencing it here killed the host with SIGSEGV).
+    char hline[192];
     snprintf(hline, sizeof(hline),
-             "thread: guest-tid=%u mapped to host_tid=%d", my_tid,
-             (int)syscall(SYS_gettid));
+             "thread: guest-tid=%u mapped to host_tid=%d routine=%p arg=%p", my_tid,
+             (int)syscall(SYS_gettid), routine, (void*)arg);
     trt_core_log(hline);
   }
 #endif
@@ -2499,9 +2517,9 @@ u64 TRT_STDCALL trt_CreateThread(void* attrs, void* stack_size, void* routine,
   {
     // thread provenance: pairs with the CS-stall probe's owner_tid so a
     // wedge can be traced back to the routine that created the owner.
-    char tline[96];
-    snprintf(tline, sizeof(tline), "thread: CreateThread tid=%u routine=%p",
-             child_tid, routine);
+    char tline[128];
+    snprintf(tline, sizeof(tline), "thread: CreateThread tid=%u routine=%p param=%p",
+             child_tid, routine, param);
     trt_core_log(tline);
   }
   ts->object = obj;
@@ -2804,19 +2822,13 @@ static u32 wait_single_impl(u64 handle, u32 ms, bool alertable, void* guest_ret)
         }
         DWORD slice_ms = 50;
         if (!infinite) {
-          const long long rem =
-              (long long)std::chrono::duration_cast<
-                  std::chrono::milliseconds>(
-                  deadline - std::chrono::steady_clock::now())
-                  .count();
-          if (rem <= 0) return 0x102u;
-          slice_ms = (DWORD)(rem < 50 ? rem : 50);
+          const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
+              deadline - std::chrono::steady_clock::now()).count();
+          slice_ms = static_cast<DWORD>(remaining <= 0 ? 0 : remaining < 50 ? remaining : 50);
         }
-        const DWORD r =
-            ::WaitForSingleObject(win_thread_h, slice_ms);
-        if (r == WAIT_OBJECT_0) return 0;
-        if (r == WAIT_ABANDONED) return 0x80u;
-        if (r != WAIT_TIMEOUT) return 0x102u;
+        const DWORD result = ::WaitForSingleObject(win_thread_h, slice_ms);
+        if (result == WAIT_FAILED) trt_SetLastError(::GetLastError());
+        if (result != WAIT_TIMEOUT || slice_ms == 0) return result;
       }
     }
   }
@@ -3113,9 +3125,36 @@ static u32 wait_multiple_impl(u32 count, const u64* handles, bool wait_all, u32 
 }
 
 // WaitForSingleObject(handle, ms): 0 signalled, 0x102 timeout, 0xFFFFFFFF failed
+static std::atomic<u32> g_launch_wait_completed{0}, g_launch_wait_timed_out{0};
+static std::atomic<u32> g_launch_wait_failed{0}, g_launch_event_signaled{0};
+static std::atomic<u32> g_launch_event_failed{0};
+
+void trt_sync_reset_launch_stats(void) {
+  g_launch_wait_completed.store(0, std::memory_order_relaxed);
+  g_launch_wait_timed_out.store(0, std::memory_order_relaxed);
+  g_launch_wait_failed.store(0, std::memory_order_relaxed);
+  g_launch_event_signaled.store(0, std::memory_order_relaxed);
+  g_launch_event_failed.store(0, std::memory_order_relaxed);
+}
+
+void trt_sync_get_launch_stats(trt_sync_launch_stats* stats) {
+  if (!stats) return;
+  *stats = {g_launch_wait_completed.load(std::memory_order_relaxed),
+            g_launch_wait_timed_out.load(std::memory_order_relaxed),
+            g_launch_wait_failed.load(std::memory_order_relaxed),
+            g_launch_event_signaled.load(std::memory_order_relaxed),
+            g_launch_event_failed.load(std::memory_order_relaxed)};
+}
+
 u32 TRT_STDCALL trt_WaitForSingleObject(u64 handle, u32 ms) {
   gap_trace_record("WaitForSingleObject");
-  return wait_single_impl(handle, ms, false, __builtin_return_address(0));
+  const u32 result = wait_single_impl(handle, ms, false, __builtin_return_address(0));
+  switch (result) {
+    case 0x102u: g_launch_wait_timed_out.fetch_add(1, std::memory_order_relaxed); break;
+    case 0xFFFFFFFFu: g_launch_wait_failed.fetch_add(1, std::memory_order_relaxed); break;
+    default: g_launch_wait_completed.fetch_add(1, std::memory_order_relaxed); break;
+  }
+  return result;
 }
 
 // .221 DIAG: log the parked-wait table (called from the gap final
@@ -4337,8 +4376,13 @@ int TRT_STDCALL trt_SetEvent(u64 handle) {
   gap_trace_record("SetEvent");
   std::lock_guard<std::mutex> lk(g_obj_mu);
   sync_object* o = object_for_locked(handle);
-  if (!o || o->kind != OBJ_EVENT) return 0;
+  if (!o || o->kind != OBJ_EVENT) {
+    trt_SetLastError(6);  // ERROR_INVALID_HANDLE
+    g_launch_event_failed.fetch_add(1, std::memory_order_relaxed);
+    return 0;
+  }
   o->signalled = true;
+  g_launch_event_signaled.fetch_add(1, std::memory_order_relaxed);
   // .221 DIAG: record the setter -- the ping-pong partner for a
   // thread parked in WaitForSingleObject on this event.
   o->last_set_tid = current_tid();
@@ -4380,7 +4424,10 @@ int TRT_STDCALL trt_SetEvent(u64 handle) {
 int TRT_STDCALL trt_ResetEvent(u64 handle) {
   std::lock_guard<std::mutex> lk(g_obj_mu);
   sync_object* o = object_for_locked(handle);
-  if (!o || o->kind != OBJ_EVENT) return 0;
+  if (!o || o->kind != OBJ_EVENT) {
+    trt_SetLastError(6);  // ERROR_INVALID_HANDLE
+    return 0;
+  }
   o->signalled = false;
   {
     // .208 diagnostic: log event resets (first 64).
@@ -4719,13 +4766,56 @@ extern "C" int trt_cs_size_for_guest(void) {
   return g_guest_ptr_bits.load(std::memory_order_relaxed) == 32 ? 24 : 40;
 }
 
-// --- critical sections (fits inside 40-byte Win64 RTL_CRITICAL_SECTION) ---
-struct crit_section {
-  u32 locked;
-  u32 recursion;
-  u32 owner;
-  u32 spin;
+// --- critical sections ---------------------------------------------------
+// The guest object is a REAL RTL_CRITICAL_SECTION, not a private layout:
+//   Win64: DebugInfo(0) LockCount(8) RecursionCount(12) OwningThread(16)
+//          LockSemaphore(24) SpinCount(32)
+//   PE32:  DebugInfo(0) LockCount(4) RecursionCount(8)  OwningThread(12)
+//          LockSemaphore(16) SpinCount(20)
+// A real CRT (ucrtbase/vcruntime140) initialises its own critical sections
+// in that layout. Overlaying our fields at offset 0 made such a lock read as
+// permanently held: LockCount (Windows' -1 = unowned) was seen as DebugInfo,
+// and EnterCriticalSection spun on WaitOnAddress forever (measured: CPython
+// 3.13 startup, 348M waits in 45 s). Use the documented offsets, and accept
+// both 0 and -1 as "unowned" so bridge- and CRT-initialised objects agree.
+struct cs_fields {
+  u32* lock_count;
+  u32* recursion;
+  u8* owner;       // OwningThread, 4 bytes (PE32) or 8 bytes (Win64)
+  u8* spin_ptr;    // SpinCount, 4 or 8 bytes
+  int owner_bytes;
 };
+
+static cs_fields cs_of(void* cs) {
+  const bool p32 = g_guest_ptr_bits.load(std::memory_order_relaxed) == 32;
+  u8* b = (u8*)cs;
+  cs_fields f;
+  f.lock_count = (u32*)(b + (p32 ? 4 : 8));
+  f.recursion = (u32*)(b + (p32 ? 8 : 12));
+  f.owner = b + (p32 ? 12 : 16);
+  f.spin_ptr = b + (p32 ? 20 : 32);
+  f.owner_bytes = p32 ? 4 : 8;
+  return f;
+}
+
+static u64 cs_owner_load(const cs_fields& f) {
+  if (f.owner_bytes == 4)
+    return __atomic_load_n((u32*)f.owner, __ATOMIC_RELAXED);
+  return __atomic_load_n((u64*)f.owner, __ATOMIC_RELAXED);
+}
+
+static void cs_owner_store(const cs_fields& f, u64 v) {
+  if (f.owner_bytes == 4)
+    __atomic_store_n((u32*)f.owner, (u32)v, __ATOMIC_RELAXED);
+  else
+    __atomic_store_n((u64*)f.owner, v, __ATOMIC_RELAXED);
+}
+
+static u32 cs_spin_load(const cs_fields& f) {
+  if (f.owner_bytes == 4)
+    return __atomic_load_n((u32*)f.spin_ptr, __ATOMIC_RELAXED);
+  return (u32)__atomic_load_n((u64*)f.spin_ptr, __ATOMIC_RELAXED);
+}
 
 // Zero a guest object with exactly-sized stores. Never memset: libc's vector
 // routines are allowed to write past the requested length, and a guest object
@@ -4737,33 +4827,51 @@ static void cs_zero_guest(void* cs) {
   for (int i = 0; i < words; i++) w[i] = 0;
 }
 
+// Initialise in the documented Windows layout: LockCount = -1 (unowned),
+// SpinCount = spin, everything else zero. Shared with bridge_kernel32's
+// InitializeCriticalSectionAndSpinCount so both registrations agree.
+extern "C" void trt_cs_init_layout(void* cs, u32 spin) {
+  if (!cs) return;
+  cs_zero_guest(cs);
+  cs_fields f = cs_of(cs);
+  __atomic_store_n(f.lock_count, 0xFFFFFFFFu, __ATOMIC_RELEASE);
+  if (f.owner_bytes == 4)
+    __atomic_store_n((u32*)f.spin_ptr, spin, __ATOMIC_RELAXED);
+  else
+    __atomic_store_n((u64*)f.spin_ptr, (u64)spin, __ATOMIC_RELAXED);
+}
+
 int TRT_STDCALL trt_InitializeCriticalSection(void* cs) {
   if (!cs) return 0;
-  cs_zero_guest(cs);
+  trt_cs_init_layout(cs, 0);
   return 1;
 }
 
 int TRT_STDCALL trt_InitializeCriticalSectionAndSpinCount2(void* cs, u32 spin) {
   if (!cs) return 0;
-  cs_zero_guest(cs);
-  ((crit_section*)cs)->spin = spin;
+  trt_cs_init_layout(cs, spin);
   return 1;
 }
 
 int TRT_STDCALL trt_TryEnterCriticalSection(void* cs) {
   if (!cs) return 0;
-  crit_section* c = (crit_section*)cs;
-  const u32 me = current_tid();
-  if (__atomic_load_n(&c->locked, __ATOMIC_ACQUIRE) &&
-      __atomic_load_n(&c->owner, __ATOMIC_RELAXED) == me) {
-    ++c->recursion;
-    return 1;
+  cs_fields f = cs_of(cs);
+  const u64 me = current_tid();
+  const u32 cur = __atomic_load_n(f.lock_count, __ATOMIC_ACQUIRE);
+  if (cur != 0 && cur != 0xFFFFFFFFu) {
+    if (cs_owner_load(f) == me) {
+      __atomic_store_n(f.recursion,
+                       __atomic_load_n(f.recursion, __ATOMIC_RELAXED) + 1,
+                       __ATOMIC_RELAXED);
+      return 1;
+    }
+    return 0;
   }
-  u32 expected = 0;
-  if (__atomic_compare_exchange_n(&c->locked, &expected, 1, false,
+  u32 expected = cur;
+  if (__atomic_compare_exchange_n(f.lock_count, &expected, 1u, false,
                                   __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-    __atomic_store_n(&c->owner, me, __ATOMIC_RELAXED);
-    c->recursion = 1;
+    cs_owner_store(f, me);
+    __atomic_store_n(f.recursion, 1u, __ATOMIC_RELAXED);
     return 1;
   }
   return 0;
@@ -4771,8 +4879,8 @@ int TRT_STDCALL trt_TryEnterCriticalSection(void* cs) {
 
 int TRT_STDCALL trt_EnterCriticalSection(void* cs) {
   if (!cs) return 0;
-  crit_section* c = (crit_section*)cs;
-  const u32 spins = c->spin ? c->spin : 256u;
+  cs_fields f = cs_of(cs);
+  const u32 spins = cs_spin_load(f) ? cs_spin_load(f) : 256u;
   for (u32 i = 0; i < spins; ++i) {
     if (trt_TryEnterCriticalSection(cs)) return 1;
     std::this_thread::yield();
@@ -4788,7 +4896,8 @@ int TRT_STDCALL trt_EnterCriticalSection(void* cs) {
       char cl[192];
       snprintf(cl, sizeof(cl),
                "sync: EnterCriticalSection cs=%p CONTENDED owner_tid=%u recursion=%u",
-               cs, c->owner, c->recursion);
+               cs, (u32)cs_owner_load(f),
+               __atomic_load_n(f.recursion, __ATOMIC_RELAXED));
       trt_core_log(cl);
     }
   }
@@ -4800,19 +4909,20 @@ int TRT_STDCALL trt_EnterCriticalSection(void* cs) {
   const u32 saved_err = trt_GetLastError();
   long waited_ms = 0;
   bool stall_named = false;
-  u32 one = 1;  // the locked word's held value (WaitOnAddress comparand)
+  u32 one = 1;  // the held value our TryEnter writes (WaitOnAddress comparand)
   while (!trt_TryEnterCriticalSection(cs)) {
-    trt_WaitOnAddress(&c->locked, &one, 4, 100);
+    trt_WaitOnAddress(f.lock_count, &one, 4, 100);
     waited_ms += 100;
     if (waited_ms >= 3000 && !stall_named) {
       stall_named = true;
+      const u32 owner_tid = (u32)cs_owner_load(f);
       u32 owner_alive = 2;
       void* start = nullptr;
       u64 arg = 0;
       {
         std::lock_guard<std::mutex> lk(g_obj_mu);
         for (const sync_object& o : g_objects) {
-          if (o.kind == OBJ_THREAD && o.tid == c->owner) {
+          if (o.kind == OBJ_THREAD && o.tid == owner_tid) {
             owner_alive = o.alive.load(std::memory_order_acquire) ? 1 : 0;
             start = o.start_routine;
             arg = o.start_arg;
@@ -4825,8 +4935,8 @@ int TRT_STDCALL trt_EnterCriticalSection(void* cs) {
                "sync: EnterCriticalSection cs=%p STALL >3s owner_tid=%u "
                "owner_thread_alive=%u owner_routine=%p owner_arg=%p "
                "recursion=%u self_tid=%u\n",
-               cs, c->owner, owner_alive, start, (void*)(uintptr_t)arg,
-               c->recursion, current_tid());
+               cs, owner_tid, owner_alive, start, (void*)(uintptr_t)arg,
+               __atomic_load_n(f.recursion, __ATOMIC_RELAXED), current_tid());
 #if defined(__linux__)
       ssize_t wrc = ::write(2, line, strlen(line));
       (void)wrc;
@@ -4856,15 +4966,18 @@ int TRT_STDCALL trt_EnterCriticalSection(void* cs) {
 
 int TRT_STDCALL trt_LeaveCriticalSection(void* cs) {
   if (!cs) return 0;
-  crit_section* c = (crit_section*)cs;
-  if (c->recursion > 1) {
-    --c->recursion;
+  cs_fields f = cs_of(cs);
+  const u32 rec = __atomic_load_n(f.recursion, __ATOMIC_RELAXED);
+  if (rec > 1) {
+    __atomic_store_n(f.recursion, rec - 1, __ATOMIC_RELAXED);
     return 1;
   }
-  c->recursion = 0;
-  __atomic_store_n(&c->owner, 0u, __ATOMIC_RELAXED);
-  __atomic_store_n(&c->locked, 0u, __ATOMIC_RELEASE);
-  trt_WakeByAddressSingle(&c->locked);  // wake one blocked waiter
+  __atomic_store_n(f.recursion, 0u, __ATOMIC_RELAXED);
+  cs_owner_store(f, 0u);
+  // Windows' unowned marker is -1; waiters compare against the held value 1,
+  // so any change wakes them.
+  __atomic_store_n(f.lock_count, 0xFFFFFFFFu, __ATOMIC_RELEASE);
+  trt_WakeByAddressSingle(f.lock_count);  // wake one blocked waiter
   return 1;
 }
 
@@ -5104,7 +5217,39 @@ int TRT_STDCALL trt_GetOverlappedResult(void* h, void* ovl, u32* bytes,
   return trt_GetOverlappedResultEx(h, ovl, bytes, wait ? 0xFFFFFFFFu : 0u, 0);
 }
 
-// --- Uncapped generation-safe Win32 TLS ---
+// --- Guest Win32 TLS ---
+#if defined(_WIN32)
+u32 TRT_STDCALL trt_TlsAlloc(void) {
+  const DWORD index = ::TlsAlloc();
+  if (index == TLS_OUT_OF_INDEXES) {
+    trt_SetLastError((u32)::GetLastError());
+    return 0xFFFFFFFFu;
+  }
+  return (u32)index;
+}
+
+void* TRT_STDCALL trt_TlsGetValue(u32 index) {
+  void* value = ::TlsGetValue((DWORD)index);
+  trt_SetLastError((u32)::GetLastError());
+  return value;
+}
+
+int TRT_STDCALL trt_TlsSetValue(u32 index, void* value) {
+  if (!::TlsSetValue((DWORD)index, value)) {
+    trt_SetLastError((u32)::GetLastError());
+    return 0;
+  }
+  return 1;
+}
+
+int TRT_STDCALL trt_TlsFree(u32 index) {
+  if (!::TlsFree((DWORD)index)) {
+    trt_SetLastError((u32)::GetLastError());
+    return 0;
+  }
+  return 1;
+}
+#else
 u32 TRT_STDCALL trt_TlsAlloc(void) {
   std::lock_guard<std::mutex> lk(g_tls_mu);
   for (u32 i = 0; i < g_tls_used.size(); ++i) {
@@ -5136,6 +5281,19 @@ void* TRT_STDCALL trt_TlsGetValue(u32 index) {
     gen = g_tls_gen[index];
   }
   trt_SetLastError(0);
+  if (index < 64) {
+    u8* teb = (u8*)trt_guest_teb_acquire(nullptr);
+    if (teb) {
+      void* val = *(void**)(teb + 0x1480 + (size_t)index * 8);
+      if (val) return val;
+    }
+  } else if (index < 1088) {
+    u8* teb = (u8*)trt_guest_teb_acquire(nullptr);
+    if (teb) {
+      void** exp = *(void***)(teb + 0x1780);
+      if (exp && exp[index - 64]) return exp[index - 64];
+    }
+  }
   if (index >= t_tls_vals.size()) return nullptr;
   if (t_tls_vals[index].first != gen) return nullptr;
   return t_tls_vals[index].second;
@@ -5155,6 +5313,22 @@ int TRT_STDCALL trt_TlsSetValue(u32 index, void* value) {
     t_tls_vals.resize((size_t)index + 1u, std::make_pair(0u, nullptr));
   }
   t_tls_vals[index] = std::make_pair(gen, value);
+  if (index < 64) {
+    u8* teb = (u8*)trt_guest_teb_acquire(nullptr);
+    if (teb) {
+      *(void**)(teb + 0x1480 + (size_t)index * 8) = value;
+    }
+  } else if (index < 1088) {
+    u8* teb = (u8*)trt_guest_teb_acquire(nullptr);
+    if (teb) {
+      void** exp = *(void***)(teb + 0x1780);
+      if (!exp) {
+        exp = (void**)calloc(1024, sizeof(void*));
+        *(void***)(teb + 0x1780) = exp;
+      }
+      if (exp) exp[index - 64] = value;
+    }
+  }
   return 1;
 }
 
@@ -5167,8 +5341,20 @@ int TRT_STDCALL trt_TlsFree(u32 index) {
   g_tls_used[index] = false;
   ++g_tls_gen[index];
   if (g_tls_gen[index] == 0) g_tls_gen[index] = 1;
+  if (index < 64) {
+    u8* teb = (u8*)trt_guest_teb_acquire(nullptr);
+    if (teb) *(void**)(teb + 0x1480 + (size_t)index * 8) = nullptr;
+  } else if (index < 1088) {
+    u8* teb = (u8*)trt_guest_teb_acquire(nullptr);
+    if (teb) {
+      void** exp = *(void***)(teb + 0x1780);
+      if (exp) exp[index - 64] = nullptr;
+    }
+  }
   return 1;
 }
+
+#endif
 
 // Close a synchronisation/thread/IOCP object
 int TRT_STDCALL trt_sync_close(u64 handle) {

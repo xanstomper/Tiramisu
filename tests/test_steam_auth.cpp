@@ -178,6 +178,68 @@ int main() {
           "escaped backslashes in a VDF path decode once");
   }
 
+  printf("steam_library: split game depots\n");
+  {
+    const std::string vdf = R"vdf(
+      "1000" {
+        "config" { "launch" {
+          "0" { "executable" "Game.exe" "config" { "oslist" "linux" } }
+          "1" { "executable" "Bin\\Game.exe" "workingdir" "." "arguments" "-boot"
+                "type" "default" "config" { "oslist" "windows" "osarch" "64" } }
+        } }
+        "depots" {
+          "1002" { "config" { "oslist" "windows" "osarch" "64" }
+                   "manifests" { "public" { "gid" "22" "size" "100" } } }
+          "1001" { "manifests" { "public" { "gid" "11" "size" "800" } } }
+          "1003" { "config" { "language" "english" } "depotfromapp" "900" }
+          "1004" { "config" { "oslist" "linux" } "manifests" { "public" "44" } }
+          "1005" { "config" { "osarch" "32" } "manifests" { "public" "55" } }
+          "1006" { "config" { "language" "french" } "manifests" { "public" "66" } }
+          "1007" { "dlcappid" "2000" "manifests" { "public" "77" } }
+          "228980" { "manifests" { "public" "88" } }
+        }
+      })vdf";
+    trt_steam_app_content content;
+    const bool parsed = trt_steam_parse_app_content(std::string("\x01\0", 2) + vdf, &content);
+    CHECK(parsed && content.depots.size() == 4 &&
+              content.depots[0].id == 1001 && content.depots[1].id == 1002,
+          "base assets and Windows executables are both selected in overlay order");
+    CHECK(parsed && content.depots.size() == 4 &&
+              content.depots[2].source_app == 900 && content.depots[2].manifest == 0 &&
+              content.depots[3].optional_dlc,
+          "shared and optional DLC depots retain their source and license status");
+    CHECK(content.executable == "Bin\\Game.exe" && content.working_dir == "." &&
+              content.arguments == "-boot",
+          "Windows launch entry carries the exe, working directory, and arguments");
+
+    trt_steam_depot shared;
+    CHECK(trt_steam_find_public_depot(
+              R"("depots" { "1003" { "manifests" { "public" "33" } } })", 1003, &shared) &&
+              shared.manifest == 33,
+          "shared depot looks up its public manifest from the source app");
+
+    trt_steam_depot_layout layout;
+    CHECK(trt_steam_add_depot_path(layout, "Content\\Assets.pak", {0, 0, false}) &&
+              trt_steam_add_depot_path(layout, "Bin\\Game.exe", {1, 0, false}) &&
+              trt_steam_add_depot_path(layout, "content\\ASSETS.pak", {2, 0, false}) &&
+              trt_steam_validate_depot_layout(layout, nullptr) &&
+              layout.size() == 2 && layout.at("bin\\game.exe").depot == 1 &&
+              layout.at("content\\assets.pak").depot == 2,
+          "the merged install keeps the executable and resolves an asset overlay once");
+    CHECK(!trt_steam_add_depot_path(layout, "Bin\\Game.exe", {0, 1, true}),
+          "a depot cannot convert an existing file into a directory");
+    trt_steam_add_depot_path(layout, "Bin\\Game.exe\\bad", {2, 1, false});
+    std::string conflict;
+    CHECK(!trt_steam_validate_depot_layout(layout, &conflict) && conflict == "bin\\game.exe",
+          "a merged file cannot also be a parent directory");
+
+    std::string path;
+    CHECK(trt_steam_normalize_content_path("./Bin/Game.exe", &path) && path == "Bin\\Game.exe" &&
+              !trt_steam_normalize_content_path("Bin/../Game.exe", &path) &&
+              !trt_steam_normalize_content_path("C:/Game.exe", &path),
+          "Windows depot paths normalize beneath the game root");
+  }
+
   printf("steam_library: appmanifest parsing\n");
   {
     trt_steam_app app;

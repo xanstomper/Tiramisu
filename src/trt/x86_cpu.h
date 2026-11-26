@@ -57,6 +57,45 @@ struct x86_regs {
 #define X86_DF  (1 << 10)  // Direction
 #define X86_OF  (1 << 11)  // Overflow
 
+// Intel condition codes are shared by Jcc, SETcc and CMOVcc.
+static inline bool x86_condition(uint32_t flags, unsigned code) {
+    const bool carry = (flags & X86_CF) != 0;
+    const bool parity = (flags & X86_PF) != 0;
+    const bool zero = (flags & X86_ZF) != 0;
+    const bool sign = (flags & X86_SF) != 0;
+    const bool overflow = (flags & X86_OF) != 0;
+    switch (code) {
+        case 0: return overflow;
+        case 1: return !overflow;
+        case 2: return carry;
+        case 3: return !carry;
+        case 4: return zero;
+        case 5: return !zero;
+        case 6: return carry || zero;
+        case 7: return !carry && !zero;
+        case 8: return sign;
+        case 9: return !sign;
+        case 10: return parity;
+        case 11: return !parity;
+        case 12: return sign != overflow;
+        case 13: return sign == overflow;
+        case 14: return zero || sign != overflow;
+        case 15: return !zero && sign == overflow;
+        default: return false;
+    }
+}
+
+enum x86_execution_status {
+    X86_EXEC_OK = 0,
+    X86_EXEC_MEMORY = 1,
+    X86_EXEC_BAD_INSTRUCTION = 2,
+    X86_EXEC_UNHANDLED_TRAP = 3,
+    X86_EXEC_JIT_FAILURE = 4,
+    X86_EXEC_ACCESS_VIOLATION = 5,
+    X86_EXEC_INSTRUCTION_LIMIT = 6,
+    X86_EXEC_GUEST_ERROR = 7,
+};
+
 // ---- Memory model ----
 // Flat 4GB guest address space backed by ONE contiguous host reservation, so a
 // guest VA is directly usable as a host pointer by the 64-bit bridges. Pages
@@ -87,8 +126,8 @@ struct x86_context {
     uint32_t entry_rva;
     // Is the CPU running?
     int running;
-    // Last error
-    int last_error;
+    int last_error;                  // guest Win32 GetLastError value
+    x86_execution_status execution;  // interpreter run result
     // Instruction count (for debugging/timeouts)
     uint64_t insn_count;
     // Max instructions before forced stop
@@ -107,7 +146,11 @@ struct x86_context {
     void* jit_cache;          // jit_cache* (owned by x86_jit.cpp)
     // Sentinel address for guest->guest calls made by the SEH dispatcher.
     uint32_t seh_sentinel;
+    uint32_t command_line_a;  // guest VA, initialized on first query
+    uint32_t command_line_w;
 };
+
+void x86_halt(x86_context* ctx, uint32_t address);
 
 // Called by guest stores that land in a page holding recompiled code.
 void x86_jit_note_write(x86_context* ctx, uint32_t addr);
@@ -150,7 +193,7 @@ static inline int x86_span_mapped(x86_context* ctx, uint32_t addr, uint32_t n) {
 int x86_mem_commit(x86_context* ctx, uint32_t base, size_t size);
 
 static inline uint8_t x86_mem_read8(x86_context* ctx, uint32_t addr) {
-    if (!ctx->mem.base) { ctx->last_error = 1; return 0; }
+    if (!ctx->mem.base) { ctx->execution = X86_EXEC_MEMORY; return 0; }
     uint32_t page = addr >> X86_PAGE_SHIFT;
     if (!x86_page_mapped(ctx, page)) {
         // Demand-page: commit the page on first touch, like Windows does inside
@@ -158,7 +201,7 @@ static inline uint8_t x86_mem_read8(x86_context* ctx, uint32_t addr) {
         // believes exists (large static arrays, .bss overflow) from faulting
         // inside the emulator while still failing for truly out-of-range VAs.
         if (x86_mem_commit(ctx, page << X86_PAGE_SHIFT, X86_PAGE_SIZE) != 0) {
-            ctx->last_error = 1; // page fault
+            ctx->execution = X86_EXEC_MEMORY; // page fault
             return 0;
         }
     }
@@ -202,11 +245,11 @@ static inline void x86_note_code_write(x86_context* ctx, uint32_t addr) {
 }
 
 static inline void x86_mem_write8(x86_context* ctx, uint32_t addr, uint8_t val) {
-    if (!ctx->mem.base) { ctx->last_error = 1; return; }
+    if (!ctx->mem.base) { ctx->execution = X86_EXEC_MEMORY; return; }
     uint32_t page = addr >> X86_PAGE_SHIFT;
     if (!x86_page_mapped(ctx, page)) {
         if (x86_mem_commit(ctx, page << X86_PAGE_SHIFT, X86_PAGE_SIZE) != 0) {
-            ctx->last_error = 1;
+            ctx->execution = X86_EXEC_MEMORY;
             return;
         }
     }

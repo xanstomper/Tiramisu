@@ -13,6 +13,7 @@
 #include "../src/trt/trt.h"
 #include "../src/trt/pe.h"
 #include "../src/trt/input.h"
+#include "../src/trt/images.h"
 #include "../src/trt/bridge_audio.h"
 #include "../src/trt/bridge_console_pack.h"
 #include "../src/trt/bridge_ole.h"
@@ -24,6 +25,7 @@
 
 extern "C" {
 u32 TRT_STDCALL trt_GetLastError(void);
+void* TRT_STDCALL trt_GetProcAddress(void*, const char*);
 int trt_bridge_register_user32(void);
 int trt_bridge_register_gdi(void);
 }
@@ -170,6 +172,14 @@ int main() {
           "XInputGetState(0) reads live pad state");
     CHECK(fn_ord2 == fn_name && fn_ord100 != nullptr,
           "XInput ordinals #2 and #100 resolve");
+    void* module = trt_images_synthetic_handle("xinput1_3.dll");
+    auto dynamic_state = reinterpret_cast<XInputGetState_t>(
+        trt_GetProcAddress(module, reinterpret_cast<const char*>(uintptr_t{100})));
+    xinput_state dynamic_sample{};
+    CHECK(dynamic_state == fn_ord100 && dynamic_state &&
+              dynamic_state(0, &dynamic_sample) == 0 &&
+              dynamic_sample.buttons == 0x1000 && dynamic_sample.lx == 12345,
+          "GetProcAddress ordinal #100 reaches live controller input");
     CHECK(fn_name(1, &st) == 1167u,
           "XInputGetState(1) returns ERROR_DEVICE_NOT_CONNECTED (1167)");
   }

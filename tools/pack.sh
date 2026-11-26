@@ -72,6 +72,7 @@ find "$out/layout/Assets" -type d -empty -delete
 cert_normalize() {
   local s="$1"
   s="${s#subject=}"
+  s="${s#/}"
   s="${s//ST=/S=}"
   s="${s// /}"
   printf '%s' "$s"
@@ -79,7 +80,7 @@ cert_normalize() {
 cert_matches() {
   local prefix="$1" want
   want="$(cert_normalize "$2")"
-  [[ -f "$prefix.pem" ]] || return 1
+  [[ -f "$prefix.pem" && -f "$prefix.pfx" && -f "$prefix.cer" ]] || return 1
   local got
   got="$(openssl x509 -in "$prefix.pem" -noout -subject -nameopt RFC2253 2>/dev/null)"
   got="$(cert_normalize "$got")"

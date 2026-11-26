@@ -9,6 +9,7 @@
 #include "apiset.h"
 #include "trt.h"
 #include "images.h"
+#include "pe.h"
 #include "pe_exports.h"
 #include "dynamic_api.h"
 
@@ -22,8 +23,8 @@
 #define strncasecmp _strnicmp
 #endif
 
-// Forward declaration (defined in bridge_kernel32.cpp): used by the
-// TRT_X86_TRACE debug line in x86_call_fn below.
+extern "C" const char* TRT_STDCALL trt_GetCommandLineA(void);
+extern "C" const u16* TRT_STDCALL trt_GetCommandLineW(void);
 
 // Registry of bridge functions: maps (module, symbol) -> function pointer
 struct bridge_entry {
@@ -143,6 +144,15 @@ static int lookup_arg_count(const char* module, const char* symbol) {
     if (module && (strcasecmp(module, "winmmbase") == 0 ||
                    strcasecmp(module, "winmmbase.dll") == 0))
         module = "winmm";
+    // api-ms-win-core-version-l1-1-* is the api-set alias of version.dll;
+    // give it the same arity answers (bridge_version registers all three).
+    if (module && strncasecmp(module, "api-ms-win-core-version", 23) == 0)
+        module = "version";
+    // kernelbase is the implementation module behind kernel32; the arity
+    // table is keyed on kernel32, so consult it for kernelbase too.
+    if (module && (strcasecmp(module, "kernelbase") == 0 ||
+                   strcasecmp(module, "kernelbase.dll") == 0))
+        module = "kernel32";
 
     // ---- General table (module, symbol, stdcall arg count) ----
     struct arg_ent { const char* mod; const char* sym; int n; };
@@ -198,7 +208,8 @@ static int lookup_arg_count(const char* module, const char* symbol) {
         // Fiber-local storage has the same shape as TLS. Without these the
         // 4-arg default shifted the guest stack 8 bytes on every FlsSetValue.
         {"kernel32","FlsAlloc",1},{"kernel32","FlsFree",1},
-        {"kernel32","FlsGetValue",1},{"kernel32","FlsSetValue",2},
+        {"kernel32","FlsGetValue",1},{"kernel32","FlsGetValue2",1},
+        {"kernel32","FlsSetValue",2},
         {"kernel32","lstrlenA",1},{"kernel32","lstrlenW",1},
         {"kernel32","lstrcpyA",2},{"kernel32","lstrcpyW",2},
         {"kernel32","MultiByteToWideChar",6},{"kernel32","WideCharToMultiByte",8},
@@ -263,7 +274,19 @@ static int lookup_arg_count(const char* module, const char* symbol) {
         {"kernel32","RaiseException",4},{"kernel32","UnhandledExceptionFilter",1},
         {"kernel32","SetUnhandledExceptionFilter",1},{"kernel32","TerminateProcess",2},
         {"kernel32","RtlMoveMemory",3},{"kernel32","RtlZeroMemory",2},
-        {"kernel32","RtlFillMemory",3},{"kernel32","CreateFileMappingA",6},
+        {"kernel32","RtlFillMemory",3},
+        // ntdll: the Rtl* primitives bridge_ntdll registers under the ntdll
+        // name (Bun/WebKit startup futexes and JIT unwind tables). api-set
+        // imports forward here, and the trap binds the resolved name, so the
+        // arity answer must be keyed on ntdll or a PE32 title guesses.
+        {"ntdll","RtlWaitOnAddress",4},
+        {"ntdll","RtlWakeAddressSingle",1},
+        {"ntdll","RtlWakeAddressAll",1},
+        {"ntdll","RtlAddGrowableFunctionTable",6},
+        {"ntdll","RtlDeleteGrowableFunctionTable",1},
+        {"ntdll","RtlGrowFunctionTable",2},
+        {"ntdll","RtlCaptureStackBackTrace",4},
+        {"kernel32","CreateFileMappingA",6},
         {"kernel32","CreateFileMappingW",6},{"kernel32","MapViewOfFile",5},
         {"kernel32","UnmapViewOfFile",1},{"kernel32","FlushViewOfFile",2},
         {"kernel32","OpenFileMappingA",3},{"kernel32","FindFirstFileA",2},
@@ -341,6 +364,93 @@ static int lookup_arg_count(const char* module, const char* symbol) {
         {"gdi32","GetDeviceCaps",2},{"gdi32","SetPixel",4},
         {"gdi32","GetPixel",3},{"gdi32","Rectangle",5},
         {"gdi32","FillRect",3},{"gdi32","GetObjectA",3},
+        {"gdi32","SetDCBrushColor",2},{"gdi32","SetDCPenColor",2},
+        {"gdi32","Arc",9},{"gdi32","Pie",9},{"gdi32","Chord",9},
+        // GDI paths: recording, replay and clip selection
+        {"gdi32","BeginPath",1},{"gdi32","EndPath",1},{"gdi32","AbortPath",1},
+        {"gdi32","CloseFigure",1},{"gdi32","GetPath",4},
+        {"gdi32","FlattenPath",1},{"gdi32","WidenPath",1},
+        {"gdi32","StrokePath",1},{"gdi32","FillPath",1},
+        {"gdi32","StrokeAndFillPath",1},{"gdi32","SelectClipPath",2},
+        {"gdi32","SetPolyFillMode",2},{"gdi32","GetPolyFillMode",1},
+        {"gdi32","PathToRegion",1},{"gdi32","PolylineTo",3},
+        {"gdi32","PolyBezier",3},{"gdi32","PolyBezierTo",3},
+        // gdiplus: the GDI+ 2D flat API renders on the DC surface
+        {"gdiplus","GdiplusStartup",3},{"gdiplus","GdiplusShutdown",1},
+        {"gdiplus","GdipAlloc",1},{"gdiplus","GdipFree",1},
+        {"gdiplus","GdipCreateFromHDC",2},{"gdiplus","GdipCreateFromHDCEx",6},
+        {"gdiplus","GdipCreateFromHWND",2},{"gdiplus","GdipDeleteGraphics",1},
+        {"gdiplus","GdipGetDC",2},{"gdiplus","GdipReleaseDC",2},
+        {"gdiplus","GdipGetDpiX",2},{"gdiplus","GdipGetDpiY",2},
+        {"gdiplus","GdipTranslateTransform",4},
+        {"gdiplus","GdipResetTransform",1},{"gdiplus","GdipScaleTransform",4},
+        {"gdiplus","GdipRotateTransform",3},{"gdiplus","GdipSetPageUnit",2},
+        // GDI+ matrices and the world transform
+        {"gdiplus","GdipCreateMatrix",1},{"gdiplus","GdipCreateMatrix2",7},
+        {"gdiplus","GdipCloneMatrix",2},{"gdiplus","GdipDeleteMatrix",1},
+        {"gdiplus","GdipSetMatrixElements",7},{"gdiplus","GdipGetMatrixElements",2},
+        {"gdiplus","GdipMultiplyMatrix",3},{"gdiplus","GdipTranslateMatrix",4},
+        {"gdiplus","GdipScaleMatrix",4},{"gdiplus","GdipRotateMatrix",3},
+        {"gdiplus","GdipInvertMatrix",1},{"gdiplus","GdipTransformMatrixPoints",3},
+        {"gdiplus","GdipSetWorldTransform",2},{"gdiplus","GdipGetWorldTransform",2},
+        {"gdiplus","GdipGetMatrixLastStatus",1},{"gdiplus","GdipTransformPoints",5},
+        {"gdiplus","GdipSetSmoothingMode",2},
+        {"gdiplus","GdipSetInterpolationMode",2},
+        {"gdiplus","GdipSetPixelOffsetMode",2},
+        {"gdiplus","GdipSetCompositingMode",2},
+        {"gdiplus","GdipSetCompositingQuality",2},
+        {"gdiplus","GdipSetTextRenderingHint",2},
+        {"gdiplus","GdipCreateSolidFill",2},
+        {"gdiplus","GdipSetSolidFillColor",2},
+        {"gdiplus","GdipGetSolidFillColor",2},{"gdiplus","GdipDeleteBrush",1},
+        {"gdiplus","GdipCloneBrush",2},{"gdiplus","GdipCreatePen1",4},
+        {"gdiplus","GdipCreatePen2",4},{"gdiplus","GdipDeletePen",1},
+        {"gdiplus","GdipSetPenColor",2},{"gdiplus","GdipSetPenWidth",2},
+        {"gdiplus","GdipSetPenEndCap",2},{"gdiplus","GdipSetPenStartCap",2},
+        {"gdiplus","GdipSetPenLineJoin",2},
+        {"gdiplus","GdipSetPenDashStyle",2},
+        {"gdiplus","GdipSetPenLineCap197819",4},
+        {"gdiplus","GdipFillRectangleI",6},{"gdiplus","GdipFillRectangle",6},
+        {"gdiplus","GdipFillRectanglesI",4},
+        {"gdiplus","GdipDrawRectangleI",6},{"gdiplus","GdipDrawRectangle",6},
+        {"gdiplus","GdipDrawLineI",6},{"gdiplus","GdipDrawLine",6},
+        {"gdiplus","GdipDrawLinesI",4},{"gdiplus","GdipDrawLines",4},
+        {"gdiplus","GdipFillEllipseI",6},{"gdiplus","GdipFillEllipse",6},
+        {"gdiplus","GdipDrawEllipseI",6},{"gdiplus","GdipDrawEllipse",6},
+        {"gdiplus","GdipFillPolygonI",5},{"gdiplus","GdipDrawPolygonI",4},
+        {"gdiplus","GdipDrawArcI",8},{"gdiplus","GdipDrawPieI",8},
+        {"gdiplus","GdipCreatePath",2},{"gdiplus","GdipDeletePath",1},
+        {"gdiplus","GdipResetPath",1},{"gdiplus","GdipAddPathRectangle",5},
+        {"gdiplus","GdipAddPathEllipse",5},{"gdiplus","GdipAddPathLine",5},
+        {"gdiplus","GdipAddPathLine2",3},{"gdiplus","GdipAddPathLines",3},
+        {"gdiplus","GdipAddPathArc",7},{"gdiplus","GdipAddPathPolygon",3},
+        {"gdiplus","GdipAddPathPolygonI",3},{"gdiplus","GdipStartFigure",1},
+        {"gdiplus","GdipClosePathFigure",1},
+        {"gdiplus","GdipClosePathFigures",1},{"gdiplus","GdipFillPath",3},
+        {"gdiplus","GdipDrawPath",3},
+        {"gdiplus","GdipCreateBitmapFromScan0",6},
+        {"gdiplus","GdipCloneImage",2},{"gdiplus","GdipDisposeImage",1},
+        {"gdiplus","GdipGetImageWidth",2},{"gdiplus","GdipGetImageHeight",2},
+        {"gdiplus","GdipBitmapGetPixel",4},{"gdiplus","GdipBitmapSetPixel",4},
+        {"gdiplus","GdipBitmapLockBits",5},
+        {"gdiplus","GdipBitmapUnlockBits",2},{"gdiplus","GdipDrawImageI",4},
+        {"gdiplus","GdipDrawImage",4},{"gdiplus","GdipDrawImageRectI",6},
+        {"gdiplus","GdipDrawImageRect",6},
+        {"gdiplus","GdipDrawImageRectRectI",14},
+        {"gdiplus","GdipDrawImageRectRect",14},
+        {"gdiplus","GdipCreateImageAttributes",1},
+        {"gdiplus","GdipDisposeImageAttributes",1},
+        {"gdiplus","GdipSetImageAttributesWrapMode",4},
+        {"gdiplus","GdipCreateFontFamilyFromName",3},
+        {"gdiplus","GdipDeleteFontFamily",1},{"gdiplus","GdipCreateFont",5},
+        {"gdiplus","GdipDeleteFont",1},{"gdiplus","GdipGetFontSize",2},
+        {"gdiplus","GdipCreateStringFormat",3},
+        {"gdiplus","GdipDeleteStringFormat",1},
+        {"gdiplus","GdipSetStringFormatAlign",2},
+        {"gdiplus","GdipDrawString",7},{"gdiplus","GdipMeasureString",9},
+        // msimg32: blended / transparent / gradient composites
+        {"msimg32","AlphaBlend",11},{"msimg32","TransparentBlt",11},
+        {"msimg32","GradientFill",6},
         // advapi32
         {"advapi32","RegOpenKeyExA",5},{"advapi32","RegOpenKeyExW",5},
         {"advapi32","RegQueryValueExA",6},{"advapi32","RegQueryValueExW",6},
@@ -355,7 +465,8 @@ static int lookup_arg_count(const char* module, const char* symbol) {
         {"ole32","CoTaskMemAlloc",1},{"ole32","CoTaskMemFree",1},
         {"oleaut32","SysAllocString",1},{"oleaut32","SysFreeString",1},
         {"oleaut32","SysStringLen",1},{"oleaut32","VariantInit",1},
-        {"oleaut32","VariantClear",1},
+        {"oleaut32","VariantClear",1},{"oleaut32","#148",3},
+        {"oleaut32","SafeArrayPtrOfIndex",3},
         // shell32 / shlwapi / comctl32
         {"shell32","SHGetFolderPathA",5},{"shell32","SHGetFolderPathW",5},
         {"shell32","SHGetKnownFolderPath",4},{"shell32","ShellExecuteA",6},
@@ -377,7 +488,22 @@ static int lookup_arg_count(const char* module, const char* symbol) {
         {"crypt32","CryptAcquireContextA",5},{"crypt32","CryptReleaseContext",2},
         {"crypt32","CryptGenRandom",3},
         {"psapi","EnumProcesses",3},{"psapi","GetProcessMemoryInfo",3},
-        {"version","GetFileVersionInfoSizeA",2},{"version","GetFileVersionInfoA",4},
+        {"psapi","GetModuleBaseNameA",4},{"psapi","GetModuleBaseNameW",4},
+        {"psapi","GetModuleInformation",4},{"psapi","K32GetModuleInformation",4},
+        {"version","GetFileVersionInfoSizeA",2},{"version","GetFileVersionInfoSizeW",2},
+        {"version","GetFileVersionInfoSizeExA",3},{"version","GetFileVersionInfoSizeExW",3},
+        {"version","GetFileVersionInfoA",4},{"version","GetFileVersionInfoW",4},
+        {"version","GetFileVersionInfoExA",5},{"version","GetFileVersionInfoExW",5},
+        {"version","VerQueryValueA",4},{"version","VerQueryValueW",4},
+        {"version","VerLanguageNameA",2},{"version","VerLanguageNameW",2},
+        // activation contexts (kernelbase forwards to kernel32)
+        {"kernel32","CreateActCtxA",1},{"kernel32","CreateActCtxW",1},
+        {"kernel32","AddRefActCtx",1},{"kernel32","ReleaseActCtx",1},
+        {"kernel32","ActivateActCtx",2},{"kernel32","DeactivateActCtx",2},
+        {"kernel32","GetCurrentActCtx",1},{"kernel32","ZombifyActCtx",1},
+        {"kernel32","QueryActCtxW",7},{"kernel32","QueryActCtxSettingsW",7},
+        {"kernel32","FindActCtxSectionStringA",5},{"kernel32","FindActCtxSectionStringW",5},
+        {"kernel32","FindActCtxSectionGuid",5},
         // msvcrt / ucrtbase
         {"msvcrt","printf",0},{"msvcrt","sprintf",0},{"msvcrt","snprintf",0},
         {"msvcrt","malloc",1},{"msvcrt","calloc",2},{"msvcrt","realloc",2},
@@ -404,9 +530,43 @@ static int lookup_arg_count(const char* module, const char* symbol) {
         {"steam_api","SteamAPI_Init",0},{"steam_api","SteamAPI_Shutdown",0},
         {"steam_api","SteamAPI_RunCallbacks",0},
         {"steam_api","SteamAPI_ISteamUserStats_RequestCurrentStats",1},
+        {"steam_api","SteamAPI_GetSteamInstallPath",0},
+        {"steam_api","SteamAPI_InitSafe",0},
+        {"steam_api","SteamAPI_SetBreakpadAppID",1},
+        {"steam_api","SteamAPI_SetMiniDumpComment",1},
+        {"steam_api","SteamAPI_SetTryCatchCallbacks",1},
+        {"steam_api","SteamAPI_UseBreakpadCrashHandler",1},
+        {"steam_api","SteamAPI_WriteMiniDump",1},
+        {"steam_api","SteamGameServer_BSecure",0},
+        {"steam_api","SteamGameServer_GetHSteamPipe",0},
+        {"steam_api","SteamGameServer_GetHSteamUser",0},
+        {"steam_api","SteamGameServer_GetSteamID",0},
+        {"steam_api","SteamGameServer_InitSafe",0},
+        {"steam_api","SteamGameServer_RunCallbacks",0},
+        {"steam_api","SteamGameServer_Shutdown",0},
+        {"steam_api","Steam_GetHSteamUserCurrent",0},
+        {"steam_api","Steam_RegisterInterfaceFuncs",2},
+        {"steam_api","Steam_RunCallbacks",0},
         {"steam_api64","SteamAPI_Init",0},{"steam_api64","SteamAPI_Shutdown",0},
         {"steam_api64","SteamAPI_RunCallbacks",0},
         {"steam_api64","SteamAPI_ISteamUserStats_RequestCurrentStats",1},
+        {"steam_api64","SteamAPI_GetSteamInstallPath",0},
+        {"steam_api64","SteamAPI_InitSafe",0},
+        {"steam_api64","SteamAPI_SetBreakpadAppID",1},
+        {"steam_api64","SteamAPI_SetMiniDumpComment",1},
+        {"steam_api64","SteamAPI_SetTryCatchCallbacks",1},
+        {"steam_api64","SteamAPI_UseBreakpadCrashHandler",1},
+        {"steam_api64","SteamAPI_WriteMiniDump",1},
+        {"steam_api64","SteamGameServer_BSecure",0},
+        {"steam_api64","SteamGameServer_GetHSteamPipe",0},
+        {"steam_api64","SteamGameServer_GetHSteamUser",0},
+        {"steam_api64","SteamGameServer_GetSteamID",0},
+        {"steam_api64","SteamGameServer_InitSafe",0},
+        {"steam_api64","SteamGameServer_RunCallbacks",0},
+        {"steam_api64","SteamGameServer_Shutdown",0},
+        {"steam_api64","Steam_GetHSteamUserCurrent",0},
+        {"steam_api64","Steam_RegisterInterfaceFuncs",2},
+        {"steam_api64","Steam_RunCallbacks",0},
         {"ws2_32","WSAIoctl",9},
         {"ws2_32","getnameinfo",7},
         {"ws2_32","freeaddrinfo",1},
@@ -754,7 +914,32 @@ static int lookup_arg_count(const char* module, const char* symbol) {
         if (strcmp(symbol, "StretchBlt") == 0) return 11;
         if (strcmp(symbol, "GetStockObject") == 0) return 1;
         if (strcmp(symbol, "SetBkMode") == 0) return 2;
+        if (strcmp(symbol, "GetBkMode") == 0) return 1;
         if (strcmp(symbol, "SetTextColor") == 0) return 2;
+        if (strcmp(symbol, "SetBkColor") == 0) return 2;
+        if (strcmp(symbol, "SetTextAlign") == 0) return 2;
+        if (strcmp(symbol, "GetTextAlign") == 0) return 1;
+        if (strcmp(symbol, "GetCurrentObject") == 0) return 2;
+        if (strcmp(symbol, "GetTextExtentPointA") == 0) return 4;
+        if (strcmp(symbol, "GetTextExtentPointW") == 0) return 4;
+        if (strcmp(symbol, "GetTextExtentExPointA") == 0) return 7;
+        if (strcmp(symbol, "GetTextExtentExPointW") == 0) return 7;
+        if (strcmp(symbol, "GetCharWidth32A") == 0) return 4;
+        if (strcmp(symbol, "GetCharWidth32W") == 0) return 4;
+        if (strcmp(symbol, "GetCharWidthA") == 0) return 4;
+        if (strcmp(symbol, "GetCharWidthW") == 0) return 4;
+        if (strcmp(symbol, "GetCharABCWidthsFloatA") == 0) return 4;
+        if (strcmp(symbol, "GetCharABCWidthsFloatW") == 0) return 4;
+        if (strcmp(symbol, "GetCharacterPlacementW") == 0) return 5;
+        if (strcmp(symbol, "TranslateCharsetInfo") == 0) return 3;
+        if (strcmp(symbol, "IntersectClipRect") == 0) return 5;
+        if (strcmp(symbol, "ExcludeClipRect") == 0) return 5;
+        if (strcmp(symbol, "UnrealizeObject") == 0) return 1;
+        if (strcmp(symbol, "UpdateColors") == 0) return 1;
+        if (strcmp(symbol, "ExtTextOutA") == 0) return 8;
+        if (strcmp(symbol, "GetOutlineTextMetricsA") == 0) return 3;
+        if (strcmp(symbol, "SetDCBrushColor") == 0) return 2;
+        if (strcmp(symbol, "SetDCPenColor") == 0) return 2;
     }
 
     // advapi32
@@ -1004,13 +1189,13 @@ static void* x86_resolve_dynamic(const char* module, const char* symbol,
     // target name, so the arg-count database finds it.
     if (const char* target = trt_apiset_target(module)) module = target;
     if (resolved_module) *resolved_module = module;
-    void* fn = trt_resolve_module(nullptr, module, symbol, (unsigned short)ordinal);
+    void* fn = trt_resolve_export(module, symbol, (unsigned short)ordinal);
     if (fn) return fn;
     if (strncasecmp(module, "api-ms-win", 10) == 0 ||
         strncasecmp(module, "ext-ms-win", 10) == 0) {
         static const char* kForwards[] = {"kernel32", "kernelbase", "ntdll", nullptr};
         for (int i = 0; kForwards[i]; i++) {
-            fn = trt_resolve_module(nullptr, kForwards[i], symbol, (unsigned short)ordinal);
+            fn = trt_resolve_export(kForwards[i], symbol, (unsigned short)ordinal);
             if (fn) {
                 if (resolved_module) *resolved_module = kForwards[i];
                 return fn;
@@ -1024,6 +1209,38 @@ static int x86_pe32_runtime(x86_context* ctx, const char* module,
                             const char* symbol, const uint32_t* args,
                             uint32_t* out) {
     if (!ctx->mem.base) return 0;  // 64-bit guest: the classic bridges apply
+
+    if (mod_eq(module, "kernel32") && sym_eq(symbol, "ExitProcess")) {
+        // An emulated guest can exit without ending the hosting UWP app.
+        ctx->running = 0;
+        if (args[0]) ctx->execution = X86_EXEC_GUEST_ERROR;
+        *out = args[0];
+        return 1;
+    }
+    if (sym_eq(symbol, "GetCommandLineA")) {
+        if (!ctx->command_line_a) {
+            const char* text = trt_GetCommandLineA();
+            const uint32_t size = static_cast<uint32_t>(strlen(text) + 1);
+            ctx->command_line_a = x86_guest_alloc(ctx, size, 0);
+            if (ctx->command_line_a)
+                memcpy(ctx->mem.base + ctx->command_line_a, text, size);
+        }
+        *out = ctx->command_line_a;
+        return 1;
+    }
+    if (sym_eq(symbol, "GetCommandLineW")) {
+        if (!ctx->command_line_w) {
+            const u16* text = trt_GetCommandLineW();
+            uint32_t length = 0;
+            while (text[length]) ++length;
+            const uint32_t size = (length + 1) * sizeof(u16);
+            ctx->command_line_w = x86_guest_alloc(ctx, size, 0);
+            if (ctx->command_line_w)
+                memcpy(ctx->mem.base + ctx->command_line_w, text, size);
+        }
+        *out = ctx->command_line_w;
+        return 1;
+    }
 
     // ---- module handles ----
     if (sym_eq(symbol, "GetModuleHandleA") || sym_eq(symbol, "GetModuleHandleW") ||
@@ -1250,6 +1467,19 @@ static int x86_pe32_runtime(x86_context* ctx, const char* module,
         } else {
             *out = 0;
         }
+        return 1;
+    }
+    if (sym_eq(symbol, "GetStartupInfoA") || sym_eq(symbol, "GetStartupInfoW")) {
+        // 32-bit STARTUPINFO has seven pointer/handle fields that would
+        // otherwise cause the Win64 bridge to overwrite the caller's stack.
+        const uint32_t info = args[0];
+        constexpr uint32_t size = 68;
+        if (info && info <= UINT32_MAX - (size - 1)) {
+            x86_mem_write32(ctx, info, size);
+            for (uint32_t offset = 4; offset < size; offset += 4)
+                x86_mem_write32(ctx, info + offset, 0);
+        }
+        *out = 0;
         return 1;
     }
     if (sym_eq(symbol, "GetSystemInfo") || sym_eq(symbol, "GetNativeSystemInfo")) {

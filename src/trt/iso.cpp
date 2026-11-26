@@ -31,6 +31,7 @@
 #else
 #  include <dirent.h>
 #  include <strings.h>
+#  include <sys/stat.h>
 #  define iso_seek(f, o) fseeko((f), (off_t)(o), SEEK_SET)
 #  define iso_tell(f) ((int64_t)ftello(f))
 #  define iso_size(f) (fseeko((f), 0, SEEK_END), (int64_t)ftello(f))
@@ -736,43 +737,170 @@ int trt_iso_extract_dir(const trt_iso* iso, const char* rel_dir,
   return n;
 }
 
-int trt_iso_find_image_in_dir(const char* host_dir, char* out, size_t out_cap) {
-  if (!host_dir || !out || out_cap < 8) return 0;
+namespace {
+
+const char k_host_sep =
 #if defined(_WIN32)
-  char pat[1024];
-  snprintf(pat, sizeof(pat), "%s\\*", host_dir);
-  WIN32_FIND_DATAA fd;
-  HANDLE h = FindFirstFileA(pat, &fd);
-  if (h == INVALID_HANDLE_VALUE) return 0;
+    '\\';
+#else
+    '/';
+#endif
+
+bool starts_with_ci(const char* s, const char* prefix) {
+  for (; *prefix; ++s, ++prefix) {
+    char a = *s, b = *prefix;
+    if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+    if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+    if (a != b) return false;
+  }
+  return true;
+}
+
+// A real mountable image, not just a file with the right extension (a truncated
+// download or a .bin that is really an audio track must be skipped, not mounted).
+bool image_mounts(const char* path) {
+  trt_iso* iso = trt_iso_open(path);
+  if (!iso) return false;
+  trt_iso_close(iso);
+  return true;
+}
+
+// A .cue sheet is a text index, not an image: the mountable file is the track
+// its first FILE statement names.
+int cue_track(const char* cue_path, char* out, size_t out_cap) {
+  FILE* f = fopen(cue_path, "r");
+  if (!f) return 0;
+  char line[512];
   int found = 0;
-  do {
-    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-    const char* dot = strrchr(fd.cFileName, '.');
-    if (!dot) continue;
-    if (_stricmp(dot, ".iso") && _stricmp(dot, ".bin") && _stricmp(dot, ".img"))
-      continue;
-    snprintf(out, out_cap, "%s\\%s", host_dir, fd.cFileName);
+  while (!found && fgets(line, sizeof(line), f)) {
+    char* p = line;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (!starts_with_ci(p, "FILE")) continue;
+    p += 4;
+    while (*p == ' ' || *p == '\t') ++p;
+    char name[420] = {};
+    if (*p == '"' || *p == '\'') {
+      const char quote = *p++;
+      const char* end = strchr(p, quote);
+      if (!end) continue;
+      const size_t n = (size_t)(end - p);
+      if (n == 0 || n >= sizeof(name)) continue;
+      memcpy(name, p, n);
+      name[n] = 0;
+    } else {
+      size_t n = 0;
+      while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') {
+        if (n + 1 < sizeof(name)) name[n++] = *p;
+        ++p;
+      }
+      name[n] = 0;
+    }
+    if (!name[0]) continue;
+    // Absolute track path (C:\... or /...): use as-is. Otherwise relative to
+    // the sheet's own folder, like every cue tool does.
+    const bool absolute = name[0] == '/' || name[0] == '\\' ||
+                          (name[1] == ':');
+    if (absolute) {
+      snprintf(out, out_cap, "%s", name);
+    } else {
+      const char* last = strrchr(cue_path, k_host_sep);
+      size_t dir_len = last ? (size_t)(last - cue_path) : 0;
+      if (dir_len >= out_cap) dir_len = out_cap - 1;
+      memcpy(out, cue_path, dir_len);
+      out[dir_len] = 0;
+      snprintf(out + dir_len, out_cap - dir_len, "%c%s", k_host_sep, name);
+    }
     found = 1;
-    break;
+  }
+  fclose(f);
+  return found;
+}
+
+bool ext_is(const char* ext, const char* want) {
+  for (; *ext && *want; ++ext, ++want) {
+    char a = *ext, b = *want;
+    if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+    if (a != b) return false;
+  }
+  return *ext == 0 && *want == 0;
+}
+
+// Rank an image candidate: a cooked .iso is preferred, then a .cue (whose track
+// is the image), then raw .bin/.img dumps. 0 = not an image name.
+int image_rank(const char* name) {
+  const char* dot = strrchr(name, '.');
+  if (!dot) return 0;
+  if (ext_is(dot, ".iso")) return 4;
+  if (ext_is(dot, ".cue")) return 3;
+  if (ext_is(dot, ".bin")) return 2;
+  if (ext_is(dot, ".img")) return 1;
+  return 0;
+}
+
+// Depth-limited search: a game that keeps its disc in `disc/` or `game data/`
+// is as common as one that keeps it beside the exe.
+int find_image_rec(const char* dir, int depth, char* out, size_t out_cap,
+                   int* best_rank) {
+  if (depth > 2) return 0;
+  std::vector<std::string> dirs;
+  std::vector<std::string> names;
+#if defined(_WIN32)
+  WIN32_FIND_DATAA fd;
+  HANDLE h = FindFirstFileA(std::string(dir).append("\\*").c_str(), &fd);
+  if (h == INVALID_HANDLE_VALUE) return 0;
+  do {
+    if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) dirs.push_back(fd.cFileName);
+    else names.push_back(fd.cFileName);
   } while (FindNextFileA(h, &fd));
   FindClose(h);
-  return found;
 #else
-  DIR* d = opendir(host_dir);
+  DIR* d = opendir(dir);
   if (!d) return 0;
-  int found = 0;
   struct dirent* de;
   while ((de = readdir(d)) != nullptr) {
-    const char* dot = strrchr(de->d_name, '.');
-    if (!dot) continue;
-    if (strcasecmp(dot, ".iso") && strcasecmp(dot, ".bin") &&
-        strcasecmp(dot, ".img"))
-      continue;
-    snprintf(out, out_cap, "%s/%s", host_dir, de->d_name);
-    found = 1;
-    break;
+    if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+    struct stat st;
+    std::string p = std::string(dir) + k_host_sep + de->d_name;
+    if (stat(p.c_str(), &st) != 0) continue;
+    if (S_ISDIR(st.st_mode)) dirs.push_back(de->d_name);
+    else names.push_back(de->d_name);
   }
   closedir(d);
-  return found;
 #endif
+  int found = 0;
+  for (const auto& n : names) {
+    const int rank = image_rank(n.c_str());
+    if (rank <= *best_rank) continue;
+    std::string p = std::string(dir) + k_host_sep + n;
+    if (rank == 3) {
+      char track[1200] = {};
+      if (!cue_track(p.c_str(), track, sizeof(track))) continue;
+      p = track;
+    }
+    if (!image_mounts(p.c_str())) continue;
+    snprintf(out, out_cap, "%s", p.c_str());
+    *best_rank = rank;
+    found = 1;
+  }
+  for (const auto& d2 : dirs) {
+    std::string p = std::string(dir) + k_host_sep + d2;
+    if (find_image_rec(p.c_str(), depth + 1, out, out_cap, best_rank)) found = 1;
+  }
+  return found;
+}
+
+}  // namespace
+
+int trt_iso_find_image_in_dir(const char* host_dir, char* out, size_t out_cap) {
+  if (!host_dir || !out || out_cap < 8) return 0;
+  int best_rank = 0;
+  out[0] = 0;
+  return find_image_rec(host_dir, 0, out, out_cap, &best_rank);
+}
+
+int trt_iso_cue_track(const char* cue_path, char* out_path, size_t out_cap) {
+  if (!cue_path || !out_path || out_cap < 8) return 0;
+  out_path[0] = 0;
+  return cue_track(cue_path, out_path, out_cap);
 }

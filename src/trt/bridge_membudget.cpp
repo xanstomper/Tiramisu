@@ -63,6 +63,7 @@ std::atomic<u64> g_va_refusals{0};
 
 std::atomic<bool> g_soft80{false};
 std::atomic<bool> g_soft90{false};
+std::atomic<u64> g_dynamic_budget{0};
 
 u64 budget_bytes_once() {
   // read once per process (function-local static: thread-safe init) — the
@@ -79,6 +80,12 @@ u64 budget_bytes_once() {
     return mb * 1024ULL * 1024ULL;
   }();
   return budget;
+}
+
+u64 get_active_budget_bytes() {
+  u64 dyn = g_dynamic_budget.load();
+  if (dyn > 0) return dyn;
+  return budget_bytes_once();
 }
 
 u64 budget_va_bytes_once() {
@@ -112,7 +119,7 @@ void log_refusal(const char* what, u64 bytes) {
            "budget (committed %llu MB) -> ERROR_COMMITMENT_LIMIT (1455); "
            "guest low-memory path expected",
            (unsigned long long)n, what, (unsigned long long)bytes,
-           (unsigned long long)(budget_bytes_once() / (1024ULL * 1024ULL)),
+           (unsigned long long)(get_active_budget_bytes() / (1024ULL * 1024ULL)),
            (unsigned long long)(g_committed.load() / (1024ULL * 1024ULL)));
   trt_core_log(line);
 }
@@ -137,7 +144,7 @@ void log_soft_level(u64 committed, const char* pct) {
            "[trt] mem: %s of the %llu MB budget committed (%llu MB) — "
            "approaching the console Game-package ceiling",
            pct,
-           (unsigned long long)(budget_bytes_once() / (1024ULL * 1024ULL)),
+           (unsigned long long)(get_active_budget_bytes() / (1024ULL * 1024ULL)),
            (unsigned long long)(committed / (1024ULL * 1024ULL)));
   trt_core_log(line);
 }
@@ -145,7 +152,7 @@ void log_soft_level(u64 committed, const char* pct) {
 // Returns 0 when the charge fits, -1 when it would exceed the budget (the
 // caller must then fail the guest allocation with 1455).
 int charge_common(const char* what, u64 bytes) {
-  const u64 budget = budget_bytes_once();
+  const u64 budget = get_active_budget_bytes();
   u64 before = g_committed.load();
   u64 after;
   do {
@@ -215,23 +222,11 @@ int trt_mem_budget_charge_commit(u64 bytes) {
 
 void trt_mem_budget_discharge_commit(u64 bytes) {
   if (!bytes) return;
-  const u64 before = g_committed.load();
-  g_committed.store(before > bytes ? before - bytes : 0);
-  if (before < bytes) {
-    // accounting tripwire: a discharge larger than the ledger means a
-    // caller freed bytes it never charged (or freed twice)
-    char line[256];
-    snprintf(line, sizeof(line),
-             "[trt] mem: BUDGET ACCOUNTING: %s discharge of %llu bytes "
-             "exceeds committed %llu — clamped to 0 (over-discharge, "
-             "caller bug)",
-             "commit", (unsigned long long)bytes, (unsigned long long)before);
-    trt_core_log(line);
-  }
+  discharge(g_committed, bytes, "commit");
   // dropping back below a soft level re-arms its warning: a game that
   // streams (alloc/free cycles near the ceiling) must warn again on the
   // next climb, not once per process
-  const u64 budget = budget_bytes_once();
+  const u64 budget = get_active_budget_bytes();
   const u64 committed = g_committed.load();
   if (committed < (budget / 10) * 8) {
     g_soft80.store(false);
@@ -254,8 +249,7 @@ int trt_mem_budget_charge_file_view(u64 bytes) {
 
 void trt_mem_budget_discharge_file_view(u64 bytes) {
   if (!bytes) return;
-  const u64 before = g_file_view.load();
-  g_file_view.store(before > bytes ? before - bytes : 0);
+  discharge(g_file_view, bytes, "file-backed view");
   discharge(g_va_reserved, bytes, "file view VA");
 }
 
@@ -277,19 +271,7 @@ int trt_mem_budget_charge_map(u64 bytes) {
 
 void trt_mem_budget_discharge_map(u64 bytes) {
   if (!bytes) return;
-  const u64 m = g_mapped.load();
-  g_mapped.store(m > bytes ? m - bytes : 0);
-  if (m < bytes) {
-    // accounting tripwire: a discharge larger than the ledger means a
-    // caller freed bytes it never charged (or freed twice)
-    char line[256];
-    snprintf(line, sizeof(line),
-             "[trt] mem: BUDGET ACCOUNTING: %s discharge of %llu bytes "
-             "exceeds committed %llu — clamped to 0 (over-discharge, "
-             "caller bug)",
-             "mapped view", (unsigned long long)bytes, (unsigned long long)m);
-    trt_core_log(line);
-  }
+  discharge(g_mapped, bytes, "mapped view");
   trt_mem_budget_discharge_commit(bytes);
   discharge(g_va_reserved, bytes, "VA reservation");
 }
@@ -309,7 +291,15 @@ void trt_mem_budget_discharge_va(u64 bytes) {
   discharge(g_va_reserved, bytes, "VA reservation");
 }
 
-u64 trt_mem_budget_bytes(void) { return budget_bytes_once(); }
+u64 trt_mem_budget_bytes(void) { return get_active_budget_bytes(); }
+void trt_mem_budget_set_mb(u32 mb) {
+  if (mb < 1) mb = 1;
+  if (mb > 16384) mb = 16384;
+  g_dynamic_budget.store((u64)mb * 1024ULL * 1024ULL);
+}
+u32 trt_mem_budget_get_mb(void) {
+  return (u32)(get_active_budget_bytes() / (1024ULL * 1024ULL));
+}
 u64 trt_mem_budget_committed(void) { return g_committed.load(); }
 u64 trt_mem_budget_mapped(void) { return g_mapped.load(); }
 u64 trt_mem_budget_peak(void) { return g_peak.load(); }
@@ -356,7 +346,7 @@ void trt_mem_budget_reset(void) {
 
 void trt_mem_budget_report(char* line, unsigned cap) {
   if (!line || !cap) return;
-  const u64 budget = budget_bytes_once();
+  const u64 budget = get_active_budget_bytes();
   const u64 committed = g_committed.load();
   snprintf(line, cap,
            "memory budget: %llu/%llu MB committed (%llu MB mapped views, "

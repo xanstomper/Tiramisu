@@ -18,10 +18,13 @@ extern "C" {
 // The runtime context: backend, resolver, and where the game's own DLLs
 // live on the host filesystem.
 void trt_runtime_init(const trt_backend* be, const char* search_dir);
+// Secondary game DLL directory when the executable lives below the mount root.
+void trt_runtime_set_content_root(const char* host_dir);
 const trt_backend* trt_runtime_backend(void);
 // The resolver that knows about guest images (and falls back to the module
 // table for system modules). Use it for the exe AND for every guest DLL.
 trt_resolver* trt_runtime_resolver(void);
+const trt_resolver* trt_runtime_export_resolver(void);
 // Where the game's own DLLs live on the host filesystem.
 const char* trt_runtime_search_dir(void);
 // Dynamic DLL search directories (SetDllDirectoryW / AddDllDirectory / loader
@@ -61,6 +64,8 @@ const char* trt_images_synth_name(void* handle);
 // trt_images_first() (GetModuleHandle(NULL), FindResource(NULL)) answers
 // with the exe rather than whichever image registered first.
 void trt_images_register_main(trt_image* img, const char* guest_name);
+// Register an alias for an image (e.g. launcher name when redirected to shipping exe).
+void trt_images_register_alias(trt_image* img, const char* alias_name);
 
 // ---- loading ----
 // Map a PE from a host path, register it, seal it. If `run_entry` is set,

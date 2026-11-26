@@ -18,6 +18,10 @@ int trt_va_try_promote_rx(u64 fault_addr);
 typedef void* (*trt_vmem_reserve_fn)(size_t bytes, u64 preferred_base);
 typedef int   (*trt_vmem_commit_fn)(void* base, size_t bytes, unsigned prot);
 typedef int   (*trt_vmem_decommit_fn)(void* base, size_t bytes);
+void trt_va_enable_deferred_data(int enabled);
+int trt_va_handle_deferred_data_fault(u64 address, u32 access);
+int trt_va_is_deferred_readwrite(const void* buffer, size_t size);
+int trt_va_prepare_data_range(const void* buffer, size_t size);
 void trt_set_vmem_hooks(trt_vmem_reserve_fn reserve_fn,
                         trt_vmem_commit_fn commit_fn,
                         trt_vmem_decommit_fn decommit_fn);

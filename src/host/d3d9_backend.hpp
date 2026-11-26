@@ -7,6 +7,8 @@
 
 #include "../trt/bridge_d3d9.h"
 #include "../trt/bridge_d3d9_meta.h"
+#include "../trt/bridge_esram.h"
+#include "shader_cache_util.h"
 
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
@@ -155,6 +157,13 @@ inline gpu_res* get_res(d3d9_handle h) {
 
 inline void free_res(gpu_res* r) {
   if (!r) return;
+  if (r->tex && trt_esram_is_active()) {
+    D3D11_TEXTURE2D_DESC desc{};
+    r->tex->GetDesc(&desc);
+    if (desc.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL)) {
+      trt_esram_release_surface(desc.Width, desc.Height, (uint32_t)desc.Format);
+    }
+  }
   if (r->srv) { r->srv->Release(); r->srv = nullptr; }
   if (r->tex) { r->tex->Release(); r->tex = nullptr; }
   r->cpu_data.clear();
@@ -1187,6 +1196,9 @@ inline d3d9_handle w2b_create_tex_common(uint32_t kind, uint32_t w, uint32_t h,
   } else if (ti.is_rt && !is_bcn) {
     g_rt.dev->CreateRenderTargetView(r->tex, nullptr, &ti.rtv);
   }
+  if (trt_esram_is_active() && (td.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL))) {
+    trt_esram_qualify_and_alloc(td.Width, td.Height, (uint32_t)td.Format, td.BindFlags, "d3d9_surface");
+  }
   return id;
 }
 
@@ -1229,17 +1241,15 @@ inline d3d9_handle hk_create_shader(u32 is_ps, u32, u32, const char* hlsl,
   if (!g_rt.initialized || !hlsl || !hlsl_len) return 0;
   ID3DBlob* blob = nullptr;
   ID3DBlob* err = nullptr;
-  HRESULT hr = D3DCompile(hlsl, hlsl_len, nullptr, nullptr, nullptr, "main",
-                          is_ps ? "ps_5_0" : "vs_5_0", 0, 0, &blob, &err);
-  if (FAILED(hr)) {
-    if (err) { err->Release(); err = nullptr; }
-    hr = D3DCompile(hlsl, hlsl_len, nullptr, nullptr, nullptr, "main",
-                    is_ps ? "ps_4_0" : "vs_4_0", 0, 0, &blob, &err);
-  }
-  if (FAILED(hr) || !blob) {
-    if (err) err->Release();
-    if (blob) blob->Release();
-    return 0;
+  const char* profile5 = is_ps ? "ps_5_0" : "vs_5_0";
+  if (!longan::d3d_compile_cached(hlsl, hlsl_len, profile5, "main", &blob) || !blob) {
+    HRESULT hr = D3DCompile(hlsl, hlsl_len, nullptr, nullptr, nullptr, "main",
+                            is_ps ? "ps_4_0" : "vs_4_0", 0, 0, &blob, &err);
+    if (FAILED(hr) || !blob) {
+      if (err) err->Release();
+      if (blob) blob->Release();
+      return 0;
+    }
   }
   if (err) err->Release();
 

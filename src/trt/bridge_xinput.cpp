@@ -5,6 +5,7 @@
 #include "thunk.h"
 #include "trt.h"
 
+#include <atomic>
 #include <stdio.h>
 #include <string.h>
 
@@ -83,7 +84,18 @@ extern "C" {
 
 u32 TRT_GUEST_ABI trt_XInputGetState(u32 user_index, void* state_out) {
   gap_trace_record("XInputGetState");
-  if (!trt_pad_connected(user_index)) return k_err_device_not_connected;
+  static std::atomic<unsigned> state_polls{0};
+  const unsigned poll_no = state_polls.fetch_add(1, std::memory_order_relaxed);
+  if (!trt_pad_connected(user_index)) {
+    if (poll_no < 16) {
+      char line[96];
+      snprintf(line, sizeof(line),
+               "xinput: GetState #%u user=%u disconnected",
+               poll_no + 1, user_index);
+      xinputlog::line(line);
+    }
+    return k_err_device_not_connected;
+  }
   if (!state_out) return 87u;  // ERROR_INVALID_PARAMETER
   xinput_state* s = (xinput_state*)state_out;
   memset(s, 0, sizeof(*s));
@@ -96,6 +108,18 @@ u32 TRT_GUEST_ABI trt_XInputGetState(u32 user_index, void* state_out) {
   s->Gamepad.sThumbLY = trt_pad_thumb_n(user_index, 1);
   s->Gamepad.sThumbRX = trt_pad_thumb_n(user_index, 2);
   s->Gamepad.sThumbRY = trt_pad_thumb_n(user_index, 3);
+  static std::atomic<u16> last_buttons{0};
+  const bool button_changed =
+      last_buttons.exchange(s->Gamepad.wButtons, std::memory_order_relaxed) !=
+      s->Gamepad.wButtons;
+  if (poll_no < 16 || button_changed || s->Gamepad.wButtons != 0) {
+    char line[128];
+    snprintf(line, sizeof(line),
+             "xinput: GetState #%u user=%u buttons=%04x lx=%d ly=%d",
+             poll_no + 1, user_index, s->Gamepad.wButtons,
+             s->Gamepad.sThumbLX, s->Gamepad.sThumbLY);
+    xinputlog::line(line);
+  }
   return k_err_success;
 }
 

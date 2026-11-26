@@ -94,7 +94,9 @@ u32 GSTD guest_gdi_main(u64 a, u64 b, u64 c) {
     bits |= 0x40u;
 
   // 8. state setters accept the real DC
-  if (SetBkMode(hdc, 2) == 1 && SetTextColor(hdc, 0x00FF0000u) != 0xFFFFFFFFu &&
+  // SetBkMode returns the PREVIOUS mode (real GDI), not a boolean: a fresh DC
+  // is OPAQUE(2), so a non-zero return is the contract here.
+  if (SetBkMode(hdc, 2) != 0 && SetTextColor(hdc, 0x00FF0000u) != 0xFFFFFFFFu &&
       SetBkColor(hdc, 0x00000000u) != 0xFFFFFFFFu)
     bits |= 0x80u;
 
