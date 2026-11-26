@@ -503,3 +503,35 @@ Entries are appended as work lands; every claim points at a gate or a file.
   engine synthesizer checks. Both signed packages in
   out/compact-input-20261126 contain the same host binary and reuse their
   respective 0.2.4.25 certificates. No console deployment was performed.
+
+### 2026-11-26 — Mineplex integration for 0.2.4.42
+
+- Resumed from `integration/xbox-0.2.4.42` at `496f089` on
+  `integration/xbox-0.2.4.42-resume`. Used the captured installed 0.2.4.41
+  tree as the common source baseline for the live changes. The manifest
+  retains the 0.2.4.42 identity.
+- `9927639` integrates the live changes captured at `b4dee3e`. It brings
+  forward the compact cursor and pointer ownership, input and window
+  lifecycle changes, graphics and crash diagnostics, and PE32 operand-width
+  regressions. It also retains the prior workspace's module path,
+  FormatMessage allocation, TLS, and launch-tracing changes.
+- `c83b075` adapts the host-debug transfer staging and loader cycle guard.
+  Incomplete and failed uploads preserve the destination. A cyclic
+  dependency produces a named load failure before either module is
+  registered. The commit brings forward the Brown managed-game close event
+  and repeated Mono exception log suppression.
+- The newer input pipeline already carries the usable RACCOIN keyboard and
+  mouse work. The older two-phase loader, game-specific Steam experiments,
+  and host import-table rewrite are preserved on the original
+  `work/gow-cycle-recovery`, `work/snapshot-*`, and
+  `capture/tiramisu-brown-resume-42` refs. Those variants still need
+  integration against the current PE32, TLS, and input code.
+- The Linux offline gate passed with 49 WebXfer checks, the cyclic DLL
+  regression, and the engine synthesizer suite. The stand-alone corpus
+  and version fixtures were absent from the scratch checkout.
+- The FNA rebuild and the UWP cross-build passed. The verification executable
+  and layout were built on Mineplex. Signing, publishing, and console
+  deployment were outside this verification. Xbox runtime checks are pending.
+- The worktree uses `/dev/shm/tiramisu-resume-42/source`. Commits and
+  verification logs are stored in the main Mineplex repository. Logs are in
+  `.git/verification/xbox-0.2.4.42-resume`.
