@@ -3295,7 +3295,9 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   // the runtime knows where the game's own DLLs live, and resolves imports
   // through the guest-image registry (a game's own DLLs beat the system's)
   trt_runtime_init(&be, exe_dir.c_str());
-  if (!image_mounted && _stricmp(exe_dir.c_str(), game_dir.c_str()) != 0)
+  if (image_mounted)
+    trt_runtime_set_content_image_drive(guest_exe.front());
+  else if (_stricmp(exe_dir.c_str(), game_dir.c_str()) != 0)
     trt_runtime_set_content_root(game_dir.c_str());
   trt_resolver* runtime_rs = trt_runtime_resolver();
 

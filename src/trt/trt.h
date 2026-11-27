@@ -290,6 +290,8 @@ struct trt_iso* trt_vfs_image_for_guest_utf16(const u16* guest_path,
 int trt_vfs_is_image_utf16(const u16* guest_path);
 int trt_vfs_image_materialize(const u16* guest_path, char* host_out,
                               size_t host_cap, int* is_dir_out);
+int trt_vfs_image_materialize_utf8(const char* guest_path, char* host_out,
+                                   size_t host_cap, int* is_dir_out);
 void trt_vfs_set_cwd(const char* guest_dir);
 int trt_vfs_get_cwd(char* out, size_t out_cap);
 int trt_vfs_normalize_guest_utf16(const u16* guest_path, char* out,

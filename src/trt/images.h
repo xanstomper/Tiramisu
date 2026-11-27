@@ -20,6 +20,8 @@ extern "C" {
 void trt_runtime_init(const trt_backend* be, const char* search_dir);
 // Secondary game DLL directory when the executable lives below the mount root.
 void trt_runtime_set_content_root(const char* host_dir);
+// The equivalent lookup for a mounted image. Materializes a requested root DLL.
+void trt_runtime_set_content_image_drive(char drive);
 const trt_backend* trt_runtime_backend(void);
 // The resolver that knows about guest images (and falls back to the module
 // table for system modules). Use it for the exe AND for every guest DLL.
