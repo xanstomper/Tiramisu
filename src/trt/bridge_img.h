@@ -28,6 +28,9 @@ typedef struct trt_img {
   u8* rgba;  // malloc'd; caller frees
 } trt_img;
 
+// Decode one 16-byte BC3 block into sixteen row-major RGBA8 pixels.
+void trt_img_decode_bc3_block(const u8 block[16], u8 rgba[64]);
+
 // parse a PNG or DDS from memory; returns 0 and fills *out on success,
 // nonzero (a named HRESULT) on failure. Log line names the failure.
 int trt_img_parse(const void* data, u32 bytes, trt_img* out);

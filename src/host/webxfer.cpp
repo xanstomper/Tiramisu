@@ -2600,6 +2600,7 @@ void handle_client(sock_t s) {
              "\"shader_input_samples\":%u,\"shader_input_lit_pixels\":%u,"
              "\"shader_input_slot\":%u,\"shader_input_width\":%u,\"shader_input_height\":%u,"
              "\"shader_input_format\":%u,\"shader_input_result\":%d,"
+             "\"shader_input_bc3_samples\":%u,\"shader_input_bc3_nontransparent_lit_peak\":%u,"
              "\"sync_wait_completed\":%u,\"sync_wait_timeout\":%u,\"sync_wait_failed\":%u,"
              "\"sync_setevent_signaled\":%u,\"sync_setevent_failed\":%u,"
              "\"guest_commit_mib\":%llu,\"guest_commit_budget_mib\":%u",
@@ -2622,6 +2623,7 @@ void handle_client(sock_t s) {
              shader_input.snapshots, shader_input.bound_views, shader_input.samples,
              shader_input.lit_pixels, shader_input.slot, shader_input.width,
              shader_input.height, shader_input.format, shader_input.result,
+             shader_input.bc3_samples, shader_input.bc3_nontransparent_lit_peak,
              sync.wait_completed, sync.wait_timed_out, sync.wait_failed,
              sync.event_signaled, sync.event_failed,
              static_cast<unsigned long long>(trt_mem_budget_committed() / 1048576ULL),

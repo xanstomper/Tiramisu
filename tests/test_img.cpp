@@ -6,6 +6,7 @@
 //   PNG  — a minimal valid 2x2 RGBA PNG built byte-by-byte in this file
 //          (fixed zlib stream, filter type 0), plus corrupt-input checks
 //   DDS  — uncompressed X8R8G8B8 2x2 and a DXT5 4x4 block, exact pixels
+#include <initializer_list>
 #include "../src/trt/bridge_img.h"
 
 #include <stdio.h>
@@ -206,6 +207,25 @@ int main() {
               img.rgba[(3 * 4 + 3) * 4 + 3] == 255,
           "DXT5 px(3,3) = opaque red");
     free(img.rgba);
+  }
+
+  // In BC2 and BC3 even ascending 565 endpoints use the four-color palette.
+  // Selector 3 between black and white must yield opaque light gray.
+  for (const char* tag : {"DXT3", "DXT5", "DXT1"}) {
+    memcpy(dxt + 84, tag, 4);
+    const bool bc1 = tag[3] == '1';
+    memset(dxt + 128, 0xff, 16);
+    u8* colors = dxt + 128 + (bc1 ? 0 : 8);
+    colors[0] = colors[1] = 0;
+    rc = trt_img_parse(dxt, sizeof(dxt), &img);
+    CHECK(rc == 0, "ascending BC endpoints parse");
+    if (rc == 0) {
+      const u8 gray = bc1 ? 0 : 170;
+      CHECK(img.rgba[0] == gray && img.rgba[1] == gray &&
+            img.rgba[2] == gray && img.rgba[3] == (bc1 ? 0 : 255),
+            "BC1 transparency is exclusive to BC1");
+      free(img.rgba);
+    }
   }
 
   // ==================== unknown container fails named ====================

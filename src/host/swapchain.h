@@ -60,6 +60,7 @@ struct guest_shader_input_probe {
   unsigned snapshots, bound_views, samples, lit_pixels;
   unsigned slot, width, height, format;
   int result;
+  unsigned bc3_samples, bc3_nontransparent_lit_peak;
 };
 guest_shader_input_probe swapchain_guest_shader_input_probe();
 void swapchain_reset_guest_draw_probe();

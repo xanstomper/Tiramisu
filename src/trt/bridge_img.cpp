@@ -189,7 +189,7 @@ u32 fourcc(const u8* p) {
 // BC decode tables
 struct bc_col { u8 r, g, b, a; };
 
-void bc1_block(const u8* in, bc_col* px /* 16 out */) {
+void bc_color_block(const u8* in, bc_col* px, bool allow_transparency) {
   const u16 c0 = (u16)in[0] | ((u16)in[1] << 8);
   const u16 c1 = (u16)in[2] | ((u16)in[3] << 8);
   // 565 -> 8: bit replication (v<<3 | v>>2) gives full 0..255 range
@@ -200,7 +200,7 @@ void bc1_block(const u8* in, bc_col* px /* 16 out */) {
   bc_col lut[4];
   lut[0] = p0;
   lut[1] = p1;
-  if (c0 > c1) {
+  if (!allow_transparency || c0 > c1) {
     lut[2].r = (2 * p0.r + p1.r + 1) / 3;  // approximate: (p0*2+p1)/3
     lut[2].g = (2 * p0.g + p1.g + 1) / 3;
     lut[2].b = (2 * p0.b + p1.b + 1) / 3;
@@ -223,7 +223,7 @@ void bc1_block(const u8* in, bc_col* px /* 16 out */) {
 void bc23_block(const u8* in, bc_col* px, int is_bc2) {
   if (is_bc2) {
     // BC2: 16 alpha nibbles first, then a BC1 color block
-    bc1_block(in + 8, px);
+    bc_color_block(in + 8, px, false);
     for (u32 i = 0; i < 16; ++i)
       px[i].a = (u8)((in[i / 2] >> ((i % 2) * 4)) & 15) * 17;
   } else {
@@ -241,7 +241,7 @@ void bc23_block(const u8* in, bc_col* px, int is_bc2) {
       alut[6] = 0;
       alut[7] = 255;
     }
-    bc1_block(in + 8, px);
+    bc_color_block(in + 8, px, false);
     // 48-bit alpha index stream
     u64 aidx = 0;
     for (u32 i = 0; i < 6; ++i)
@@ -314,7 +314,7 @@ int parse_dds(const u8* d, u32 bytes, trt_img* out) {
     for (u32 by = 0; by < bh; ++by) {
       for (u32 bx = 0; bx < bw; ++bx) {
         const u8* src = px + ((size_t)by * bw + bx) * block_bytes;
-        if (fourcc_ == fourcc((const u8*)"DXT1")) bc1_block(src, blk);
+        if (fourcc_ == fourcc((const u8*)"DXT1")) bc_color_block(src, blk, true);
         else bc23_block(src, blk, fourcc_ == fourcc((const u8*)"DXT3"));
         for (u32 i = 0; i < 16; ++i) {
           const u32 x = bx * 4 + (i & 3);
@@ -343,6 +343,13 @@ int parse_dds(const u8* d, u32 bytes, trt_img* out) {
 }
 
 }  // namespace
+
+void trt_img_decode_bc3_block(const u8 block[16], u8 rgba[64]) {
+  bc_col pixels[16];
+  static_assert(sizeof(pixels) == 64);
+  bc23_block(block, pixels, false);
+  memcpy(rgba, pixels, sizeof(pixels));
+}
 
 int trt_img_parse(const void* data, u32 bytes, trt_img* out) {
   if (!data || !bytes || !out) return (int)0x80070057;

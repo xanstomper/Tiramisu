@@ -17,6 +17,7 @@
 #include "../trt/bridge_d3d12.h"
 #include "../trt/bridge_d3dx.h"
 #include "../trt/input.h"
+#include "../trt/bridge_img.h"
 #include <algorithm>
 
 #include <d3d11on12.h>
@@ -64,6 +65,7 @@ struct surface_sample {
   DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
   bool pending = false;
   unsigned lit = 0;
+  unsigned nontransparent_lit = 0;
 };
 surface_sample g_guest_surface_probe, g_host_surface_probe, g_other_surface_probe;
 std::atomic<unsigned> g_surface_samples{0}, g_guest_lit_pixels{0}, g_host_lit_pixels{0};
@@ -79,6 +81,7 @@ std::atomic<unsigned> g_shader_input_samples{0}, g_shader_input_lit{0};
 std::atomic<unsigned> g_shader_input_slot{0}, g_shader_input_width{0};
 std::atomic<unsigned> g_shader_input_height{0}, g_shader_input_format{0};
 std::atomic<int> g_shader_input_result{0};
+std::atomic<unsigned> g_bc3_samples{0}, g_bc3_nontransparent_lit_peak{0};
 std::atomic<int> g_surface_probe_result{0};
 unsigned g_surface_probe_interval = 0;
 winrt::com_ptr<IDXGIFactory2> g_factory;
@@ -552,10 +555,15 @@ HRESULT enqueue_surface_sample(surface_sample& sample, ID3D11Texture2D* source,
                                DXGI_FORMAT view_format = DXGI_FORMAT_UNKNOWN) {
   D3D11_TEXTURE2D_DESC desc{};
   source->GetDesc(&desc);
-  const bool typeless = desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
+  const bool typeless = desc.Format == DXGI_FORMAT_BC3_TYPELESS ||
+                        desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
                         desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS;
   const DXGI_FORMAT format = typeless ? view_format : desc.Format;
+  const bool bc3 = format == DXGI_FORMAT_BC3_UNORM || format == DXGI_FORMAT_BC3_UNORM_SRGB;
+  const unsigned unit = bc3 ? 4 : 1;
   switch (format) {
+    case DXGI_FORMAT_BC3_UNORM:
+    case DXGI_FORMAT_BC3_UNORM_SRGB:
     case DXGI_FORMAT_R8G8B8A8_UNORM:
     case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
     case DXGI_FORMAT_B8G8R8A8_UNORM:
@@ -565,9 +573,10 @@ HRESULT enqueue_surface_sample(surface_sample& sample, ID3D11Texture2D* source,
   }
   if (desc.SampleDesc.Count != 1 || !desc.Width || !desc.Height) return E_NOTIMPL;
 
+  if (desc.Width % unit || desc.Height % unit) return E_NOTIMPL;
   if (!sample.texture || sample.format != format) {
     D3D11_TEXTURE2D_DESC staging{};
-    staging.Width = staging.Height = kGuestProbeGrid;
+    staging.Width = staging.Height = kGuestProbeGrid * unit;
     staging.MipLevels = staging.ArraySize = 1;
     staging.Format = format;
     staging.SampleDesc.Count = 1;
@@ -580,14 +589,15 @@ HRESULT enqueue_surface_sample(surface_sample& sample, ID3D11Texture2D* source,
     sample.format = format;
   }
 
-  // Sample across the image. Queue only sixteen one-pixel copies, and never
-  // transfer the image itself to the diagnostics endpoint.
+  // Each region holds one pixel or one native compressed block.
   for (unsigned y = 0; y < kGuestProbeGrid; ++y) {
     for (unsigned x = 0; x < kGuestProbeGrid; ++x) {
       const unsigned px = (2 * x + 1) * desc.Width / (2 * kGuestProbeGrid);
       const unsigned py = (2 * y + 1) * desc.Height / (2 * kGuestProbeGrid);
-      const D3D11_BOX region{px, py, 0, px + 1, py + 1, 1};
-      g_ctx->CopySubresourceRegion(sample.texture.get(), 0, x, y, 0, source, 0, &region);
+      const unsigned left = px / unit * unit, top = py / unit * unit;
+      const D3D11_BOX region{left, top, 0, left + unit, top + unit, 1};
+      g_ctx->CopySubresourceRegion(sample.texture.get(), 0, x * unit, y * unit, 0,
+                                   source, 0, &region);
     }
   }
   sample.pending = true;
@@ -601,8 +611,25 @@ HRESULT poll_surface_sample(surface_sample& sample) {
                                 D3D11_MAP_FLAG_DO_NOT_WAIT, &map);
   if (hr == DXGI_ERROR_WAS_STILL_DRAWING) return S_FALSE;
   if (FAILED(hr)) return hr;
-  sample.lit = trt_gpu_count_lit_rgb32(map.pData, kGuestProbeGrid,
-                                      kGuestProbeGrid, map.RowPitch);
+  if (sample.format == DXGI_FORMAT_BC3_UNORM || sample.format == DXGI_FORMAT_BC3_UNORM_SRGB) {
+    sample.lit = sample.nontransparent_lit = 0;
+    const auto* bytes = static_cast<const u8*>(map.pData);
+    for (unsigned y = 0; y < kGuestProbeGrid; ++y) {
+      for (unsigned x = 0; x < kGuestProbeGrid; ++x) {
+        u8 rgba[64];
+        trt_img_decode_bc3_block(bytes + y * map.RowPitch + x * 16, rgba);
+        // One representative pixel per block preserves the 16-point RGB metric.
+        sample.lit += trt_gpu_count_lit_rgb32(rgba + 40, 1, 1, 4);
+        for (unsigned i = 0; i < 16; ++i) {
+          const u8* pixel = rgba + i * 4;
+          if (pixel[3]) sample.nontransparent_lit += trt_gpu_count_lit_rgb32(pixel, 1, 1, 4);
+        }
+      }
+    }
+  } else {
+    sample.lit = trt_gpu_count_lit_rgb32(map.pData, kGuestProbeGrid,
+                                        kGuestProbeGrid, map.RowPitch);
+  }
   g_ctx->Unmap(sample.texture.get(), 0);
   sample.pending = false;
   return S_OK;
@@ -675,6 +702,12 @@ void measure_surface_pair(ID3D11Texture2D* guest, ID3D11Texture2D* host) {
     if (hr == S_OK) {
       g_shader_input_lit.store(std::max(g_shader_input_lit.load(), g_shader_input_surface.lit));
       g_shader_input_samples.fetch_add(1);
+      if (g_shader_input_surface.format == DXGI_FORMAT_BC3_UNORM ||
+          g_shader_input_surface.format == DXGI_FORMAT_BC3_UNORM_SRGB) {
+        g_bc3_samples.fetch_add(1);
+        g_bc3_nontransparent_lit_peak.store(std::max(g_bc3_nontransparent_lit_peak.load(),
+                                                    g_shader_input_surface.nontransparent_lit));
+      }
     } else if (FAILED(hr)) {
       g_shader_input_surface.pending = false;
       g_shader_input_result.store(hr);
@@ -905,6 +938,8 @@ void swapchain_reset_guest_draw_probe() {
   g_shader_input_snapshots.store(0);
   g_shader_input_bound.store(0);
   g_shader_input_samples.store(0);
+  g_bc3_samples.store(0);
+  g_bc3_nontransparent_lit_peak.store(0);
   g_shader_input_lit.store(0);
   g_shader_input_slot.store(0);
   g_shader_input_width.store(0);
@@ -924,7 +959,7 @@ guest_shader_input_probe swapchain_guest_shader_input_probe() {
           g_shader_input_samples.load(), g_shader_input_lit.load(),
           g_shader_input_slot.load(), g_shader_input_width.load(),
           g_shader_input_height.load(), g_shader_input_format.load(),
-          g_shader_input_result.load()};
+          g_shader_input_result.load(), g_bc3_samples.load(), g_bc3_nontransparent_lit_peak.load()};
 }
 
 guest_draw_probe swapchain_guest_draw_probe() {
