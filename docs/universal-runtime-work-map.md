@@ -87,6 +87,25 @@ a successful retry and parallel loads of the same file.
 [Windows DllMain](https://learn.microsoft.com/en-us/windows/win32/dlls/dllmain)
 [Wine module lookup and initialization](https://github.com/wine-mirror/wine/blob/master/dlls/ntdll/loader.c)
 
+### Verify PE32 dependencies in one process
+
+The offline PE32 gate now runs a real executable that calls its bundled DLL
+through the static import table. It checks the returned value, guest module
+handles, and heap allocations around a loaded image. Extend this with a
+transitive dependency that uses static TLS and a dynamic load after entry.
+Give each dependency its own TLS index and initialization state, pass Windows
+attach and detach notifications in dependency order, and verify a retry after
+an initializer rejects the load. Confirm live loads enter the same interpreter
+address space and exports use guest addresses. Validate an interactive menu
+from a real PE32 D3D9 title on Xbox Series and Xbox One hardware as available.
+
+The interpreter currently commits its entire virtual address space at startup.
+Measure resident and committed memory on Xbox and test a page-commit policy
+against bridge reads and writes before enabling it. Keep allocation and
+mapping failures visible before the guest entry point.
+[PE32 execution](../src/trt/x86_exec.cpp)
+[PE32 tests](../tests/test_pe32.cpp)
+
 ### Make launch decisions reproducible
 
 Use one resolved install tree, one provider registry, and one launch plan for

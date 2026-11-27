@@ -5,6 +5,7 @@
 // control flow, and stack operations. API calls are thunked to 64-bit
 // bridges via x86_call_bridge().
 #include "x86_cpu.h"
+#include "images.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -3907,6 +3908,23 @@ static bool install_main_tls(x86_context* ctx, const trt_image& image) {
 }
 
 // ---- Run a 32-bit PE through the interpreter ----
+static bool map_pe32_dependencies(x86_context* ctx, const trt_image& main,
+                                  uint32_t stack_base, uint64_t stack_end) {
+    const int count = trt_images_count();
+    for (int i = 0; i < count; ++i) {
+        const trt_image* dll = trt_images_nth(i);
+        if (!dll || dll == &main || !dll->is_pe32) continue;
+        const uint32_t base = dll->guest_base;
+        const uint64_t end = (uint64_t)base + dll->size_of_image;
+        if (!dll->base || !base || !dll->size_of_image || end > UINT32_MAX)
+            return false;
+        if (base < stack_end && stack_base < end) return false;
+        if (x86_mem_map_host(ctx, base, dll->base, dll->size_of_image) != 0)
+            return false;
+    }
+    return true;
+}
+
 int x86_run_pe32(x86_context* ctx, void* image_base, size_t image_size,
                  uint32_t guest_base, uint32_t entry_rva, uint32_t stack_base,
                  size_t stack_size, const trt_image* image) {
@@ -3915,10 +3933,21 @@ int x86_run_pe32(x86_context* ctx, void* image_base, size_t image_size,
     // reservation.
     if (!ctx->mem.base) x86_cpu_init(ctx);
 
-    // Map the PE image at the guest VA base the loader relocated it for.
+    const uint64_t stack_end = uint64_t(stack_base) + stack_size;
+    if (stack_size < 16 || stack_size > UINT32_MAX - stack_base) {
+        if (ctx->log) ctx->log("x86: invalid guest stack range");
+        return X86_EXEC_MEMORY;
+    }
+    // Static imports can already point to a sibling DLL's guest address.
+    // Copy each relocated image into the same interpreter address space.
     if (x86_mem_map_host(ctx, guest_base, image_base, image_size) != 0) {
         if (ctx->log) ctx->log("x86: failed to map PE image");
         return -1;
+    }
+    if (image && image->is_pe32 &&
+        !map_pe32_dependencies(ctx, *image, stack_base, stack_end)) {
+        if (ctx->log) ctx->log("x86: failed to map a PE32 dependency");
+        return X86_EXEC_MEMORY;
     }
     // Commit a tail past SizeOfImage. Host libc routines that bridges call on
     // guest pointers (glibc's AVX memset/memcpy) may store a few bytes beyond
@@ -3936,8 +3965,7 @@ int x86_run_pe32(x86_context* ctx, void* image_base, size_t image_size,
     // A PE32 guest uses the 24-byte i386 CRITICAL_SECTION layout: bridges that
     // initialize one must not write the Win64 40-byte struct over it.
     // Set up stack
-    if (stack_size < 16 || uint64_t(stack_base) + stack_size > UINT32_MAX ||
-        x86_mem_commit(ctx, stack_base, stack_size) != 0) {
+    if (x86_mem_commit(ctx, stack_base, stack_size) != 0) {
         if (ctx->log) ctx->log("x86: failed to commit stack");
         return -1;
     }

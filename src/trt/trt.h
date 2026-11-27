@@ -156,6 +156,9 @@ u32 trt_pe32_bind_dynamic(const char* module, const char* symbol, u32 ordinal,
 // Release all guest-VA reservations (called by trt_images_reset between
 // corpus PEs; images already mapped keep their recorded guest_base).
 void trt_pe32_guest_reset(void);
+// End of the last loader-owned PE32 image range intersecting [base, base+size).
+// Zero means the range is free of images.
+u32 trt_pe32_image_overlap_end(u32 base, u32 size);
 
 // Flip sections to final protections (code -> RX). Call once after
 // relocation/import/TLS writes are complete. Returns TRT_OK or TRT_ERR_SEAL.

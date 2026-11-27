@@ -363,6 +363,21 @@ static bool pe32_guest_overlaps(u32 base, u64 size) {
   return false;
 }
 
+extern "C" u32 trt_pe32_image_overlap_end(u32 base, u32 size) {
+  if (!size) return 0;
+  std::lock_guard<std::mutex> lk(g_pe32_mu);
+  const u64 end = (u64)base + size;
+  u32 overlap_end = 0;
+  for (int i = 0; i < g_pe32_extent_count; ++i) {
+    const auto& extent = g_pe32_extents[i];
+    if (!extent.host_base) continue;
+    const u32 extent_end = extent.guest_base + (u32)extent.host_size;
+    if (base < extent_end && extent.guest_base < end && extent_end > overlap_end)
+      overlap_end = extent_end;
+  }
+  return overlap_end;
+}
+
 // Reserve a guest-VA range for a new PE32 image: preferred base first,
 // else the lowest free 64 KiB-aligned slot at/above the floor. Records the
 // (host, guest) pair for host->guest translation. Returns 0 on success.

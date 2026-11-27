@@ -24,8 +24,7 @@
 namespace {
 
 constexpr uint32_t kArenaBase = 0x20000000u;
-// Stops before the TEB (0x7FFDE000), the TLS array (0x7FFE0000) and the
-// import-trap range (0xF0000000).
+// Loader-owned image ranges are skipped below.
 constexpr uint32_t kArenaEnd = 0xC0000000u;
 constexpr uint32_t kMagicUsed = 0x48454150u;  // 'HEAP'
 constexpr uint32_t kMagicFree = 0x46524545u;  // 'FREE'
@@ -117,13 +116,15 @@ uint32_t carve(x86_context* ctx, uint32_t need) {
     cur = payload[0];
   }
 
-  if (g_heap.bump + need > kArenaEnd) return 0;
-  const uint32_t va = g_heap.bump;
-  g_heap.bump += need;
-  if (x86_mem_commit(ctx, va, need) != 0) {
-    g_heap.bump -= need;  // do not hand out memory we could not commit
-    return 0;
+  uint32_t va = g_heap.bump;
+  while ((uint64_t)va + need <= kArenaEnd) {
+    const uint32_t image_end = trt_pe32_image_overlap_end(va, need);
+    if (!image_end) break;
+    va = align8(image_end);
   }
+  if ((uint64_t)va + need > kArenaEnd || x86_mem_commit(ctx, va, need) != 0)
+    return 0;
+  g_heap.bump = va + need;
   blk_hdr* h = hdr_at(ctx, va);
   h->size = need;
   h->magic = kMagicUsed;

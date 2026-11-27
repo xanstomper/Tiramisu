@@ -296,18 +296,30 @@ trt_image* trt_images_find_path(const char* host_path) {
   return nullptr;
 }
 
-trt_image* trt_images_by_handle(void* handle) {
+// Call with g_img_mu held. Prefer the registered guest handle to any
+// host-pointer alias, since a PE32 image lives at a distinct guest base.
+static const guest_image* find_image_handle(void* handle) {
   if (!handle) return nullptr;
-  // STAGE 7: HMODULE == image base (guest code dereferences handles as a
-  // PE header pointer); fall back to the legacy synthetic tag
-  const u64 v = (u64)(uintptr_t)handle;
-  for (int i = 0; i < g_image_count; ++i)
-    if (g_images[i].img &&
-        (u64)(uintptr_t)g_images[i].img->base == v) return g_images[i].img;
-  if ((v & 0xFFF00000u) != TRT_HANDLE_TAG) return nullptr;
-  const int idx = (int)(v & 0xFFFFu);
-  if (idx >= g_image_count) return nullptr;
-  return g_images[idx].img;
+  for (int i = 0; i < g_image_count; ++i) {
+    if (g_images[i].handle == handle) return &g_images[i];
+  }
+  for (int i = 0; i < g_image_count; ++i) {
+    if (g_images[i].img && g_images[i].img->base == handle) return &g_images[i];
+  }
+  const uintptr_t value = (uintptr_t)handle;
+  if (value >= TRT_HANDLE_TAG && value - TRT_HANDLE_TAG < (uintptr_t)g_image_count)
+    return &g_images[value - TRT_HANDLE_TAG];
+  return nullptr;
+}
+
+static void* guest_image_handle(const trt_image& img) {
+  return img.is_pe32 ? (void*)(uintptr_t)img.guest_base : img.base;
+}
+
+trt_image* trt_images_by_handle(void* handle) {
+  std::lock_guard<std::mutex> lock(g_img_mu);
+  const guest_image* entry = find_image_handle(handle);
+  return entry ? entry->img : nullptr;
 }
 
 int trt_fault_is_guest(const void* addr) {
@@ -353,7 +365,7 @@ void trt_images_register_main_with_path(trt_image* img, const char* guest_name,
   // STAGE 7: HMODULE == image base on Windows (guest code dereferences it:
   // UnityCrashHandler64's CRT does cmp $0x5a4d,(%rax) on the handle right
   // after GetModuleHandleW — a synthetic tag faults there)
-  g.handle = (void*)(uintptr_t)img->base;
+  g.handle = guest_image_handle(*img);
   ++g_image_count;
 }
 
@@ -370,7 +382,7 @@ void trt_images_register_alias(trt_image* img, const char* alias_name) {
   snprintf(g.name, sizeof(g.name), "%s", base);
   snprintf(g.path, sizeof(g.path), "<alias>");
   g.img = img;
-  g.handle = (void*)(uintptr_t)img->base;
+  g.handle = guest_image_handle(*img);
   ++g_image_count;
 }
 
@@ -405,18 +417,9 @@ void* trt_images_handle(trt_image* img) {
 }
 
 const char* trt_images_name(void* handle) {
-  if (handle) {
-    // STAGE 7: HMODULE == image base; fall back to the legacy tag
-    const u64 v = (u64)(uintptr_t)handle;
-    for (int i = 0; i < g_image_count; ++i)
-      if (g_images[i].img &&
-          (u64)(uintptr_t)g_images[i].img->base == v) return g_images[i].name;
-    if ((v & 0xFFF00000u) != TRT_HANDLE_TAG) return nullptr;
-    const int idx = (int)(v & 0xFFFFu);
-    if (idx >= g_image_count) return nullptr;
-    return g_images[idx].name;
-  }
-  return nullptr;
+  std::lock_guard<std::mutex> lock(g_img_mu);
+  const guest_image* entry = find_image_handle(handle);
+  return entry ? entry->name : nullptr;
 }
 
 // ---- synthetic system-module handles (STAGE 7, OrTMM) ---------------------
@@ -600,11 +603,7 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
       snprintf(g.name, sizeof(g.name), "%s", base);
       snprintf(g.path, sizeof(g.path), "%s", host_path);
       g.img = img;
-      // STAGE 7: HMODULE == image base (see trt_images_register_main).
-      // M7 Phase 1: a 32-bit HMODULE must be a 32-bit-safe value — the guest
-      // VA base, not the 64-bit host pointer (a 32-bit slot cannot hold it).
-      g.handle = img->is_pe32 ? (void*)(uintptr_t)img->guest_base
-                              : (void*)(uintptr_t)img->base;
+      g.handle = guest_image_handle(*img);
       g.is_dll = true;
       ++g_image_count;
     }

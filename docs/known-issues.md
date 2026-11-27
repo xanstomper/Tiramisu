@@ -29,7 +29,11 @@ not a guess. Rows are removed only when verified fixed on-device or in the gate.
   structured `docs/proof/<name>/proof.json` format.
 
 ## Recently added (this session)
-- **DirectStorage (dstorage.dll)** — stubs return E_NOTIMPL; games fall back to standard I/O.
+- **DirectStorage (dstorage.dll)** — the offline middleware gate verifies an
+  asynchronous uncompressed file-to-memory read. Compressed requests and
+  unsupported destination types return `E_NOTIMPL`. Verify queue shutdown,
+  cancellation, and a real game's streaming requests on Xbox before claiming
+  coverage beyond the offline case.
 - **Bink 2 video (bink2w64.dll)** — the built-in fallback is a stub (null/false), so games skip video. A game-shipped native Bink DLL is preferred by the loader's native-override path; without it, cutscenes remain unavailable.
 - **Oodle (oo2core_6_win64.dll)** — stubs return -1; games fall back to standard decompression.
 - **Geo/locale (GetGeoInfoW, GetUserGeoID)** — honest stubs returning 0.

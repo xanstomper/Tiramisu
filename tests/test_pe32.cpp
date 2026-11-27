@@ -1,6 +1,5 @@
 // tiramisu/tests/test_pe32.cpp
-// Offline proof for the M7 Phase 1 PE32 loader on a Linux host (LOAD-ONLY:
-// no 32-bit code executes — there is no x86 engine until Phase 2):
+// Offline PE32 loader and interpreter coverage on Linux:
 //   1. map a real PE32 guest DLL (guest_lib32.dll) at its preferred base
 //   2. map a real PE32 guest EXE (guest_hello32.exe) whose preferred base
 //      is taken -> guest-VA relocation, HIGHLOW fixups verified byte-wise
@@ -11,8 +10,11 @@
 //   4. seal (W^X) and audit (trt_audit_imports, 4-byte variant)
 //   5. negative: bad magic, machine/magic mismatch, truncation, insane
 //      import/reloc/TLS RVAs, DIR64 in a PE32 image -> NAMED errors, no crash
-// Console runs the identical loader through the UWP backend.
+//   6. run a PE32 entry point that calls a real sibling DLL export
+// Console runs the same loader and interpreter through the UWP backend.
 #include "../src/trt/trt.h"
+#include "../src/trt/images.h"
+#include "../src/trt/x86_cpu.h"
 #include "../src/trt/pe_exports.h"
 
 #include <stdio.h>
@@ -382,8 +384,8 @@ int find_trap(const char* mod, const char* sym, u32* out_va) {
 
 int main(int argc, char** argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
-  if (argc < 3) {
-    fprintf(stderr, "usage: %s <guest_hello32.exe> <guest_lib32.dll>\n", argv[0]);
+  if (argc < 4) {
+    fprintf(stderr, "usage: %s <guest_hello32.exe> <guest_lib32.dll> <guest_libcaller32.exe>\n", argv[0]);
     return 2;
   }
   size_t exe_size = 0, lib_size = 0;
@@ -635,6 +637,52 @@ int main(int argc, char** argv) {
   trt_unmap(&be, exe_img);
   trt_unmap(&be, lib_img);
   g_lib32_img = nullptr;
+
+  printf("case: PE32 entry calls its mapped sibling DLL\n");
+  const std::string dll_file = argv[2];
+  const auto separator = dll_file.find_last_of('/');
+  const std::string dll_dir = separator == std::string::npos
+      ? "." : dll_file.substr(0, separator + 1);
+  trt_runtime_init(&be, dll_dir.c_str());
+  size_t caller_size = 0;
+  u8* caller_file = read_file(argv[3], &caller_size);
+  trt_image* caller = nullptr;
+  rc = trt_map_pe(&be, trt_runtime_resolver(), caller_file, caller_size, &caller);
+  free(caller_file);
+  trt_image* sibling = trt_images_find("guest_lib32.dll");
+  CHECK(rc == TRT_OK && caller && sibling &&
+            caller->guest_base != sibling->guest_base && caller->pe32_guestva_count == 1,
+        "the runtime imports a sibling DLL and uses separate guest ranges");
+  if (rc == TRT_OK && caller && sibling && trt_seal_image(&be, caller) == TRT_OK) {
+    trt_images_register_main_with_path(caller, "guest_libcaller32.exe", argv[3]);
+    CHECK(trt_images_by_handle(trt_images_handle(sibling)) == sibling &&
+              trt_images_by_handle(trt_images_handle(caller)) == caller &&
+              (uintptr_t)trt_images_handle(caller) == caller->guest_base,
+          "PE32 main and DLL handles resolve by guest base");
+    x86_context context{};
+    context.log = &linux_log;
+    const int run_result = x86_run_pe32(&context, caller->base, caller->size_of_image,
+                                       caller->guest_base, caller->entry_rva,
+                                       0x00100000, 0x00100000, caller);
+    printf("  info interpreter result=%d eax=%u eip=%08x\n",
+           run_result, context.regs.eax, context.regs.eip);
+    CHECK(run_result == X86_EXEC_OK && context.regs.eax == 42 &&
+              x86_mem_read16(&context, sibling->guest_base) == 0x5A4D,
+          "a PE32 executable calls its sibling export and returns 42");
+    const u32 allocation = x86_guest_alloc(&context, 64, 1);
+    CHECK(caller->guest_base == 0x20000000u &&
+              allocation >= caller->guest_base + caller->size_of_image &&
+              x86_mem_read16(&context, caller->guest_base) == 0x5A4D,
+          "the guest heap preserves images mapped within its address range");
+    if (allocation) x86_guest_free(&context, allocation);
+    x86_mem_free(&context);
+  } else {
+    CHECK(false, "the PE32 executable is ready to run");
+  }
+  trt_images_reset();
+  trt_unmap(&be, caller);
+  trt_unmap(&be, sibling);
+
   free(exe_file);
   free(lib_file);
   printf(failures ? "\nRESULT: %d FAILURES\n" : "\nRESULT: ALL PASS\n",

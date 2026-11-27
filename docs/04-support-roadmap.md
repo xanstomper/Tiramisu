@@ -146,7 +146,10 @@ land here.
 ### W6 — platform/lifecycle surfaces (small, frequent)
 
 - `mscoree.dll` (.NET Framework games, not Mono) — currently STUB.
-- DStorage streaming for Unity 6 titles (`corpus-local/gonext`).
+- DirectStorage streaming for Unity 6 titles. Check which source, compression,
+  and destination types the game requests. Verify uncompressed reads on Xbox,
+  then add verified compression and texture destinations where the game needs
+  them. Exercise cancellation and queue shutdown with pending requests.
 - `CreateDirectoryW`-less CrashReporter paths (RACCOIN's plain-GPU gap).
 - Steam/EOS/GDK handshakes — auth-only by contract; no DRM bypass, ever.
 

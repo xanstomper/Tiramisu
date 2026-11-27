@@ -92,7 +92,12 @@ file "$out/guest_hello32.exe"
 clang++ -std=c++20 -O2 -Wall -no-pie \
   tests/test_pe32.cpp "$out/libtrt.a" -lpthread \
   -o "$out/test_pe32"
-"$out/test_pe32" "$out/guest_hello32.exe" "$out/guest_lib32.dll"
+"$CLANG" --target=i686-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_libcaller32.c -o "$out/guest_libcaller32.obj"
+"$LLD_LINK" "$out/guest_libcaller32.obj" "$out/guest_lib32.lib" \
+  /NODEFAULTLIB /ENTRY:libcaller32_main /SUBSYSTEM:WINDOWS /MACHINE:X86 \
+  /DYNAMICBASE /BASE:0x20000000 /OUT:"$out/guest_libcaller32.exe"
+"$out/test_pe32" "$out/guest_hello32.exe" "$out/guest_lib32.dll" "$out/guest_libcaller32.exe"
 
 # --- 3e. Phase 3: PC->Xbox API translator -----------------------------------
 clang++ -std=c++20 -O2 -Wall -no-pie \
