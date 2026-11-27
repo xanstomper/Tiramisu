@@ -44,6 +44,7 @@
 #include "../src/trt/thunk.h"
 #include "../src/trt/apiset.h"
 
+#include <algorithm>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
@@ -550,7 +551,10 @@ bool g_gaps_mode = false;
 const char* g_sym_pe = "";
 int g_cov_real = 0, g_cov_recorded = 0, g_cov_silent = 0;
 int g_cov_unresolved = 0;
+int g_cov_bundled = 0, g_cov_system = 0;
 int g_cov_delay = 0;
+constexpr int COVERAGE_BUNDLED = 4;
+constexpr int COVERAGE_SYSTEM_CANDIDATE = 5;
 void gap_record(const char* dll, const char* sym, int cls);
 
 const char* impl_class_name(int cls) {
@@ -558,43 +562,58 @@ const char* impl_class_name(int cls) {
     case TRT_IMPL_RECORDED: return "recorded";
     case TRT_IMPL_NAMED_SILENT: return "named-silent";
     case TRT_IMPL_UNRESOLVED: return "unresolved";
+    case COVERAGE_BUNDLED: return "bundled-export";
+    case COVERAGE_SYSTEM_CANDIDATE: return "system-candidate";
     default: return "real";
   }
 }
 
-// Classify one bound symbol and add it to this PE's coverage totals.
-// Game-dir exports, SYSTEM routes and ordinal-only binds are REAL by
-// construction (native code / a real host DLL).
-int classify_one(const char* dll, const char* sym, u16 ordinal = 0) {
-  int have_cls = 0;
-  if (sym && trt_symbol_class(dll, sym, &have_cls)) return have_cls;
-  // An ordinal-only import carries no name to classify. A module publishes its
-  // ordinal exports as "#<n>", so classify that name. Without this, every
-  // ordinal bind on a BUILTIN module (UnityPlayer's eight oleaut32 thunks)
-  // was counted UNRESOLVED on the line right after trt_module_query_ordinal
-  // had confirmed it binds - a measurement bug that inflated the unresolved
-  // column of the support matrix.
-  if (!sym && ordinal) {
-    char ord_name[16];
-    snprintf(ord_name, sizeof(ord_name), "#%u", (unsigned)ordinal);
-    if (trt_symbol_class(dll, ord_name, &have_cls)) return have_cls;
+// Simulate the same lookup for ordinary and delay imports. A DLL on the
+// host whitelist is only a candidate until the console resolves its export.
+int classify_import(const char* dll, const char* sym, u16 ordinal,
+                    const u8* sibling, size_t sibling_size) {
+  if (sibling) {
+    const trt_section_header* secs = nullptr;
+    u32 nsec = 0;
+    if (sibling_size >= 2 && rd16b(sibling) == 0x5a4d &&
+        file_sec_table(sibling, sibling_size, &secs, &nsec) &&
+        file_exports(sibling, sibling_size, (const u8*)secs, nsec, sym, ordinal))
+      return COVERAGE_BUNDLED;
   }
-  // Not resolvable. On a SYSTEM/GAMEDIR/STUB module that is expected: the
-  // console provides the DLL, the game ships it, or the stub IS the design.
-  // On a BUILTIN module Tiramisu claims the DLL and does not export the
-  // symbol - a real gap, and one that used to be counted as REAL, which is
-  // how a coverage row can read 100% while a title still cannot bind.
-  if (trt_module_route(dll) == TRT_ROUTE_BUILTIN) return TRT_IMPL_UNRESOLVED;
-  return TRT_IMPL_REAL;
+  if (!(sym ? trt_module_query(dll, sym) : trt_module_query_ordinal(dll, ordinal))) {
+    return whitelist_has(dll) ? COVERAGE_SYSTEM_CANDIDATE : TRT_IMPL_UNRESOLVED;
+  }
+  const char* target = trt_apiset_target(dll);
+  if (trt_module_route(target ? target : dll) == TRT_ROUTE_SYSTEM)
+    return COVERAGE_SYSTEM_CANDIDATE;
+  char ord_name[16];
+  if (!sym) {
+    snprintf(ord_name, sizeof(ord_name), "#%u", (unsigned)ordinal);
+    sym = ord_name;
+  }
+  int cls = TRT_IMPL_REAL;
+  trt_symbol_class(dll, sym, &cls);
+  return cls;
 }
 
-void add_coverage(const char* dll, const char* sym, u16 ordinal = 0) {
-  const int cls = classify_one(dll, sym, ordinal);
+void add_coverage(const char* dll, const char* sym, u16 ordinal, int cls) {
   if (cls == TRT_IMPL_RECORDED) ++g_cov_recorded;
   else if (cls == TRT_IMPL_NAMED_SILENT) ++g_cov_silent;
   else if (cls == TRT_IMPL_UNRESOLVED) ++g_cov_unresolved;
+  else if (cls == COVERAGE_BUNDLED) ++g_cov_bundled;
+  else if (cls == COVERAGE_SYSTEM_CANDIDATE) ++g_cov_system;
   else ++g_cov_real;
-  gap_record(dll, sym, cls);
+
+  char ord_name[16];
+  if (!sym) {
+    snprintf(ord_name, sizeof(ord_name), "#%u", (unsigned)ordinal);
+    sym = ord_name;
+  }
+  if (cls != COVERAGE_BUNDLED && cls != COVERAGE_SYSTEM_CANDIDATE)
+    gap_record(dll, sym, cls);
+  if (g_symbols_mode) {
+    printf("SYMBOL %s %s!%s %s\n", g_sym_pe, dll, sym, impl_class_name(cls));
+  }
 }
 
 // ---- gap worklist (--gaps) ------------------------------------------------
@@ -704,6 +723,9 @@ void dry_thunks(const u8* file, size_t size, const trt_section_header* secs,
   out->first_gap[0] = 0;
   const u64 stride = is_pe32 ? 4 : 8;
   if (!int_off || int_off + stride > size) return;  // nothing readable to walk
+  char sib_path[1280];
+  size_t sib_size = 0;
+  u8* sib = find_game_sibling(dll_name, sib_path, sizeof(sib_path), &sib_size);
   for (u64 t = 0;; t += stride) {
     const u64 t_off = int_off + t;
     if (t_off + stride > size) break;
@@ -725,7 +747,8 @@ void dry_thunks(const u8* file, size_t size, const trt_section_header* secs,
         continue;
       }
       sym_name = (const char*)(file + hn_off + 2);
-      if (strnlen(sym_name, 256) == 256) {
+      const size_t limit = std::min<size_t>(256, size - (hn_off + 2));
+      if (strnlen(sym_name, limit) == limit) {
         char one[160];
         snprintf(one, sizeof(one), "%s!<unterminated symbol>", dll_name);
         if (!out->first_gap[0]) snprintf(out->first_gap, sizeof(out->first_gap), "%s", one);
@@ -735,53 +758,11 @@ void dry_thunks(const u8* file, size_t size, const trt_section_header* secs,
     }
     (void)iat_off;
 
-    bool binds = false;
-
-    // ---- 1. game-dir sibling FIRST (console host searches the game dir
-    //         via VFS before consulting the system) ----
-    char sib_path[1280];
-    size_t sib_size = 0;
-    u8* sib = find_game_sibling(dll_name, sib_path, sizeof(sib_path), &sib_size);
-    if (sib) {
-      const u8* sib_sec = nullptr;
-      u32 sib_nsec = 0;
-      const trt_section_header* sib_secs = nullptr;
-      if (rd16b(sib) == 0x5A4D &&
-          file_sec_table(sib, sib_size, &sib_secs, &sib_nsec)) {
-        binds = file_exports(sib, sib_size, (const u8*)sib_secs, sib_nsec,
-                             sym_name, ordinal);
-      }
-      free(sib);
-    }
-
-    // ---- 2/3/4. module table (+ apiset redirect), STUB always binds ----
-    if (!binds && sym_name) {
-      binds = trt_module_query(dll_name, sym_name) != 0;
-    } else if (!binds && ordinal) {
-      binds = trt_module_query_ordinal(dll_name, ordinal) != 0;
-    }
-
-    // ---- 5. SYSTEM iff on the console whitelist ----
-    if (!binds && whitelist_has(dll_name)) binds = true;
-
-    if (binds) {
+    const int cls = classify_import(dll_name, sym_name, ordinal, sib, sib_size);
+    add_coverage(dll_name, sym_name, ordinal, cls);
+    if (cls != TRT_IMPL_UNRESOLVED) {
       ++out->bound;
-      add_coverage(dll_name, sym_name, ordinal);
-      if (g_symbols_mode) {
-        char ord_label[16];
-        if (!sym_name && ordinal)
-          snprintf(ord_label, sizeof(ord_label), "#%u", (unsigned)ordinal);
-        else
-          snprintf(ord_label, sizeof(ord_label), "#ordinal");
-        printf("SYMBOL %s %s!%s %s\n", g_sym_pe, dll_name,
-               sym_name ? sym_name : ord_label,
-               impl_class_name(classify_one(dll_name, sym_name, ordinal)));
-      }
     } else {
-      // Nothing binds this symbol: the loader fails right here, which makes it
-      // the most severe gap class. Record it by name for the worklist, since
-      // add_coverage() is only reached for symbols that do bind.
-      if (sym_name) gap_record(dll_name, sym_name, TRT_IMPL_UNRESOLVED);
       char one[160];
       if (sym_name) snprintf(one, sizeof(one), "%s!%s", dll_name, sym_name);
       else snprintf(one, sizeof(one), "%s!#%u", dll_name, (unsigned)ordinal);
@@ -789,6 +770,7 @@ void dry_thunks(const u8* file, size_t size, const trt_section_header* secs,
       append_csv(out->unresolved, sizeof(out->unresolved), one);
     }
   }
+  free(sib);
 }
 
 // Delay-import coverage. The loader binds delay descriptors eagerly, so a
@@ -822,30 +804,34 @@ void delay_coverage(const file_pe& pe, const u8* file, size_t size) {
     const u64 nm_off = rva_to_file(file, size, pe.secs, pe.nsec, name_rva);
     if (!nm_off || nm_off >= size) continue;
     char dll[96];
+    const size_t name_limit = std::min(sizeof(dll), size - nm_off);
+    if (strnlen((const char*)file + nm_off, name_limit) == name_limit) continue;
     snprintf(dll, sizeof(dll), "%s", (const char*)(file + nm_off));
     const u64 thunks = rva_to_file(file, size, pe.secs, pe.nsec, int_rva);
     if (!thunks) continue;
+    char sib_path[1280];
+    size_t sib_size = 0;
+    u8* sib = find_game_sibling(dll, sib_path, sizeof(sib_path), &sib_size);
     for (u64 t = 0; t < 200000; ++t) {
       const u64 to = thunks + t * stride;
       if (to + stride > size) break;
       const u64 thunk = pe.is_pe32 ? rd32b(file + to) : rd64b(file + to);
       if (!thunk) break;
-      if (thunk & flag) continue;  // ordinal: real by construction
-      const u64 hn = rva_to_file(file, size, pe.secs, pe.nsec,
-                                 thunk & 0x7FFFFFFFu);
-      if (!hn || hn + 2 >= size) continue;
-      const char* sym = (const char*)(file + hn + 2);
-      if (strnlen(sym, 256) == 256) continue;
-      ++g_cov_delay;
-      add_coverage(dll, sym);
-      if (g_symbols_mode) {
-        int c = TRT_IMPL_REAL, have = 0;
-        const char* cls = trt_symbol_class(dll, sym, &have)
-                              ? impl_class_name(c = have)
-                              : "unresolved";
-        printf("SYMBOL %s %s!%s %s\n", g_sym_pe, dll, sym, cls);
+      u16 ordinal = 0;
+      const char* sym = nullptr;
+      if (thunk & flag) {
+        ordinal = static_cast<u16>(thunk);
+      } else {
+        const u64 hn = rva_to_file(file, size, pe.secs, pe.nsec, thunk);
+        if (!hn || hn + 2 >= size) continue;
+        sym = (const char*)(file + hn + 2);
+        const size_t limit = std::min<size_t>(256, size - (hn + 2));
+        if (strnlen(sym, limit) == limit) continue;
       }
+      ++g_cov_delay;
+      add_coverage(dll, sym, ordinal, classify_import(dll, sym, ordinal, sib, sib_size));
     }
+    free(sib);
   }
 }
 
@@ -854,7 +840,7 @@ void dry_run_pe(const char* path, const char* name, const u8* file,
   (void)path;
   g_sym_pe = name;
   g_cov_real = g_cov_recorded = g_cov_silent = g_cov_unresolved = 0;
-  g_cov_delay = 0;
+  g_cov_delay = g_cov_bundled = g_cov_system = 0;
   ++g_pe_seq;  // gap dedup is per PE, not per import
   file_pe pe;
   if (!file_pe_open(file, size, &pe)) {
@@ -864,18 +850,14 @@ void dry_run_pe(const char* path, const char* name, const u8* file,
   const trt_data_directory* imp_dir = &pe.dirs[TRT_PE_DIR_IMPORT];
   const u32 imp_va = imp_dir->virtual_address;
   const u32 imp_sz = imp_dir->size;
+  const u64 imp_off = rva_to_file(file, size, pe.secs, pe.nsec, imp_va);
   if (!imp_va || !imp_sz) {
     printf("  dry-run: (no import directory)\n");
-    return;
-  }
-  const u64 imp_off = rva_to_file(file, size, pe.secs, pe.nsec, imp_va);
-  if (!imp_off) {
+  } else if (!imp_off) {
     printf("  dry-run: IMPORT DIR UNREADABLE (rva=%x)\n", imp_va);
-    return;
   }
 
-  printf("  dry-run (file-level import audit, game dir first):\n");
-  for (u32 d = 0; d + sizeof(trt_import_descriptor) <= imp_sz &&
+  for (u32 d = 0; imp_off && d + sizeof(trt_import_descriptor) <= imp_sz &&
                   imp_off + d + sizeof(trt_import_descriptor) <= size;
        d += sizeof(trt_import_descriptor)) {
     const u8* dp = file + imp_off + d;
@@ -889,6 +871,11 @@ void dry_run_pe(const char* path, const char* name, const u8* file,
       continue;
     }
     char dll_name[96];
+    const size_t name_limit = std::min(sizeof(dll_name), size - nm_off);
+    if (strnlen((const char*)file + nm_off, name_limit) == name_limit) {
+      printf("    <unterminated dll name> route=? imports=0 bound=0\n");
+      continue;
+    }
     snprintf(dll_name, sizeof(dll_name), "%s", (const char*)(file + nm_off));
     const u64 int_off = rva_to_file(file, size, pe.secs, pe.nsec,
                                     oft ? oft : iat_rva);
@@ -918,11 +905,12 @@ void dry_run_pe(const char* path, const char* name, const u8* file,
   if (g_coverage_mode) {
     delay_coverage(pe, file, size);
     const int total =
-        g_cov_real + g_cov_recorded + g_cov_silent + g_cov_unresolved;
+        g_cov_real + g_cov_recorded + g_cov_silent + g_cov_unresolved +
+        g_cov_bundled + g_cov_system;
     printf("COVERAGE %s: imports=%d real=%d recorded=%d named-silent=%d "
-           "unresolved=%d delay=%d\n",
+           "unresolved=%d bundled=%d system-candidate=%d delay=%d\n",
            name, total, g_cov_real, g_cov_recorded, g_cov_silent,
-           g_cov_unresolved, g_cov_delay);
+           g_cov_unresolved, g_cov_bundled, g_cov_system, g_cov_delay);
   }
 }
 
@@ -986,6 +974,15 @@ int run_corpus(int argc, char** argv) {
     if (!trt_symbol_class("kernel32.dll", "VirtualAlloc", &cls) ||
         cls != TRT_IMPL_REAL) {
       printf("COVERAGE SELFTEST FAIL: kernel32!VirtualAlloc must be REAL\n");
+      return 1;
+    }
+    if (classify_import("kernel32.dll", "VirtualAlloc", 0, nullptr, 0) != TRT_IMPL_REAL ||
+        classify_import("kernel32.dll", "UnknownCorpFixture", 0, nullptr, 0) == TRT_IMPL_REAL ||
+        classify_import("bcrypt.dll", "BCryptGenRandom", 0, nullptr, 0) !=
+            COVERAGE_SYSTEM_CANDIDATE ||
+        classify_import("absent-corpus-fixture.dll", nullptr, 42, nullptr, 0) !=
+            TRT_IMPL_UNRESOLVED) {
+      printf("COVERAGE SELFTEST FAIL: provider candidates and missing exports need distinct classes\n");
       return 1;
     }
     // msacm32 used to be whole-module named-silent. It now ships real
