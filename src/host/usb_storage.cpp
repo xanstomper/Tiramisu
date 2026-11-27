@@ -24,6 +24,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <set>
@@ -80,7 +81,6 @@ std::string g_games_dir;
 std::string g_package_dir;
 
 std::vector<webxfer_storage_volume> g_external_volumes;
-std::vector<std::string> g_external_direct_game_dirs;
 std::mutex g_usb_broker_mu;
 std::map<std::string, winrt::Windows::Storage::StorageFolder> g_usb_broker_folders;
 std::map<std::string, winrt::Windows::Storage::StorageFile> g_usb_broker_files;
@@ -92,10 +92,10 @@ std::atomic<bool> g_usb_scan_running{false};
 std::atomic<bool> g_usb_scan_ready{false};
 std::mutex g_usb_scan_mu;
 std::vector<webxfer_storage_volume> g_usb_scan_vols;
-std::vector<std::string> g_usb_scan_direct_dirs;
 std::map<std::string, winrt::Windows::Storage::StorageFolder> g_usb_scan_folders;
 std::map<std::string, winrt::Windows::Storage::StorageFile> g_usb_scan_files;
 std::string g_usb_scan_broker_status = "checking";
+std::string g_usb_broker_status = "checking";
 
 std::atomic<bool> g_usb_copy_active{false};
 std::atomic<uint64_t> g_usb_copy_done{0}, g_usb_copy_total{0};
@@ -105,9 +105,20 @@ std::atomic<bool> g_usb_copy_needs_rescan{false};
 std::string g_usb_copy_toast;
 
 std::string volume_key(std::string path) {
+  std::replace(path.begin(), path.end(), '/', '\\');
   while (path.size() > 1 && (path.back() == '\\' || path.back() == '/'))
     path.pop_back();
   return lower_ascii(std::move(path));
+}
+
+constexpr const char* k_game_containers[] = {
+    "Games", "TiramisuGames", "Tiramisu Games", "Tiramisu",
+    "PC Games", "PCGames", "Downloads",
+};
+
+bool is_game_container(const std::string& low) {
+  return std::any_of(std::begin(k_game_containers), std::end(k_game_containers),
+                     [&](const char* name) { return lower_ascii(name) == low; });
 }
 
 bool is_reserved_usb_root_dir(const std::string& name) {
@@ -115,9 +126,7 @@ bool is_reserved_usb_root_dir(const std::string& name) {
   return low == "." || low == ".." || low == "$recycle.bin" ||
          low == "system volume information" || low == "windowsapps" ||
          low == "xbox" || low == "xboxgames" || low == "programdata" ||
-         low == "games" || low == "tiramisugames" || low == "tiramisu" ||
-         low == "pc games" || low == "pcgames" || low == "downloads" ||
-         low == "steamlibrary" || low == "__macosx";
+         is_game_container(low) || low == "steamlibrary" || low == "__macosx";
 }
 
 bool is_game_archive_ext(const std::string& low_name, std::string* out_kind) {
@@ -146,43 +155,48 @@ bool win32_dir_readable_w(const std::string& path) {
   return GetLastError() == ERROR_FILE_NOT_FOUND;
 }
 
-bool win32_dir_has_game_w(const std::string& dir, int depth, std::string* first_exe,
-                          uint64_t* approx_bytes) {
-  if (depth > 2) return false;
-  std::wstring w = host_u82ws(dir);
-  while (!w.empty() && (w.back() == L'\\' || w.back() == L'/')) w.pop_back();
-  w += L"\\*";
+bool win32_file_readable_w(const std::string& path) {
+  if (path.empty()) return false;
+  HANDLE h = CreateFile2(host_u82ws(path).c_str(), GENERIC_READ,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         OPEN_EXISTING, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  CloseHandle(h);
+  return true;
+}
+
+bool win32_dir_has_game_w(const std::string& dir, int depth, std::string* first_exe) {
+  if (depth > 5 || dir.empty()) return false;
+  std::wstring search = host_u82ws(dir);
+  while (!search.empty() && (search.back() == L'\\' || search.back() == L'/'))
+    search.pop_back();
+  search += L"\\*";
   WIN32_FIND_DATAW fd{};
-  HANDLE h = FindFirstFileW(w.c_str(), &fd);
+  HANDLE h = FindFirstFileW(search.c_str(), &fd);
   if (h == INVALID_HANDLE_VALUE) return false;
   bool found = false;
-  uint64_t bytes = 0;
   do {
     const std::string fn = host_ws2u8(fd.cFileName);
-    if (fn == "." || fn == ".." || fn == "__MACOSX") continue;
+    if (fn == "." || fn == ".." || fn == "__MACOSX" ||
+        (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
     const std::string full = dir + "\\" + fn;
+    const std::string low = lower_ascii(fn);
     if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-      const std::string low = lower_ascii(fn);
       if (low == "thirdparty" || low == "extras" || low == "prereqs") continue;
-      if (win32_dir_has_game_w(full, depth + 1, first_exe, &bytes)) {
+      std::string child_exe;
+      if (win32_dir_has_game_w(full, depth + 1, &child_exe)) {
+        if (first_exe && !child_exe.empty()) *first_exe = fn + "\\" + child_exe;
         found = true;
       }
+    } else if (low.ends_with(".exe") && !is_junk_exe(fn) && win32_file_readable_w(full)) {
+      if (first_exe) *first_exe = fn;
+      found = true;
     } else {
-      const uint64_t sz = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-      bytes += sz;
-      const std::string low = lower_ascii(fn);
       std::string kind;
-      if (low.size() > 4 && low.compare(low.size() - 4, 4, ".exe") == 0 &&
-          !is_junk_exe(fn)) {
-        if (first_exe && first_exe->empty()) *first_exe = fn;
-        found = true;
-      } else if (is_game_archive_ext(low, &kind) && kind == "iso") {
-        found = true;
-      }
+      found = is_game_archive_ext(low, &kind) && kind == "iso" && win32_file_readable_w(full);
     }
-  } while (FindNextFileW(h, &fd));
+  } while (!found && FindNextFileW(h, &fd));
   FindClose(h);
-  if (approx_bytes) *approx_bytes += bytes;
   return found;
 }
 
@@ -233,8 +247,8 @@ void run_external_storage_scan_worker() {
   std::vector<raw_vol> candidates;
   std::string broker_status = "unavailable";
 
-  // 1. WinRT RemovableDevices broker (detects NTFS, exFAT, and FAT32 USB drives
-  //    on Xbox Dev Mode even when raw Win32 ACLs restrict direct directory reads).
+  // 1. The Windows.Storage broker exposes removable media and declared file
+  // types when the console grants access to the package.
   try {
     using winrt::Windows::Storage::KnownFolders;
     auto folders = KnownFolders::RemovableDevices().GetFoldersAsync().get();
@@ -245,6 +259,10 @@ void run_external_storage_scan_worker() {
       candidates.push_back({std::move(name), std::move(path), folder, true, true});
     }
     broker_status = "ready";
+  } catch (const winrt::hresult_error& error) {
+    char code[16];
+    snprintf(code, sizeof(code), "0x%08x", static_cast<unsigned>(error.code().value));
+    broker_status = std::string("unavailable ") + code;
   } catch (...) {
     broker_status = "unavailable";
   }
@@ -319,10 +337,8 @@ void run_external_storage_scan_worker() {
   }
 
   std::vector<webxfer_storage_volume> out_vols;
-  std::vector<std::string> out_direct_dirs;
   std::map<std::string, winrt::Windows::Storage::StorageFolder> out_folders;
   std::map<std::string, winrt::Windows::Storage::StorageFile> out_files;
-  int next_id = 1;
 
   for (const auto& cand : candidates) {
     webxfer_storage_volume vol;
@@ -355,17 +371,29 @@ void run_external_storage_scan_worker() {
     }
 
     vol.win32_readable = win32_dir_readable_w(vol.path);
-    std::set<std::string> seen_items;
+    std::map<std::string, size_t> seen_items;
 
     auto add_item = [&](const std::string& disp_name, const std::string& full_path,
                         const std::string& kind, const std::string& exe_rel,
                         uint64_t sz, bool w32_ok,
                         winrt::Windows::Storage::StorageFolder bfolder,
                         winrt::Windows::Storage::StorageFile bfile) {
-      const std::string ik = lower_ascii(disp_name + "|" + kind + "|" + full_path);
-      if (!seen_items.insert(ik).second) return;
+      const std::string ik = kind + "|" + volume_key(full_path);
+      const auto [it, inserted] = seen_items.emplace(ik, vol.items.size());
+      if (!inserted) {
+        const auto& existing = vol.items[it->second];
+        if (bfolder) out_folders.emplace(existing.id, std::move(bfolder));
+        if (bfile) out_files.emplace(existing.id, std::move(bfile));
+        return;
+      }
+      // Stable across polls and independent of volume or directory iteration order.
+      uint64_t hash = 14695981039346656037ull;
+      for (unsigned char c : volume_key(vol.path.empty() ? vol.name : vol.path) + "|" + ik) {
+        hash ^= c;
+        hash *= 1099511628211ull;
+      }
       webxfer_usb_item item;
-      item.id = "usb-" + std::to_string(next_id++);
+      item.id = "usb-" + std::to_string(hash);
       item.name = disp_name;
       item.volume_path = vol.path.empty() ? vol.name : vol.path;
       item.fs = vol.fs;
@@ -380,28 +408,25 @@ void run_external_storage_scan_worker() {
       vol.items.push_back(std::move(item));
     };
 
-    if (vol.win32_readable && !vol.path.empty()) {
+    if (!vol.path.empty()) {
       std::string base = vol.path;
       if (base.back() != '\\' && base.back() != '/') base += '\\';
 
       if (cand.from_broker && base.size() > 3) {
         std::string first_exe;
-        uint64_t sz = 0;
-        if (win32_dir_has_game_w(vol.path, 0, &first_exe, &sz)) {
-          out_direct_dirs.push_back(vol.path);
+        if (win32_dir_has_game_w(vol.path, 0, &first_exe)) {
           add_item(sanitize_usb_item_name(cand.name, "folder"), vol.path, "folder",
-                   first_exe, sz, true, cand.folder, nullptr);
+                   first_exe, 0, true, cand.folder, nullptr);
         }
       }
 
-      const char* containers[] = {"Games", "TiramisuGames", "Tiramisu",
-                                  "PC Games", "PCGames", "Downloads"};
       std::vector<std::string> candidate_containers;
-      for (const char* sub : containers) candidate_containers.push_back(base + sub);
+      for (const char* sub : k_game_containers) candidate_containers.push_back(base + sub);
       candidate_containers.push_back(base + "SteamLibrary\\steamapps\\common");
 
       for (const auto& cpath : candidate_containers) {
         if (!win32_dir_readable_w(cpath)) continue;
+        vol.win32_readable = true;
         vol.game_roots.push_back(cpath);
         WIN32_FIND_DATAW fd{};
         HANDLE h = FindFirstFileW((host_u82ws(cpath) + L"\\*").c_str(), &fd);
@@ -412,14 +437,13 @@ void run_external_storage_scan_worker() {
             const std::string ep = cpath + "\\" + fn;
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
               std::string first_exe;
-              uint64_t sz = 0;
-              if (win32_dir_has_game_w(ep, 0, &first_exe, &sz)) {
+              if (win32_dir_has_game_w(ep, 0, &first_exe)) {
                 add_item(sanitize_usb_item_name(fn, "folder"), ep, "folder",
-                         first_exe, sz, true, nullptr, nullptr);
+                         first_exe, 0, true, nullptr, nullptr);
               }
             } else {
               std::string kind;
-              if (is_game_archive_ext(lower_ascii(fn), &kind)) {
+              if (is_game_archive_ext(lower_ascii(fn), &kind) && win32_file_readable_w(ep)) {
                 const uint64_t sz = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
                 add_item(sanitize_usb_item_name(fn, kind), ep, kind, "", sz, true,
                          nullptr, nullptr);
@@ -439,15 +463,13 @@ void run_external_storage_scan_worker() {
           if (rfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             if (is_reserved_usb_root_dir(fn)) continue;
             std::string first_exe;
-            uint64_t sz = 0;
-            if (win32_dir_has_game_w(full, 0, &first_exe, &sz)) {
-              out_direct_dirs.push_back(full);
+            if (win32_dir_has_game_w(full, 0, &first_exe)) {
               add_item(sanitize_usb_item_name(fn, "folder"), full, "folder",
-                       first_exe, sz, true, nullptr, nullptr);
+                       first_exe, 0, true, nullptr, nullptr);
             }
           } else {
             std::string kind;
-            if (is_game_archive_ext(lower_ascii(fn), &kind)) {
+            if (is_game_archive_ext(lower_ascii(fn), &kind) && win32_file_readable_w(full)) {
               const uint64_t sz = ((uint64_t)rfd.nFileSizeHigh << 32) | rfd.nFileSizeLow;
               add_item(sanitize_usb_item_name(fn, kind), full, kind, "", sz, true,
                        nullptr, nullptr);
@@ -458,7 +480,8 @@ void run_external_storage_scan_worker() {
       }
     }
 
-    if (cand.folder && (vol.items.empty() || !vol.win32_readable)) {
+    // A readable volume can still expose some files only through the broker.
+    if (cand.folder) {
       auto inspect_broker_game = [&](const winrt::Windows::Storage::StorageFolder& gf) {
         const std::string gname = host_ws2u8(gf.Name().c_str());
         if (is_reserved_usb_root_dir(gname)) return;
@@ -491,7 +514,7 @@ void run_external_storage_scan_worker() {
           if (!exe.empty()) {
             std::string fpath;
             try { fpath = host_ws2u8(gf.Path().c_str()); } catch (...) {}
-            const bool r32 = !fpath.empty() && win32_dir_readable_w(fpath);
+            const bool r32 = win32_dir_has_game_w(fpath, 0, nullptr);
             add_item(sanitize_usb_item_name(gname, "folder"),
                      fpath.empty() ? (vol.name + "\\" + gname) : fpath,
                      "folder", exe, 0, r32, gf, nullptr);
@@ -509,14 +532,13 @@ void run_external_storage_scan_worker() {
           try { fpath = host_ws2u8(f.Path().c_str()); } catch (...) {}
           add_item(sanitize_usb_item_name(fn, kind),
                    fpath.empty() ? (vol.name + "\\" + fn) : fpath,
-                   kind, "", 0, vol.win32_readable, nullptr, f);
+                   kind, "", 0, win32_file_readable_w(fpath), nullptr, f);
         }
         auto root_folders = cand.folder.GetFoldersAsync().get();
         for (const auto& rf : root_folders) {
           const std::string rname = host_ws2u8(rf.Name().c_str());
           const std::string low = lower_ascii(rname);
-          if (low == "games" || low == "tiramisugames" || low == "tiramisu" ||
-              low == "pc games" || low == "pcgames" || low == "downloads") {
+          if (is_game_container(low)) {
             auto sub_files = rf.GetFilesAsync().get();
             for (const auto& sf : sub_files) {
               const std::string sfn = host_ws2u8(sf.Name().c_str());
@@ -526,7 +548,7 @@ void run_external_storage_scan_worker() {
               try { spath = host_ws2u8(sf.Path().c_str()); } catch (...) {}
               add_item(sanitize_usb_item_name(sfn, kind),
                        spath.empty() ? (vol.name + "\\" + rname + "\\" + sfn) : spath,
-                       kind, "", 0, vol.win32_readable, nullptr, sf);
+                       kind, "", 0, win32_file_readable_w(spath), nullptr, sf);
             }
             auto sub_folders = rf.GetFoldersAsync().get();
             for (const auto& gf : sub_folders) inspect_broker_game(gf);
@@ -538,6 +560,9 @@ void run_external_storage_scan_worker() {
     }
 
     if (cand.is_removable || cand.from_broker || !vol.game_roots.empty() || !vol.items.empty()) {
+      std::sort(vol.items.begin(), vol.items.end(), [](const auto& a, const auto& b) {
+        return a.id < b.id;
+      });
       if (vol.fs.empty() && cand.from_broker) vol.fs = "USB";
       out_vols.push_back(std::move(vol));
     }
@@ -551,7 +576,6 @@ void run_external_storage_scan_worker() {
   {
     std::lock_guard<std::mutex> lk(g_usb_scan_mu);
     g_usb_scan_vols = std::move(out_vols);
-    g_usb_scan_direct_dirs = std::move(out_direct_dirs);
     g_usb_scan_folders = std::move(out_folders);
     g_usb_scan_files = std::move(out_files);
     g_usb_scan_broker_status = broker_status;
@@ -816,21 +840,19 @@ bool poll(bool force) {
 
   if (g_usb_scan_ready.exchange(false)) {
     std::vector<webxfer_storage_volume> vols;
-    std::vector<std::string> direct_dirs;
     std::string broker_status;
     {
       std::lock_guard<std::mutex> lk(g_usb_scan_mu);
       vols = std::move(g_usb_scan_vols);
-      direct_dirs = std::move(g_usb_scan_direct_dirs);
       broker_status = g_usb_scan_broker_status;
       std::lock_guard<std::mutex> blk(g_usb_broker_mu);
       g_usb_broker_folders = std::move(g_usb_scan_folders);
       g_usb_broker_files = std::move(g_usb_scan_files);
     }
-    const bool changed = (vols != g_external_volumes) || (direct_dirs != g_external_direct_game_dirs);
+    const bool changed = vols != g_external_volumes || broker_status != g_usb_broker_status;
     const size_t prev_cnt = g_external_volumes.size();
     g_external_volumes = std::move(vols);
-    g_external_direct_game_dirs = std::move(direct_dirs);
+    g_usb_broker_status = broker_status;
     webxfer_set_external_storage(g_external_volumes, broker_status);
     if (changed) {
       log_line(("storage: USB/external discovery (" + broker_status +

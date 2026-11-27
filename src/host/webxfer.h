@@ -12,6 +12,8 @@
 
 namespace longan {
 
+inline constexpr char kPortalGamesFolder[] = "TiramisuGames";
+
 struct webxfer_usb_item {
   std::string id;
   std::string name;
@@ -50,6 +52,9 @@ void webxfer_set_usb_install_status(bool active, const std::string& phase,
 bool webxfer_extract_zip_to_dir(const std::string& zip_path, const std::string& dest_dir,
                                 std::string* out_note, bool require_complete = true);
 bool webxfer_sanitize_game_name(const std::string& raw, std::string* out);
+// Extract one completed Device Portal ZIP and publish it without replacing a game.
+bool webxfer_import_portal_zip(const std::string& local_state,
+                               const std::string& filename, std::string* note);
 
 struct webxfer_state {
   bool running = false;
