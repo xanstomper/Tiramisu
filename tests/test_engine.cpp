@@ -805,6 +805,25 @@ int main(int argc, char** argv) {
     CHECK(r0ok && nread == 4 && memcmp(buf, "orig", 4) == 0,
           "Z:\\ro.txt reads original content before write");
 
+    void* const bad_file = reinterpret_cast<void*>(static_cast<uintptr_t>(-1));
+    void* denied = trt_CreateFileW(wpath, 0x80000000u, 1, nullptr, 5, 0, nullptr);
+    CHECK(denied == bad_file && trt_GetLastError() == 5 && access(ovfile, F_OK) != 0,
+          "TRUNCATE_EXISTING without write access leaves the mounted asset untouched");
+    if (denied != bad_file) trt_CloseHandle(denied);
+    void* truncated = trt_CreateFileW(wpath, 0x40000000u, 1, nullptr, 5, 0, nullptr);
+    struct stat base_file{}, writable_file{};
+    CHECK(truncated != bad_file && stat(ovfile, &writable_file) == 0 &&
+              writable_file.st_size == 0 && stat(zfile, &base_file) == 0 && base_file.st_size == 4,
+          "TRUNCATE_EXISTING publishes an empty overlay and preserves the original");
+    if (truncated != bad_file) trt_CloseHandle(truncated);
+    u16 absent_path[64];
+    w16(absent_path, "C:\\absent-truncate.bin");
+    void* absent = trt_CreateFileW(absent_path, 0x40000000u, 1, nullptr, 5, 0, nullptr);
+    CHECK(absent == bad_file && trt_GetLastError() == 2 &&
+              trt_GetFileAttributesW(absent_path) == 0xffffffffu,
+          "TRUNCATE_EXISTING on an absent file reports FILE_NOT_FOUND without creating it");
+    if (absent != bad_file) trt_CloseHandle(absent);
+
     void* hw = trt_CreateFileW(wpath, 0x40000000u, 0u, nullptr, 2u, 0x80u, nullptr);
     u32 nwr = 0;
     int wok = (hw != (void*)(uintptr_t)-1) &&
