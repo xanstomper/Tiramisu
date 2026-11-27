@@ -42,8 +42,8 @@
     <Capability Name="internetClientServer" />
     <Capability Name="privateNetworkClientServer" />
     <Capability Name="codeGeneration" />
+    <uap:Capability Name="removableStorage" />
     <rescap:Capability Name="inputForegroundObservation" />
     <rescap:Capability Name="expandedResources" />
-    <DeviceCapability Name="removableStorage" />
   </Capabilities>
 </Package>
