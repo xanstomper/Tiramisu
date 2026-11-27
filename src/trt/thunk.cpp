@@ -1,31 +1,9 @@
 // tiramisu/src/trt/thunk.cpp
 // Per-symbol fail-visible thunks (see thunk.h).
 //
-// Why machine code: the thunk must be callable through the guest's IAT,
-// so it has to be a real code address with a known calling convention.
-// The stub is Win64-correct, which is the part that bites:
-//
-//   Win64 nonvolatile registers are rbx, rbp, rdi, rsi, rsp, r12-r15.
-//   The guest keeps locals in those across a call, so a stub that
-//   clobbers rdi corrupts the guest SILENTLY (this bit us once already).
-//   We save/restore rdi+rsi around the handler and keep the stack
-//   16-byte aligned for the handler's own ABI:
-//
-//   57                push rdi
-//   56                push rsi
-//   48 83 EC 08       sub  rsp, 8
-//   48 BF/B9 <idx>    mov  rdi/rcx, idx     ; host ABI first-arg register
-//   49 BB <handler>   mov  r11, handler
-//   41 FF D3          call r11
-//   48 83 C4 08       add  rsp, 8
-//   5E                pop  rsi
-//   5F                pop  rdi
-//   C3                ret
-//
-// The handler then logs the symbol name and returns 0 in rax.
-//
-// W^X: the page is allocated RW through the backend, written, then flipped
-// to RX - never RWX, exactly like the PE image seal path.
+// The dispatcher uses the guest ABI. A tail jump reuses the caller's
+// return address and shadow space, so the generated code stays a leaf and
+// never needs its own unwind metadata.
 #include "thunk.h"
 
 #include <stdio.h>
@@ -48,38 +26,28 @@ struct thunk_entry {
   std::string sym;
   void* code = nullptr;
   u64 ret_val = 0;
+  u64 launch_generation = 0;
+  unsigned logged_calls = 0;
 };
 
 std::mutex g_thunk_mu;
 std::deque<thunk_entry> g_thunks;
 std::unordered_map<std::string, size_t> g_thunk_map;
 std::vector<unsigned char*> g_thunk_pages;
+u64 g_launch_generation = 1;
+trt_unsupported_api_call g_first_call{};
 
 std::mutex g_backend_mu;
 trt_backend g_backend;
 bool g_backend_set = false;
 
-#ifdef _WIN32
-// Win64 host ABI: first argument register is rcx (volatile - no save needed).
+#if defined(_WIN32) || (defined(__x86_64__) && defined(__clang__))
 const unsigned char k_stub_arg_mov[] = {0x48, 0xB9};  // mov rcx, imm64
 #else
-// SysV host ABI (Linux test harness): first argument register is rdi, which
-// is NONVOLATILE in Win64 - hence the explicit save/restore around it.
 const unsigned char k_stub_arg_mov[] = {0x48, 0xBF};  // mov rdi, imm64
 #endif
-const unsigned char k_stub_head[] = {
-    0x57,                    // push rdi
-    0x56,                    // push rsi
-    0x48, 0x83, 0xEC, 0x08,  // sub rsp, 8   (stack alignment for the call)
-};
-const unsigned char k_stub_mov_r11[] = {0x49, 0xBB};        // mov r11, imm64
-const unsigned char k_stub_call_r11[] = {0x41, 0xFF, 0xD3}; // call r11
-const unsigned char k_stub_tail[] = {
-    0x48, 0x83, 0xC4, 0x08,  // add rsp, 8
-    0x5E,                    // pop rsi
-    0x5F,                    // pop rdi
-    0xC3,                    // ret
-};
+const unsigned char k_stub_mov_r11[] = {0x49, 0xBB}; // mov r11, imm64
+const unsigned char k_stub_jmp_r11[] = {0x41, 0xFF, 0xE3}; // jmp r11
 
 void put_u64(unsigned char* p, u64 v) {
   for (int i = 0; i < 8; ++i) p[i] = (unsigned char)((v >> (i * 8)) & 0xFF);
@@ -87,13 +55,11 @@ void put_u64(unsigned char* p, u64 v) {
 
 void write_stub_slot(unsigned char* code, u64 index, u64 dispatch_addr) {
   unsigned char* p = code;
-  memcpy(p, k_stub_head, sizeof(k_stub_head)); p += sizeof(k_stub_head);
   memcpy(p, k_stub_arg_mov, sizeof(k_stub_arg_mov)); p += sizeof(k_stub_arg_mov);
   put_u64(p, index); p += 8;
   memcpy(p, k_stub_mov_r11, sizeof(k_stub_mov_r11)); p += sizeof(k_stub_mov_r11);
   put_u64(p, dispatch_addr); p += 8;
-  memcpy(p, k_stub_call_r11, sizeof(k_stub_call_r11)); p += sizeof(k_stub_call_r11);
-  memcpy(p, k_stub_tail, sizeof(k_stub_tail));
+  memcpy(p, k_stub_jmp_r11, sizeof(k_stub_jmp_r11));
 }
 
 } // namespace
@@ -128,39 +94,47 @@ void trt_core_log(const char* line) {
   else fprintf(stderr, "  [trt] %s\n", tagged);
 }
 
-// the target of every stub: names the symbol, returns ret_val
-extern "C" u64 trt_thunk_dispatch(u64 index) {
-  std::string kind, mod, sym;
+void trt_thunk_begin_launch(void) {
+  std::lock_guard<std::mutex> lk(g_thunk_mu);
+  ++g_launch_generation;
+  g_first_call = {};
+}
+
+trt_unsupported_api_call trt_thunk_first_call(void) {
+  std::lock_guard<std::mutex> lk(g_thunk_mu);
+  return g_first_call;
+}
+
+u64 TRT_GUEST_ABI trt_thunk_dispatch(u64 index) {
+  char line[512]{};
   u64 ret = 0;
-  bool found = false;
   {
     std::lock_guard<std::mutex> lk(g_thunk_mu);
     if (index < (u64)g_thunks.size()) {
-      const thunk_entry& e = g_thunks[(size_t)index];
-      kind = e.kind;
-      mod = e.mod;
-      sym = e.sym;
+      thunk_entry& e = g_thunks[(size_t)index];
       ret = e.ret_val;
-      found = true;
+      if (e.launch_generation != g_launch_generation) {
+        e.launch_generation = g_launch_generation;
+        e.logged_calls = 0;
+      }
+      if (g_first_call.observed_calls++ == 0) {
+        g_first_call.thread_id = trt_GetCurrentThreadId();
+        g_first_call.return_value = ret;
+        snprintf(g_first_call.kind, sizeof(g_first_call.kind), "%s", e.kind.c_str());
+        snprintf(g_first_call.name, sizeof(g_first_call.name), "%s!%s",
+                 e.mod.c_str(), e.sym.c_str());
+      }
+      if (e.logged_calls < 6) {
+        ++e.logged_calls;
+        snprintf(line, sizeof(line),
+                 "trt: %s %s!%s called (unimplemented) -> ret=0x%llx",
+                 e.kind.c_str(), e.mod.c_str(), e.sym.c_str(), (unsigned long long)ret);
+      }
+    } else {
+      snprintf(line, sizeof(line), "trt: thunk called with a bad index");
     }
   }
-  if (found) {
-    static std::unordered_map<u64, int> s_call_counts;
-    static std::mutex s_log_mu;
-    bool should_log = false;
-    {
-      std::lock_guard<std::mutex> lk(s_log_mu);
-      if (++s_call_counts[index] <= 6) should_log = true;
-    }
-    if (should_log) {
-      char line[512];
-      snprintf(line, sizeof(line), "trt: %s %s!%s called (unimplemented) -> ret=0x%llx",
-               kind.c_str(), mod.c_str(), sym.c_str(), (unsigned long long)ret);
-      trt_core_log(line);
-    }
-  } else {
-    trt_core_log("trt: thunk called with a bad index");
-  }
+  if (line[0]) trt_core_log(line);
   return ret;
 }
 
@@ -186,7 +160,9 @@ void* trt_thunk_make_ext(const trt_backend* be, const char* kind, const char* mo
       return g_thunks[it->second].code;
     }
 
-    if (!backend || !backend->alloc || !backend->protect) return nullptr;
+    if (!backend || !backend->alloc || !backend->protect || !backend->release) {
+      return nullptr;
+    }
 
     const size_t index = g_thunks.size();
     const size_t page_idx = index / k_thunks_per_page;
@@ -201,7 +177,10 @@ void* trt_thunk_make_ext(const trt_backend* be, const char* kind, const char* mo
       for (size_t s = 0; s < k_thunks_per_page; ++s) {
         write_stub_slot(page + s * k_thunk_stride, base_idx + s, dispatch_addr);
       }
-      backend->protect(page, 4096, TRT_PROT_R | TRT_PROT_X);
+      if (backend->protect(page, 4096, TRT_PROT_R | TRT_PROT_X) != 0) {
+        backend->release(page, 4096);
+        return nullptr;
+      }
       g_thunk_pages.push_back(page);
     }
 

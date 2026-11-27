@@ -22,6 +22,7 @@
 #include "settings.h"
 #include "crash_report.h"
 #include "../trt/trt.h"
+#include "../trt/thunk.h"
 #include "../trt/x86_cpu.h"
 #include "../trt/mono_host.h"
 #include "../trt/fna_platform.h"
@@ -1404,6 +1405,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     }
   } checkpoint{r};
   gap_trace_begin_launch();
+  trt_thunk_begin_launch();
   checkpoint_phase(longan::launch_phase::preparing);
   g_worker_fault_recorded.store(false);
   longan::launch_worker_fault_write(g_local_state, {});

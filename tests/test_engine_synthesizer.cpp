@@ -210,6 +210,17 @@ int main() {
 
   printf("== 2. Dynamic Thunk Synthesis & Invocation ==\n");
   {
+    trt_backend reject_exec = be;
+    static bool released = false;
+    reject_exec.protect = [](void*, size_t, unsigned) { return -1; };
+    reject_exec.release = [](void* page, size_t size) {
+      released = true;
+      test_release(page, size);
+    };
+    CHECK(!trt_thunk_make(&reject_exec, "STUB", "mycustom.dll", "Denied") && released,
+          "a thunk page rejected by the backend is released and never returned");
+    CHECK(trt_thunk_first_call().observed_calls == 0,
+          "attempted binding does not count as a guest call");
     void* thunk = trt_dynamic_synthesize_api("mycustom.dll", "CreateMagicPortal", 0);
     CHECK(thunk != nullptr, "synthesized thunk is non-null");
     CHECK(trt_dynamic_is_synthesized("mycustom.dll", "CreateMagicPortal") == 1,
@@ -221,6 +232,17 @@ int main() {
     uint64_t res = pfn();
     CHECK((res & 0x77000000ULL) == 0x77000000ULL,
           "invoking synthesized thunk returns inferred pseudo-handle");
+    const auto first_call = trt_thunk_first_call();
+    CHECK(first_call.observed_calls == 1 && first_call.return_value == res &&
+              first_call.thread_id != 0 && !strcmp(first_call.kind, "SYNTH") &&
+              !strcmp(first_call.name, "mycustom.dll!CreateMagicPortal"),
+          "executed fallback captures the API, return value, and thread");
+    pfn();
+    CHECK(trt_thunk_first_call().observed_calls == 2, "the trace counts repeated executions");
+    trt_thunk_begin_launch();
+    CHECK(trt_thunk_first_call().observed_calls == 0, "the next launch starts with a clean trace");
+    CHECK(pfn() == res && trt_thunk_first_call().observed_calls == 1,
+          "cached thunks record calls again after launch reset");
   }
 
   printf("== 2b. Dynamic lookup stays honest for missing exports ==\n");

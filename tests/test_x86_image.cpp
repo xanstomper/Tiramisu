@@ -42,7 +42,7 @@ static int be_protect(void* p, size_t n, unsigned prot) {
 static void be_release(void* p, size_t n) { munmap(p, n); }
 static void be_log(const char* line) { (void)line; }
 static trt_backend be{be_alloc, be_protect, be_release, be_log, nullptr};
-static u64 test_bridge(u64, u64, u64, u64) { return 42; }
+static u64 TRT_GUEST_ABI test_bridge(u64, u64, u64, u64) { return 42; }
 static void* rs_resolve(void*, const char* mod, const char* sym, u16) {
   if (mod && sym && !strcasecmp(mod, "testdll.dll") && !strcasecmp(sym, "TestFn"))
     return (void*)&test_bridge;
@@ -104,7 +104,7 @@ static void trace_op(u32 va, unsigned op, u32 esp) {
   if (g_trace) fprintf(g_trace, "%08x %02x esp=%08x\n", va, op, esp);
 }
 
-static u64 dummy_bridge(u64, u64, u64, u64) { return 0; }
+static u64 TRT_GUEST_ABI dummy_bridge(u64, u64, u64, u64) { return 0; }
 static void* real_resolve(void*, const char* mod, const char* sym, u16) {
   (void)mod; (void)sym;
   return (void*)&dummy_bridge;  // every import binds; traps name themselves

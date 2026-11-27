@@ -19,11 +19,11 @@ struct trap_ctx {
 
 static trt_resolver g_trap_rs{};
 
-typedef u64 (*host_call4)(u64, u64, u64, u64);
+typedef u64 (TRT_GUEST_ABI *host_call4)(u64, u64, u64, u64);
 
 // A normal C call passes the first four integer args in the platform's ABI
-// registers (Win64: rcx/rdx/r8/r9; SysV: rdi/rsi/rdx/rcx), so the compiler
-// handles the 32->64 widening for us. The 32-bit guest's arguments live on
+// registers (Win64: rcx/rdx/r8/r9), so the compiler handles the 32->64
+// widening and reserves shadow space. The 32-bit guest's arguments live on
 // its stack: [esp] is the return address, [esp+4..] the arguments.
 u64 call_host_bridge(u64 fn, trt_x86_ctx* c) {
   u64 args[4] = {0, 0, 0, 0};

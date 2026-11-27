@@ -306,6 +306,8 @@ void* trt_dynamic_synthesize_api(const char* module, const char* symbol, uint16_
 
   std::string full_key = std::string(mod_name) + "!" + sym_name;
   uint64_t ret_val = trt_dynamic_deduce_return_val(mod_name, sym_name);
+  void* thunk = trt_thunk_make_ext(trt_core_backend(), "SYNTH", mod_name, sym_name, ret_val);
+  if (!thunk) return nullptr;
 
   bool first_time = false;
   {
@@ -324,7 +326,7 @@ void* trt_dynamic_synthesize_api(const char* module, const char* symbol, uint16_
     trt_core_log(log_buf);
   }
 
-  return trt_thunk_make_ext(trt_core_backend(), "SYNTH", mod_name, sym_name, ret_val);
+  return thunk;
 }
 
 } // extern "C"

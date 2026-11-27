@@ -26,6 +26,7 @@
 #ifdef TIRAMISU_UWP_HOST
   #include "cover_art.h"
   #include "../trt/bridge_d3d.h"
+  #include "../trt/thunk.h"
   #include "swapchain.h"
   #include "../trt/iso.h"
   #include <memory>
@@ -2223,7 +2224,19 @@ void handle_client(sock_t s) {
     trt_launch_api_entry entries[12]{};
     u64 calls = 0;
     const u32 count = gap_trace_launch_tail(entries, 12, &calls);
-    std::string body = "{\"observed_calls\":" + std::to_string(calls) + ",\"newest_first\":[";
+    const auto unsupported = trt_thunk_first_call();
+    std::string body = "{\"observed_calls\":" + std::to_string(calls) +
+                       ",\"fallback_calls\":" + std::to_string(unsupported.observed_calls) +
+                       ",\"first_fallback\":";
+    if (unsupported.observed_calls) {
+      body += "{\"api\":\"" + json_escape(unsupported.name) +
+              "\",\"kind\":\"" + json_escape(unsupported.kind) +
+              "\",\"thread_id\":" + std::to_string(unsupported.thread_id) +
+              ",\"return_value\":" + std::to_string(unsupported.return_value) + "}";
+    } else {
+      body += "null";
+    }
+    body += ",\"newest_first\":[";
     for (u32 i = 0; i < count; ++i) {
       if (i) body += ',';
       body += "{\"api\":\"" + json_escape(entries[i].name) +

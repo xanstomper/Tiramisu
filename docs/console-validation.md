@@ -114,6 +114,11 @@ repeat counts for the current Play attempt. It contains no arguments,
 paths, or memory addresses. The trace is available while the process is
 alive. The last observed call establishes where the sample stopped.
 
+The launch API tail also reports `fallback_calls` and `first_fallback`. These
+fields count executed fallback thunks and identify the first one by DLL,
+export, thread ID, and return value. A nonzero fallback count is a lead for
+investigation. A launch can tolerate an optional fallback and fail later.
+
 On 0.2.4.42 and newer, `GET /api/launch-worker-fault` reports the phase and
 exception code of the first fault that escaped a guest worker routine or
 DLL thread-attach callback. The worker report is cleared for each Play

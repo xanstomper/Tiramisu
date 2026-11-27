@@ -27,6 +27,19 @@ const trt_backend* trt_core_backend(void);
 // Log through the backend if we have one, else stderr.
 void trt_core_log(const char* line);
 
+typedef struct trt_unsupported_api_call {
+  u64 observed_calls;
+  u64 return_value;
+  u32 thread_id;
+  char kind[16];
+  char name[224];
+} trt_unsupported_api_call;
+
+// The first executed fallback in this launch and the total fallback calls.
+// Bind-only lookups never count here. The snapshot contains no guest pointers.
+void trt_thunk_begin_launch(void);
+trt_unsupported_api_call trt_thunk_first_call(void);
+
 // .203 diagnostic: current thread id for the [tid=] log prefix.
 // Defined in bridge_kernel32.cpp (Win32: ::GetCurrentThreadId()).
 u32 TRT_STDCALL trt_GetCurrentThreadId(void);
