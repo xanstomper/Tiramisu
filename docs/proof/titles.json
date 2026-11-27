@@ -38,8 +38,8 @@
       "dir": "cuphead",
       "build": "Unity, D3D11",
       "machine": "PE32+ x64",
-      "boots": "guest entry and D3D11 reached on 0.2.4.58",
-      "renders": "**no visible game frame** — black guest framebuffer on 0.2.4.58",
+      "boots": "guest entry and D3D11 reached on 0.2.4.59",
+      "renders": "**no visible game frame** — black guest framebuffer on 0.2.4.59",
       "audio": "not measured",
       "input": "game response unverified",
       "playable": "**no** — menu unreached",
@@ -47,7 +47,8 @@
         "docs/proof/xbox-series-s-2026-11-26-runtime-055.json",
         "docs/proof/xbox-series-s-2026-11-26-runtime-056.json",
         "docs/proof/xbox-series-s-2026-11-26-runtime-057.json",
-        "docs/proof/xbox-series-s-2026-11-26-runtime-058.json"
+        "docs/proof/xbox-series-s-2026-11-26-runtime-058.json",
+        "docs/proof/xbox-series-s-2026-11-27-runtime-059.json"
       ]
     },
     {
@@ -55,7 +56,7 @@
       "dir": "sekiro",
       "build": "Windows PC",
       "machine": "PE32+ x64",
-      "boots": "guest entry invoked on 0.2.4.58",
+      "boots": "guest entry invoked on 0.2.4.59",
       "renders": "**no** — process exited before observed D3D11 initialization",
       "audio": "not measured",
       "input": "not reached",
@@ -64,7 +65,8 @@
         "docs/proof/xbox-series-s-2026-11-26-runtime-055.json",
         "docs/proof/xbox-series-s-2026-11-26-runtime-056.json",
         "docs/proof/xbox-series-s-2026-11-26-runtime-057.json",
-        "docs/proof/xbox-series-s-2026-11-26-runtime-058.json"
+        "docs/proof/xbox-series-s-2026-11-26-runtime-058.json",
+        "docs/proof/xbox-series-s-2026-11-27-runtime-059.json"
       ]
     },
     {
