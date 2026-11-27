@@ -2,6 +2,7 @@
 #ifndef TIRAMISU_SWAPCHAIN_H
 #define TIRAMISU_SWAPCHAIN_H
 
+#include <array>
 #include <cstdint>
 #include <d3d11_1.h>
 #include <dxgi1_2.h>
@@ -50,6 +51,11 @@ struct guest_draw_probe {
   unsigned long long max_passing_samples;
   int coverage_result;
 };
+struct guest_shader_view {
+  unsigned dimension, format, width, height;
+};
+using guest_shader_views = std::array<guest_shader_view, 4>;
+guest_shader_views swapchain_guest_shader_views();
 struct guest_shader_input_probe {
   unsigned snapshots, bound_views, samples, lit_pixels;
   unsigned slot, width, height, format;

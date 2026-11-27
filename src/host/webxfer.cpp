@@ -2602,7 +2602,7 @@ void handle_client(sock_t s) {
              "\"shader_input_format\":%u,\"shader_input_result\":%d,"
              "\"sync_wait_completed\":%u,\"sync_wait_timeout\":%u,\"sync_wait_failed\":%u,"
              "\"sync_setevent_signaled\":%u,\"sync_setevent_failed\":%u,"
-             "\"guest_commit_mib\":%llu,\"guest_commit_budget_mib\":%u}",
+             "\"guest_commit_mib\":%llu,\"guest_commit_budget_mib\":%u",
              resize.exclusive_requests, draw.coverage_samples, draw.max_passing_samples,
              draw.coverage_result, stats.d3d11_device_calls, stats.d3d11_swapchains, stats.d3d11_get_buffer_calls,
              stats.d3d11_present_calls, stats.d3d11_successful_presents,
@@ -2626,7 +2626,20 @@ void handle_client(sock_t s) {
              sync.event_signaled, sync.event_failed,
              static_cast<unsigned long long>(trt_mem_budget_committed() / 1048576ULL),
              trt_mem_budget_get_mb());
-    respond(s, "200 OK", "application/json", buf);
+    std::string body(buf);
+    body += ",\"shader_input_views\":[";
+    const auto views = swapchain_guest_shader_views();
+    for (size_t i = 0; i < views.size(); ++i) {
+      const auto& view = views[i];
+      if (i) body += ',';
+      char item[128];
+      snprintf(item, sizeof(item),
+               "{\"dimension\":%u,\"format\":%u,\"width\":%u,\"height\":%u}",
+               view.dimension, view.format, view.width, view.height);
+      body += item;
+    }
+    body += "]}";
+    respond(s, "200 OK", "application/json", body);
     return;
   }
 #endif

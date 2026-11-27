@@ -27,6 +27,7 @@
 #include "settings.h"
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -71,6 +72,8 @@ std::atomic<unsigned> g_other_surface_samples{0}, g_other_lit_pixels{0};
 std::atomic<unsigned> g_other_width{0}, g_other_height{0}, g_other_format{0};
 std::atomic<int> g_other_surface_result{0};
 surface_sample g_shader_input_surface;
+std::mutex g_shader_views_mutex;
+guest_shader_views g_shader_views{};
 std::atomic<unsigned> g_shader_input_snapshots{0}, g_shader_input_bound{0};
 std::atomic<unsigned> g_shader_input_samples{0}, g_shader_input_lit{0};
 std::atomic<unsigned> g_shader_input_slot{0}, g_shader_input_width{0};
@@ -631,7 +634,8 @@ void sample_other_render_target(ID3D11RenderTargetView* view, ID3D11Resource* re
 void sample_guest_shader_input() {
   if (g_shader_input_surface.pending) return;
   g_shader_input_snapshots.fetch_add(1);
-  ID3D11ShaderResourceView* bound[4]{};
+  guest_shader_views views{};
+  ID3D11ShaderResourceView* bound[std::tuple_size_v<guest_shader_views>]{};
   g_ctx->PSGetShaderResources(0, static_cast<UINT>(std::size(bound)), bound);
   bool chosen = false;
   for (unsigned slot = 0; slot < std::size(bound); ++slot) {
@@ -639,17 +643,20 @@ void sample_guest_shader_input() {
     view.attach(bound[slot]);  // PSGetShaderResources retained every bound view.
     if (!view) continue;
     g_shader_input_bound.fetch_add(1);
-    if (chosen) continue;
     D3D11_SHADER_RESOURCE_VIEW_DESC srv{};
     view->GetDesc(&srv);
-    if (srv.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D ||
-        srv.Texture2D.MostDetailedMip != 0) continue;
+    views[slot].dimension = srv.ViewDimension;
+    views[slot].format = srv.Format;
     winrt::com_ptr<ID3D11Resource> resource;
     view->GetResource(resource.put());
     auto texture = resource.try_as<ID3D11Texture2D>();
     if (!texture) continue;
     D3D11_TEXTURE2D_DESC desc{};
     texture->GetDesc(&desc);
+    views[slot].width = desc.Width;
+    views[slot].height = desc.Height;
+    if (chosen || srv.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D ||
+        srv.Texture2D.MostDetailedMip != 0) continue;
     g_shader_input_slot.store(slot);
     g_shader_input_width.store(desc.Width);
     g_shader_input_height.store(desc.Height);
@@ -658,6 +665,8 @@ void sample_guest_shader_input() {
     g_shader_input_result.store(hr);
     chosen = SUCCEEDED(hr);
   }
+  std::lock_guard<std::mutex> lock(g_shader_views_mutex);
+  g_shader_views = views;
 }
 
 void measure_surface_pair(ID3D11Texture2D* guest, ID3D11Texture2D* host) {
@@ -889,6 +898,10 @@ void swapchain_reset_guest_draw_probe() {
   g_other_format.store(0);
   g_other_surface_result.store(0);
   g_shader_input_surface = {};
+  {
+    std::lock_guard<std::mutex> lock(g_shader_views_mutex);
+    g_shader_views = {};
+  }
   g_shader_input_snapshots.store(0);
   g_shader_input_bound.store(0);
   g_shader_input_samples.store(0);
@@ -899,6 +912,11 @@ void swapchain_reset_guest_draw_probe() {
   g_shader_input_format.store(0);
   g_shader_input_result.store(0);
   g_surface_probe_interval = 0;
+}
+
+guest_shader_views swapchain_guest_shader_views() {
+  std::lock_guard<std::mutex> lock(g_shader_views_mutex);
+  return g_shader_views;
 }
 
 guest_shader_input_probe swapchain_guest_shader_input_probe() {
