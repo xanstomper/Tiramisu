@@ -139,14 +139,19 @@ int main(int argc, char** argv) {
   CHECK(trt_seal_image(&be, img) == TRT_OK, "image sealed (W^X)");
 
   const u64 ret = win64_call(img->base + img->entry_rva, 0, 0, 0);
-  printf("  guest returned 0x%llx (want 0x3f)\n", (unsigned long long)ret);
+  printf("  guest returned 0x%llx (want 0x1ff)\n", (unsigned long long)ret);
 
   CHECK(ret & 0x01u, "timeBeginPeriod(1) accepted");
   CHECK(ret & 0x02u, "clock nondecreasing");
   CHECK(ret & 0x04u, "clock advances during spin");
   CHECK(ret & 0x08u, "waveOutGetNumDevs -> 1 real output device");
   CHECK(ret & 0x10u, "timeGetDevCaps sane");
-  CHECK(ret & 0x20u, "mciSendStringW fails visibly (263)");
+  CHECK(ret & 0x20u, "mciSendStringW reports an unavailable device");
+  CHECK(ret & 0x40u, "mciSendStringA reports the same device error");
+  CHECK(ret & 0x80u, "MCI error strings respect ANSI and UTF-16 buffer bounds");
+  CHECK(ret & 0x100u, "unknown errors and zero-length buffers fail safely");
+  CHECK(rs.resolve(rs.user, "winmmbase.dll", "mciGetErrorStringA", 0) != nullptr,
+        "the alternate WinMM module exposes the recovered entry points");
 
   // Issue #6 regression: joyGetPos and the WinMM joystick API must resolve
   // cleanly for games like The Spike Cross on both winmm.dll and winmmbase.dll.

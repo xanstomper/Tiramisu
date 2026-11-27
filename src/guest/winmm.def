@@ -28,6 +28,9 @@ EXPORTS
     joySetCapture
     joyReleaseCapture
     joyConfigChanged
+    mciSendStringA
     mciSendStringW
+    mciGetErrorStringA
+    mciGetErrorStringW
     GetProfileStringW
     PlaySoundW
