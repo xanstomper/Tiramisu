@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.2.5.0] — USB and Device Portal imports, loader and middleware updates
+
+- Added automatic USB discovery improvements and the Device Portal
+  `LocalState/TiramisuGames` drop folder for unpacked games, disc images,
+  and automatically imported ZIPs. Updated the beginner tutorial for all
+  transfer paths.
+- Added requester-aware dependency reports, on-demand root DLL loading for
+  disc images, PE32 module and TLS work, and expanded Windows API coverage.
+- Integrated AGY's host refactor, FMOD and Wwise codecs, EOS and Galaxy
+  fallback bridges, PE32 ABI additions, and state-preserving D3D11 blit.
+  Added DirectStorage queues and broader rendering, input, and console
+  diagnostics.
+- Improved Steam install readiness, dashboard settings, atomic file uploads,
+  and original Xbox One-family profiles. Recorded Series S evidence with the
+  exact build and unreached milestones for each tested game.
+
+The [complete 0.2.5.0 release notes](docs/releases/0.2.5.0.md) include setup,
+all subsystems, known limitations, the commit history, and a file inventory.
+
 ## [0.2.4.12] — Steam Zstd chunks
 - **Zstd-compressed Steam depot chunks now decode on Xbox.** The downloader
   understands Valve's `VSZa` container (8-byte magic + CRC header, inner Zstd

@@ -120,17 +120,57 @@ so the certificate is handled for you.
 
 ## Step 6 — Put games on the Xbox
 
-1. Scan the QR code on the TV with your phone, or open
-   `http://<xbox-ip>:9127` on your computer (use `http`, not `https`).
-2. Add your game:
-   - **Computer:** drag the game folder onto the page, or upload a `.zip` of it.
-   - **Phone:** zip the game folder first (phone browsers cannot choose whole
-     folders), then tap **Upload .zip**.
-3. Wait for the upload to finish, then press **Launch** (or A on the
-   controller).
+Use a complete Windows game you own. Keep its executable, DLLs, and assets
+in their original relative folders.
 
-To make a `.zip`: on Windows, right-click the game folder → **Send to →
-Compressed (zipped) folder**. On Mac, right-click → **Compress**.
+### From a USB SSD or hard drive
+
+1. Use a drive that Xbox Dev Mode exposes as removable media. On the drive,
+   create `TiramisuGames` or `Games` at the root.
+2. Add each unpacked game in its own subfolder, or put a complete game ZIP
+   or disc image in that folder. For example, use
+   `TiramisuGames/Example Game/Example.exe` with the rest of the game beside it.
+3. Connect the drive and leave Tiramisu on the menu while it scans. Open
+   **Transfer** to see the drive and its items. A folder or disc image with
+   direct read access can appear in the library for launch.
+4. For a ZIP or an item Xbox lets Tiramisu read through the storage broker,
+   select it in **Transfer** and choose **Download to Xbox**. Use a complete
+   game ZIP when an unpacked folder is invisible or Xbox exposes only certain
+   file types. Leave room for the extracted game on internal storage.
+
+### From Xbox Device Portal
+
+1. Start the updated Tiramisu once so it creates the drop folder.
+2. In the portal at `https://<xbox-ip>:11443`, open **File Explorer →
+   LocalAppData → the installed Tiramisu package → LocalState → TiramisuGames**.
+   If you use the experimental keyboard and mouse edition, choose the package
+   for that edition. Each edition has its own LocalState.
+3. Upload a complete game ZIP or a supported disc image such as an ISO. If
+   you already have a way to upload an unpacked folder, give each game its own
+   subfolder under `TiramisuGames`.
+4. Return to the Tiramisu menu. Folders and disc images appear after a library
+   refresh. Complete ZIPs extract into `LocalState/games` after the upload
+   settles. Imports preserve an existing game with the same name. After a
+   successful import, the source archive is kept with a `.imported` suffix.
+   You can remove that archive in Device Portal to reclaim space.
+
+The ZIP and its extracted contents both need space on the console.
+[Device Portal file upload](https://learn.microsoft.com/en-us/windows/uwp/debug-test-perf/device-portal-api-core)
+
+### From the Tiramisu LAN dashboard
+
+1. Scan the TV's QR code or open `http://<xbox-ip>:9127` on your computer
+   or phone.
+2. On a computer, drag in the game folder or upload a ZIP. On a phone, use
+   **Upload .zip**.
+3. Wait for the transfer to finish, then select the game in Tiramisu.
+
+On Linux, you can create a ZIP from the directory containing the game folder.
+On Windows or macOS, you can use the file manager's built-in compression.
+
+```sh
+zip -r "Example Game.zip" "Example Game/"
+```
 
 ## Why is there a `dev.cer` file?
 
@@ -149,9 +189,10 @@ without needing it again.
 - **Back up saves before updating:** open the LAN dashboard → **Saves &
   Support → Backup Saves (.zip)**. Uninstalling a Dev Mode app wipes its saved
   data.
-- **To update:** install the new `Tiramisu.msix` (Step 4). If the portal says
-  the same version is already installed, uninstall the old app first, then
-  install the new one.
+- **To update:** install the newer MSIX for the edition you already use
+  (Step 4). Version 0.2.5.0 uses the same signing certificates as 0.2.4.12.
+  Check the version and edition if the portal refuses the update. Back up
+  games and saves before removing either installed package.
 
 ## Troubleshooting
 
@@ -162,6 +203,9 @@ without needing it again.
 | Error `0x8007000B` | Wrong pair. `Tiramisu.msix` needs `dev.cer`; KBM needs `edge-dev.cer`. |
 | Tiramisu opens then closes instantly | Make sure "Treat UWP apps as games by default" is ON (Step 2). |
 | LAN page (`:9127`) does not load | Same Wi-Fi as the Xbox, and use `http://` (not `https://`). |
+| USB drive appears but the game folder is missing | Put a complete game ZIP in `TiramisuGames` on the USB drive and look under **Transfer**. |
+| Device Portal has no `TiramisuGames` folder | Start the updated app once, then open LocalState for the edition you started. |
+| Portal ZIP stays in the drop folder | Verify that the upload finished, the ZIP contains the game executable, the title name is available, and internal storage has room to extract it. |
 
 More problems: see [troubleshooting.md](troubleshooting.md).
 
@@ -170,6 +214,8 @@ More problems: see [troubleshooting.md](troubleshooting.md).
 ```text
 Device Portal:  https://<xbox-ip>:11443
 LAN dashboard:  http://<xbox-ip>:9127
+Portal drop:    LocalAppData → Tiramisu package → LocalState → TiramisuGames
+USB drop:       Games or TiramisuGames at the drive root
 Normal pair:    Tiramisu.msix  + dev.cer
 KBM pair:       Tiramisu-EdgeSpoof.msix + edge-dev.cer
 Installer:      bash tools/deploy.sh install <msix> <cer>
