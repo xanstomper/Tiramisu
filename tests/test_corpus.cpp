@@ -804,7 +804,7 @@ void delay_coverage(const file_pe& pe, const u8* file, size_t size) {
     const u64 nm_off = rva_to_file(file, size, pe.secs, pe.nsec, name_rva);
     if (!nm_off || nm_off >= size) continue;
     char dll[96];
-    const size_t name_limit = std::min(sizeof(dll), size - nm_off);
+    const size_t name_limit = std::min<size_t>(sizeof(dll), size - nm_off);
     if (strnlen((const char*)file + nm_off, name_limit) == name_limit) continue;
     snprintf(dll, sizeof(dll), "%s", (const char*)(file + nm_off));
     const u64 thunks = rva_to_file(file, size, pe.secs, pe.nsec, int_rva);
@@ -871,7 +871,7 @@ void dry_run_pe(const char* path, const char* name, const u8* file,
       continue;
     }
     char dll_name[96];
-    const size_t name_limit = std::min(sizeof(dll_name), size - nm_off);
+    const size_t name_limit = std::min<size_t>(sizeof(dll_name), size - nm_off);
     if (strnlen((const char*)file + nm_off, name_limit) == name_limit) {
       printf("    <unterminated dll name> route=? imports=0 bound=0\n");
       continue;
