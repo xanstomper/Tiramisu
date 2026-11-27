@@ -180,6 +180,13 @@ float g_toast_max = 3.2f;
 // Real storage telemetry
 double g_storage_used_gb = 0.0;
 double g_storage_total_gb = 0.0;
+std::vector<std::wstring> g_usb_volumes;
+std::vector<ui_usb_item> g_usb_items;
+bool g_usb_installing = false;
+float g_usb_install_pct = 0.0f;
+std::wstring g_usb_install_label;
+int g_lib_filter = 0;  // 0 = All Games shelf, 1 = USB / Drives downloads
+int g_usb_selected = 0;
 
 // Live upload progress
 uint64_t g_upload_done = 0;
@@ -1093,11 +1100,18 @@ void draw_home_screen() {
       } else {
         swprintf(st_buf, 64, L"Storage usage unavailable");
       }
-      text_out(g_f_nav, right_x + sx(22.0f), st_y + sy(74.0f), right_w - sx(44.0f),
+      text_out(g_f_nav, right_x + sx(22.0f), st_y + sy(60.0f), right_w - sx(44.0f),
                sy(28.0f), st_buf, g_br_white);
+      const std::wstring usb_line =
+          g_usb_volumes.empty()
+              ? std::wstring(L"USB: Ready (NTFS / exFAT)")
+              : (L"USB: " + g_usb_volumes[0]);
+      text_out_line(g_f_small, right_x + sx(22.0f), st_y + sy(92.0f),
+                    right_w - sx(44.0f), sy(22.0f), usb_line.c_str(),
+                    g_usb_volumes.empty() ? g_br_dim : g_br_accent);
 
       const float trk_x = right_x + sx(22.0f);
-      const float trk_y = st_y + card_h - sy(48.0f);
+      const float trk_y = st_y + card_h - sy(42.0f);
       const float trk_w = right_w - sx(44.0f);
       const float trk_h = sy(22.0f);
       const float fill_p =
@@ -1235,33 +1249,190 @@ void draw_library_screen() {
   text_out(g_f_small, pad_x + sx(22.0f), top_y + sy(58.0f), left_w - sx(44.0f),
            sy(24.0f), sub, g_br_dim);
 
-  // Active pill "All Titles"
-  const float pill_y = top_y + sy(102.0f);
-  draw_champagne_pill(pad_x + sx(18.0f), pill_y, left_w - sx(36.0f), sy(40.0f));
-  text_out(g_f_body, pad_x + sx(34.0f), pill_y, left_w - sx(68.0f), sy(40.0f),
-           L"All Installed Titles", g_br_ink, DWRITE_TEXT_ALIGNMENT_LEADING,
-           DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-
-  text_out(g_f_small, pad_x + sx(24.0f), pill_y + sy(60.0f), left_w - sx(48.0f),
-           sy(26.0f), L"Add Games", g_br_accent);
-  constexpr const wchar_t* add_actions[] = {L"Transfer over LAN", L"Open Steam library"};
+  // Library View Filter Pills (All Installed/USB vs USB Downloads)
+  wchar_t all_lbl[64];
+  swprintf(all_lbl, 64, L"All Titles (%zu)", g_games.size());
+  wchar_t usb_lbl[64];
+  swprintf(usb_lbl, 64, L"USB / Drives (%zu)", g_usb_items.size());
+  const wchar_t* filter_labels[2] = {all_lbl, usb_lbl};
   for (int i = 0; i < 2; ++i) {
+    const float fx = pad_x + sx(18.0f);
+    const float fy = top_y + sy(96.0f + i * 46.0f);
+    const float fw = left_w - sx(36.0f);
+    const bool act = (g_lib_filter == i);
+    const bool hov = ptr_in(fx, fy, fw, sy(38.0f));
+    if (act) {
+      draw_champagne_pill(fx, fy, fw, sy(38.0f));
+    } else {
+      fill_rrect(fx, fy, fw, sy(38.0f), sy(19.0f), hov ? g_br_glass2 : g_br_pill_bg);
+      stroke_rrect(fx, fy, fw, sy(38.0f), sy(19.0f),
+                   hov ? g_br_border_hi : g_br_border, sc(1.0f));
+    }
+    text_out_line(g_f_small, fx + sx(14.0f), fy, fw - sx(28.0f), sy(38.0f),
+                  filter_labels[i], act ? g_br_ink : g_br_white,
+                  DWRITE_TEXT_ALIGNMENT_LEADING,
+                  DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+  }
+
+  text_out(g_f_small, pad_x + sx(24.0f), top_y + sy(198.0f), left_w - sx(48.0f),
+           sy(24.0f), L"Add Games", g_br_accent);
+  constexpr const wchar_t* add_actions[] = {
+      L"Rescan USB (NTFS / exFAT)",
+      L"Pick USB Folder (Xbox)",
+      L"Transfer over LAN",
+      L"Open Steam library"};
+  for (int i = 0; i < 4; ++i) {
     const float x = pad_x + sx(18.0f);
-    const float y = top_y + sy(190.0f + i * 48.0f);
+    const float y = top_y + sy(226.0f + i * 44.0f);
     const float w = left_w - sx(36.0f);
-    const bool hover = ptr_in(x, y, w, sy(40.0f));
-    fill_rrect(x, y, w, sy(40.0f), sy(20.0f), hover ? g_br_glass2 : g_br_pill_bg);
-    stroke_rrect(x, y, w, sy(40.0f), sy(20.0f),
-                 hover ? g_br_border_hi : g_br_border, sc(1.1f));
-    text_out_line(g_f_small, x + sx(14.0f), y, w - sx(28.0f), sy(40.0f),
+    const bool hover = ptr_in(x, y, w, sy(36.0f));
+    fill_rrect(x, y, w, sy(36.0f), sy(18.0f), hover ? g_br_glass2 : g_br_pill_bg);
+    stroke_rrect(x, y, w, sy(36.0f), sy(18.0f),
+                 hover ? g_br_border_hi : g_br_border, sc(1.0f));
+    text_out_line(g_f_small, x + sx(14.0f), y, w - sx(28.0f), sy(36.0f),
                   add_actions[i], g_br_white, DWRITE_TEXT_ALIGNMENT_LEADING,
                   DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
   }
-  text_out(g_f_small, pad_x + sx(24.0f), top_y + sy(292.0f), left_w - sx(48.0f),
-           sy(64.0f), L"USB games appear here when Xbox can read the drive's game folder.", g_br_dim);
+  text_out(g_f_small, pad_x + sx(24.0f), top_y + sy(412.0f), left_w - sx(48.0f),
+           sy(22.0f), L"Connected Drives", g_br_accent);
+  if (g_usb_volumes.empty()) {
+    text_out(g_f_small, pad_x + sx(24.0f), top_y + sy(436.0f), left_w - sx(48.0f),
+             sy(72.0f), L"Plug an NTFS or exFAT USB drive or pick a folder above.", g_br_dim);
+  } else {
+    for (int i = 0; i < 4 && i < (int)g_usb_volumes.size(); ++i) {
+      text_out_line(g_f_small, pad_x + sx(24.0f), top_y + sy(438.0f + i * 26.0f),
+                    left_w - sx(48.0f), sy(24.0f), g_usb_volumes[i].c_str(), g_br_sub);
+    }
+  }
+
+  const float insp_h = sy(196.0f);
+  const float grid_y = top_y + insp_h + gap;
+  const float grid_h = full_h - insp_h - gap;
+
+  if (g_lib_filter == 1) {
+    // USB & External Drive Downloads Browser
+    draw_glass_card(right_x, top_y, right_w, insp_h, 24.0f);
+    text_out_line(g_f_small, right_x + sx(26.0f), top_y + sy(20.0f), right_w - sx(52.0f),
+                  sy(22.0f), L"USB & EXTERNAL STORAGE (NTFS · exFAT · FAT32)",
+                  g_br_accent, DWRITE_TEXT_ALIGNMENT_LEADING,
+                  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, true);
+    const bool has_usb =
+        !g_usb_items.empty() && g_usb_selected >= 0 && g_usb_selected < (int)g_usb_items.size();
+    const std::wstring htitle =
+        has_usb ? g_usb_items[g_usb_selected].name
+                : (g_usb_volumes.empty() ? L"No USB Drive Detected"
+                                         : L"USB Ready — Place Games / .zip / .iso on Drive");
+    text_out_line(g_f_h2, right_x + sx(26.0f), top_y + sy(46.0f), right_w - sx(52.0f),
+                  sy(36.0f), htitle.c_str(), g_br_white,
+                  DWRITE_TEXT_ALIGNMENT_LEADING,
+                  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, true);
+    std::wstring hsub;
+    if (g_usb_installing) {
+      wchar_t pb[128];
+      swprintf(pb, 128, L"Installing %d%% · %s", (int)(g_usb_install_pct * 100.0f),
+               g_usb_install_label.c_str());
+      hsub = pb;
+    } else if (has_usb) {
+      const auto& ui = g_usb_items[g_usb_selected];
+      hsub = ui.drive_badge + L"  ·  " + ui.kind +
+             (ui.size_str.empty() ? L"" : (L"  ·  " + ui.size_str)) +
+             (ui.installed_internal ? L"  ·  Already Installed on Xbox" : L"  ·  Ready to Download to Xbox SSD");
+    } else {
+      hsub = L"Supports unpacked game folders, .zip archives, and .iso images on NTFS / exFAT.";
+    }
+    text_out_line(g_f_mono, right_x + sx(26.0f), top_y + sy(88.0f), right_w - sx(52.0f),
+                  sy(24.0f), hsub.c_str(), g_br_sub,
+                  DWRITE_TEXT_ALIGNMENT_LEADING,
+                  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, true);
+
+    const float by = top_y + insp_h - sy(58.0f);
+    if (has_usb) {
+      draw_champagne_pill(right_x + sx(26.0f), by, sx(236.0f), sy(40.0f));
+      if (g_controller_active) {
+        draw_xbox_btn(right_x + sx(48.0f), by + sy(20.0f), sc(10.0f), L'A',
+                      g_br_xbox_a, true);
+      }
+      const wchar_t* dlab = g_usb_installing ? L"Installing..."
+                          : (g_usb_items[g_usb_selected].installed_internal
+                                 ? L"Re-Download to Xbox"
+                                 : L"⬇  Download to Xbox");
+      text_out_line(g_f_small, right_x + sx(g_controller_active ? 64.0f : 26.0f), by,
+                    sx(g_controller_active ? 188.0f : 236.0f), sy(40.0f),
+                    dlab, g_br_ink, DWRITE_TEXT_ALIGNMENT_CENTER,
+                    DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+    fill_rrect(right_x + sx(276.0f), by, sx(176.0f), sy(40.0f), sy(20.0f), g_br_glass2);
+    stroke_rrect(right_x + sx(276.0f), by, sx(176.0f), sy(40.0f), sy(20.0f),
+                 ptr_in(right_x + sx(276.0f), by, sx(176.0f), sy(40.0f)) ? g_br_white : g_br_border_hi, sc(1.0f));
+    text_out_line(g_f_small, right_x + sx(284.0f), by, sx(160.0f), sy(40.0f),
+                  L"↻ Rescan Drives", g_br_white, DWRITE_TEXT_ALIGNMENT_CENTER,
+                  DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+    fill_rrect(right_x + sx(466.0f), by, sx(184.0f), sy(40.0f), sy(20.0f), g_br_glass2);
+    stroke_rrect(right_x + sx(466.0f), by, sx(184.0f), sy(40.0f), sy(20.0f),
+                 ptr_in(right_x + sx(466.0f), by, sx(184.0f), sy(40.0f)) ? g_br_white : g_br_border_hi, sc(1.0f));
+    text_out_line(g_f_small, right_x + sx(474.0f), by, sx(168.0f), sy(40.0f),
+                  L"Pick USB Folder", g_br_white, DWRITE_TEXT_ALIGNMENT_CENTER,
+                  DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+    if (g_usb_installing) {
+      fill_rrect(right_x + sx(26.0f), top_y + sy(118.0f), right_w - sx(52.0f),
+                 sy(8.0f), sy(4.0f), g_br_pill_bg);
+      fill_rrect(right_x + sx(26.0f), top_y + sy(118.0f),
+                 (right_w - sx(52.0f)) * std::clamp(g_usb_install_pct, 0.02f, 1.0f),
+                 sy(8.0f), sy(4.0f), g_br_accent);
+    }
+
+    draw_glass_card(right_x, grid_y, right_w, grid_h, 24.0f);
+    if (g_usb_items.empty()) {
+      text_out_line(g_f_body, right_x + sx(24.0f), grid_y + grid_h * 0.42f,
+                    right_w - sx(48.0f), sy(36.0f),
+                    L"No USB game folders, .zip archives, or .iso images found yet.",
+                    g_br_dim, DWRITE_TEXT_ALIGNMENT_CENTER);
+    } else {
+      const float rpad = sx(18.0f);
+      const float row_h = sy(56.0f);
+      const int max_vis = std::max(1, (int)((grid_h - 2.0f * rpad) / row_h));
+      const int start = ((int)g_usb_items.size() > max_vis)
+                            ? std::clamp(g_usb_selected - max_vis / 2, 0,
+                                         (int)g_usb_items.size() - max_vis)
+                            : 0;
+      for (int i = start; i < (int)g_usb_items.size() && (i - start) < max_vis; ++i) {
+        const float rx = right_x + rpad;
+        const float ry = grid_y + rpad + (i - start) * row_h;
+        const float rw = right_w - 2.0f * rpad;
+        const bool sel = (i == g_usb_selected);
+        const bool hov = !sel && ptr_in(rx, ry, rw, row_h - sy(6.0f));
+        fill_rrect(rx, ry, rw, row_h - sy(6.0f), sc(14.0f),
+                   sel ? g_br_glass2 : (hov ? g_br_glass2 : g_br_pill_bg));
+        stroke_rrect(rx, ry, rw, row_h - sy(6.0f), sc(14.0f),
+                     sel ? g_br_white : g_br_border, sel ? sc(1.8f) : sc(1.0f));
+        const auto& ui = g_usb_items[i];
+        text_out_line(g_f_body, rx + sx(16.0f), ry + sy(4.0f), rw * 0.56f, sy(24.0f),
+                      ui.name.c_str(), g_br_white, DWRITE_TEXT_ALIGNMENT_LEADING,
+                      DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        const std::wstring meta = ui.drive_badge + L" · " + ui.kind +
+                                  (ui.size_str.empty() ? L"" : (L" · " + ui.size_str));
+        text_out_line(g_f_small, rx + sx(16.0f), ry + sy(26.0f), rw * 0.56f, sy(20.0f),
+                      meta.c_str(), g_br_dim, DWRITE_TEXT_ALIGNMENT_LEADING,
+                      DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        const std::wstring badge =
+            ui.installed_internal ? L"Installed on Xbox ✓"
+                                  : (sel ? L"Download (A) ⬇" : L"Download to Xbox");
+        text_out_line(g_f_small, rx + rw - sx(210.0f), ry, sx(194.0f), row_h - sy(6.0f),
+                      badge.c_str(),
+                      ui.installed_internal ? g_br_accent : g_br_white,
+                      DWRITE_TEXT_ALIGNMENT_TRAILING,
+                      DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+      }
+    }
+    draw_controller_footer({{L'A', L"Download to Xbox"},
+                            {L'Y', L"Rescan USB"},
+                            {L'B', L"Back to Games"}});
+    return;
+  }
 
   // Right Top: Selected Game Inspector Banner
-  const float insp_h = sy(196.0f);
   draw_glass_card(right_x, top_y, right_w, insp_h, 24.0f);
   const bool has_game =
       !g_games.empty() && g_selected >= 0 && g_selected < (int)g_games.size();
@@ -1316,10 +1487,13 @@ void draw_library_screen() {
     draw_top_specular_rim(right_x, top_y, right_w, sc(24.0f), 0.34f);
     stroke_rrect(right_x, top_y, right_w, insp_h, sc(24.0f), g_br_border_hi, sc(1.2f));
 
-    text_out_line(g_f_small, right_x + sx(26.0f), top_y + sy(20.0f), right_w * 0.56f,
-                  sy(22.0f),
-                  gm.engine_type.empty() ? L"XBOX DEV MODE READY"
-                                         : gm.engine_type.c_str(),
+    const std::wstring top_tag =
+        gm.is_external
+            ? ((gm.source_badge.empty() ? L"USB DRIVE" : gm.source_badge) + L"  ·  " +
+               (gm.engine_type.empty() ? L"XBOX DEV MODE READY" : gm.engine_type))
+            : (gm.engine_type.empty() ? L"XBOX DEV MODE READY" : gm.engine_type);
+    text_out_line(g_f_small, right_x + sx(26.0f), top_y + sy(20.0f), right_w * 0.64f,
+                  sy(22.0f), top_tag.c_str(),
                   g_br_accent, DWRITE_TEXT_ALIGNMENT_LEADING,
                   DWRITE_PARAGRAPH_ALIGNMENT_CENTER, true);
     text_out_line(g_f_h2, right_x + sx(26.0f), top_y + sy(46.0f), right_w * 0.58f,
@@ -1337,8 +1511,10 @@ void draw_library_screen() {
       draw_xbox_btn(right_x + sx(50.0f), by + sy(20.0f), sc(10.0f), L'A',
                     g_br_xbox_a, true);
     }
+    const wchar_t* play_lbl =
+        (!gm.win32_readable && gm.is_external) ? L"⬇  Install" : L"▶  Play";
     text_out(g_f_body, right_x + sx(g_controller_active ? 64.0f : 26.0f), by,
-             sx(g_controller_active ? 104.0f : 152.0f), sy(40.0f), L"▶  Play",
+             sx(g_controller_active ? 104.0f : 152.0f), sy(40.0f), play_lbl,
              g_br_ink, DWRITE_TEXT_ALIGNMENT_CENTER,
              DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
@@ -1368,25 +1544,33 @@ void draw_library_screen() {
                   inp_lbl.c_str(), g_br_accent, DWRITE_TEXT_ALIGNMENT_CENTER,
                   DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
-    // Two-step safe Delete / Uninstall Game pill button
+    // Two-step safe Uninstall pill OR Download-to-Xbox pill for USB games
     const float del_x = right_x + sx(566.0f);
-    const float del_w = sx(168.0f);
-    const bool armed = (g_delete_confirm_idx == g_selected);
+    const float del_w = sx(184.0f);
     const bool dhov = ptr_in(del_x, by, del_w, sy(40.0f));
-    fill_rrect(del_x, by, del_w, sy(40.0f), sy(20.0f),
-               armed ? g_br_xbox_b : g_br_glass2);
-    stroke_rrect(del_x, by, del_w, sy(40.0f), sy(20.0f),
-                 (armed || dhov) ? g_br_white : g_br_xbox_b, sc(1.2f));
-    text_out_line(g_f_small, del_x + sx(10.0f), by, del_w - sx(20.0f), sy(40.0f),
-                  armed ? L"Confirm Delete?" : L"Uninstall",
-                  armed ? g_br_white : g_br_xbox_b,
-                  DWRITE_TEXT_ALIGNMENT_CENTER,
-                  DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    if (gm.is_external) {
+      fill_rrect(del_x, by, del_w, sy(40.0f), sy(20.0f), g_br_glass2);
+      stroke_rrect(del_x, by, del_w, sy(40.0f), sy(20.0f),
+                   dhov ? g_br_white : g_br_accent, sc(1.2f));
+      text_out_line(g_f_small, del_x + sx(10.0f), by, del_w - sx(20.0f), sy(40.0f),
+                    g_usb_installing ? L"Installing..." : L"⬇  Save to Xbox",
+                    g_br_accent, DWRITE_TEXT_ALIGNMENT_CENTER,
+                    DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    } else {
+      const bool armed = (g_delete_confirm_idx == g_selected);
+      fill_rrect(del_x, by, del_w, sy(40.0f), sy(20.0f),
+                 armed ? g_br_xbox_b : g_br_glass2);
+      stroke_rrect(del_x, by, del_w, sy(40.0f), sy(20.0f),
+                   (armed || dhov) ? g_br_white : g_br_xbox_b, sc(1.2f));
+      text_out_line(g_f_small, del_x + sx(10.0f), by, del_w - sx(20.0f), sy(40.0f),
+                    armed ? L"Confirm Delete?" : L"Uninstall",
+                    armed ? g_br_white : g_br_xbox_b,
+                    DWRITE_TEXT_ALIGNMENT_CENTER,
+                    DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
   }
 
   // Right Bottom: 4-Column Cover Art Grid
-  const float grid_y = top_y + insp_h + gap;
-  const float grid_h = full_h - insp_h - gap;
   draw_glass_card(right_x, grid_y, right_w, grid_h, 24.0f);
 
   const int cols = 4;
@@ -2260,6 +2444,38 @@ void ui_set_storage(double used_gb, double total_gb) {
   g_storage_total_gb = total_gb;
 }
 
+void ui_set_usb_state(const std::vector<std::wstring>& volume_summaries,
+                      const std::vector<ui_usb_item>& items,
+                      bool installing, float install_pct,
+                      const std::wstring& install_label) {
+  g_usb_volumes = volume_summaries;
+  g_usb_items = items;
+  g_usb_installing = installing;
+  g_usb_install_pct = install_pct;
+  g_usb_install_label = install_label;
+  if (g_usb_items.empty()) {
+    g_usb_selected = 0;
+  } else if (g_usb_selected >= (int)g_usb_items.size()) {
+    g_usb_selected = (int)g_usb_items.size() - 1;
+  }
+}
+
+int ui_library_filter() { return g_lib_filter; }
+void ui_library_set_filter(int filter) { g_lib_filter = std::clamp(filter, 0, 1); }
+int ui_usb_selected() { return g_usb_selected; }
+void ui_usb_nav_up() {
+  if (g_usb_selected > 0) {
+    --g_usb_selected;
+    ui_sfx_move();
+  }
+}
+void ui_usb_nav_down() {
+  if (g_usb_selected + 1 < (int)g_usb_items.size()) {
+    ++g_usb_selected;
+    ui_sfx_move();
+  }
+}
+
 void ui_set_upload_progress(uint64_t done_bytes, uint64_t total_bytes,
                             std::wstring label) {
   g_upload_done = done_bytes;
@@ -2557,12 +2773,55 @@ ui_click ui_hit_test(int x, int y) {
     const float left_w = full_w * 0.25f;
     const float right_x = pad_x + left_w + gap;
     const float right_w = full_w - left_w - gap;
-    if (hits(pad_x + sx(18.0f), top_y + sy(190.0f), left_w - sx(36.0f), sy(40.0f)))
+    for (int i = 0; i < 2; ++i) {
+      if (hits(pad_x + sx(18.0f), top_y + sy(96.0f + i * 46.0f),
+               left_w - sx(36.0f), sy(38.0f))) {
+        g_lib_filter = i;
+        return {ui_click_type::library_filter, i};
+      }
+    }
+    if (hits(pad_x + sx(18.0f), top_y + sy(226.0f), left_w - sx(36.0f), sy(36.0f)))
+      return {ui_click_type::rescan_usb, 0};
+    if (hits(pad_x + sx(18.0f), top_y + sy(270.0f), left_w - sx(36.0f), sy(36.0f)))
+      return {ui_click_type::pick_usb_folder, 0};
+    if (hits(pad_x + sx(18.0f), top_y + sy(314.0f), left_w - sx(36.0f), sy(36.0f)))
       return {ui_click_type::tab, UI_TOOLS};
-    if (hits(pad_x + sx(18.0f), top_y + sy(238.0f), left_w - sx(36.0f), sy(40.0f)))
+    if (hits(pad_x + sx(18.0f), top_y + sy(358.0f), left_w - sx(36.0f), sy(36.0f)))
       return {ui_click_type::tab, UI_STEAM};
+
     const float insp_h = sy(196.0f);
     const float by = top_y + insp_h - sy(58.0f);
+    const float grid_y = top_y + insp_h + gap;
+    const float grid_h = full_h - insp_h - gap;
+
+    if (g_lib_filter == 1) {
+      if (!g_usb_items.empty() && hits(right_x + sx(26.0f), by, sx(236.0f), sy(40.0f))) {
+        return {ui_click_type::install_usb_item, g_usb_selected};
+      }
+      if (hits(right_x + sx(276.0f), by, sx(176.0f), sy(40.0f))) {
+        return {ui_click_type::rescan_usb, 0};
+      }
+      if (hits(right_x + sx(466.0f), by, sx(184.0f), sy(40.0f))) {
+        return {ui_click_type::pick_usb_folder, 0};
+      }
+      const float rpad = sx(18.0f);
+      const float row_h = sy(56.0f);
+      const int max_vis = std::max(1, (int)((grid_h - 2.0f * rpad) / row_h));
+      const int start = ((int)g_usb_items.size() > max_vis)
+                            ? std::clamp(g_usb_selected - max_vis / 2, 0,
+                                         (int)g_usb_items.size() - max_vis)
+                            : 0;
+      for (int i = start; i < (int)g_usb_items.size() && (i - start) < max_vis; ++i) {
+        const float ry = grid_y + rpad + (i - start) * row_h;
+        if (hits(right_x + rpad, ry, right_w - 2.0f * rpad, row_h - sy(6.0f))) {
+          const bool same = (i == g_usb_selected);
+          g_usb_selected = i;
+          return {same ? ui_click_type::install_usb_item : ui_click_type::select_usb_item, i};
+        }
+      }
+      return {ui_click_type::none, 0};
+    }
+
     if (hits(right_x + sx(26.0f), by, sx(152.0f), sy(40.0f))) {
       return {ui_click_type::play, g_selected};
     }
@@ -2572,11 +2831,12 @@ ui_click ui_hit_test(int x, int y) {
     if (hits(right_x + sx(370.0f), by, sx(184.0f), sy(40.0f))) {
       return {ui_click_type::cycle_input, g_selected};
     }
-    if (hits(right_x + sx(566.0f), by, sx(168.0f), sy(40.0f))) {
-      return {ui_click_type::delete_game, g_selected};
+    if (hits(right_x + sx(566.0f), by, sx(184.0f), sy(40.0f))) {
+      const bool ext = !g_games.empty() && g_selected >= 0 &&
+                       g_selected < (int)g_games.size() &&
+                       g_games[g_selected].is_external;
+      return {ext ? ui_click_type::install_usb_game : ui_click_type::delete_game, g_selected};
     }
-    const float grid_y = top_y + insp_h + gap;
-    const float grid_h = full_h - insp_h - gap;
     const int cols = 4;
     const float gpad = sx(18.0f), cgap = sx(16.0f);
     const float cw = (right_w - 2.0f * gpad - (cols - 1) * cgap) / (float)cols;

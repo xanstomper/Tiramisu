@@ -16,6 +16,19 @@ struct ui_game {
   std::wstring meta;         // e.g. input mode / appid
   std::wstring engine_type;  // Direct3D 11 | Vulkan | Unity | Mono / FNA | ...
   std::string key_utf8;      // UTF-8 game key for cover_art lookup
+  bool is_external = false;
+  bool win32_readable = true;
+  std::wstring source_badge; // e.g. L"USB E: · NTFS" or L"Internal SSD"
+};
+
+struct ui_usb_item {
+  std::wstring id;
+  std::wstring name;
+  std::wstring drive_badge;  // e.g. L"E: · NTFS"
+  std::wstring kind;         // L"Folder" | L"ZIP" | L"ISO"
+  std::wstring size_str;
+  bool win32_readable = true;
+  bool installed_internal = false;
 };
 
 // 5 primary capsule tabs matching the Tiramisu Series X|S dashboard design:
@@ -88,6 +101,15 @@ void ui_toast(std::wstring message, float duration_sec = 3.2f);
 
 // Real Xbox storage telemetry (from GetDiskFreeSpaceExA)
 void ui_set_storage(double used_gb, double total_gb);
+void ui_set_usb_state(const std::vector<std::wstring>& volume_summaries,
+                      const std::vector<ui_usb_item>& items,
+                      bool installing = false, float install_pct = 0.0f,
+                      const std::wstring& install_label = {});
+int ui_library_filter();
+void ui_library_set_filter(int filter);
+int ui_usb_selected();
+void ui_usb_nav_up();
+void ui_usb_nav_down();
 
 // Live LAN file transfer progress bar telemetry
 void ui_set_upload_progress(uint64_t done_bytes, uint64_t total_bytes,
@@ -151,7 +173,13 @@ enum class ui_click_type {
   steam_action,
   steam_qr,
   run_tool,
-  quick_menu_item
+  quick_menu_item,
+  library_filter,
+  install_usb_game,
+  pick_usb_folder,
+  rescan_usb,
+  select_usb_item,
+  install_usb_item
 };
 struct ui_click {
   ui_click_type type;

@@ -127,7 +127,7 @@ if [[ ! -f "$SRC/.tiramisu-staged" || "$(cat "$SRC/.tiramisu-staged" 2>/dev/null
   for p in "$UWP_DIR"/patches/*.patch; do
     [[ -f "$p" ]] || continue
     log "applying patch $(basename "$p")"
-    patch -p1 -d "$SRC" --forward < "$p" || die "patch failed: $p"
+    patch -p1 -d "$SRC" --forward < "$p" >&2 || die "patch failed: $p"
   done
 
   # config.h: replicate mono.winconfig.targets (RunWinConfigSetup) — the

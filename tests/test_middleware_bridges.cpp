@@ -10,6 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <chrono>
+#include <thread>
 
 #define CHECK(cond, msg) \
   do { \
@@ -172,14 +175,110 @@ int main() {
   CHECK(mana_player != nullptr, "criManaPlayer_Create returns valid non-null handle");
   CHECK(cri_CriMana_Finalize() == 0, "CriMana_Finalize succeeds");
 
-  // 5. DirectStorage
+  // 5. DirectStorage (real async IDStorageFactory / File / Queue / StatusArray)
   printf("-- DirectStorage\n");
   CHECK(trt_bridge_register_dstorage() == 0, "trt_bridge_register_dstorage succeeds");
   CHECK(dstorage_DStorageSetConfiguration(nullptr) == 0, "DStorageSetConfiguration succeeds");
   CHECK(dstorage_DStorageSetConfiguration1(nullptr) == 0, "DStorageSetConfiguration1 succeeds");
-  void* factory = nullptr;
-  CHECK(dstorage_DStorageGetFactory(nullptr, &factory) != 0, "DStorageGetFactory reports honest E_NOTIMPL");
-  CHECK(factory == nullptr, "DStorageGetFactory nulls out factory pointer");
+  void* factory = (void*)0x1234;
+  CHECK(dstorage_DStorageGetFactory(nullptr, &factory) != 0 && factory == nullptr,
+        "DStorageGetFactory rejects null IID cleanly and nulls ppv");
+
+  {
+    struct test_guid { unsigned d1; unsigned short d2, d3; unsigned char d4[8]; };
+    static constexpr test_guid k_factory_iid = {0x6924ea0cu, 0xc3cdu, 0x4826u, {0xb1, 0x0a, 0xf6, 0x4f, 0x4e, 0xd9, 0x27, 0xc1}};
+    static constexpr test_guid k_file_iid = {0x5de95e7bu, 0x955au, 0x4868u, {0xa7, 0x3c, 0x24, 0x3b, 0x29, 0xf4, 0xb8, 0xda}};
+    static constexpr test_guid k_status_iid = {0x82397587u, 0x7cd5u, 0x453bu, {0xa0, 0x2e, 0x31, 0x37, 0x9b, 0xd6, 0x46, 0x56}};
+    static constexpr test_guid k_queue1_iid = {0xdd2f482cu, 0x5effu, 0x41e8u, {0x9c, 0x9e, 0xd2, 0x37, 0x4b, 0x27, 0x81, 0x28}};
+
+    CHECK(dstorage_DStorageGetFactory(&k_factory_iid, &factory) == 0 && factory != nullptr,
+          "DStorageGetFactory returns IDStorageFactory");
+
+    char tmpl[] = "/tmp/trt_dstorage_XXXXXX";
+    int fd = mkstemp(tmpl);
+    CHECK(fd >= 0, "created temp test payload");
+    const char payload[] = "DIRECTSTORAGE_TIRAMISU_PAYLOAD_123456";
+    CHECK(write(fd, payload, sizeof(payload) - 1) == (ssize_t)(sizeof(payload) - 1),
+          "wrote test payload");
+    close(fd);
+
+    u16 wpath[256] = {};
+    for (size_t i = 0; tmpl[i] && i + 1 < 256; ++i) wpath[i] = (u16)(unsigned char)tmpl[i];
+
+    auto** fvt = *(void***)factory;
+    typedef long(TRT_GUEST_ABI* create_queue_fn)(void*, const void*, const void*, void**);
+    typedef long(TRT_GUEST_ABI* open_file_fn)(void*, const u16*, const void*, void**);
+    typedef long(TRT_GUEST_ABI* create_status_fn)(void*, u32, const char*, const void*, void**);
+    typedef u32(TRT_GUEST_ABI* release_fn)(void*);
+
+    void* file = nullptr;
+    CHECK(((open_file_fn)fvt[4])(factory, wpath, &k_file_iid, &file) == 0 && file != nullptr,
+          "IDStorageFactory::OpenFile opens real file");
+
+    void* status = nullptr;
+    CHECK(((create_status_fn)fvt[5])(factory, 4, "test_status", &k_status_iid, &status) == 0 &&
+              status != nullptr,
+          "IDStorageFactory::CreateStatusArray creates status array");
+
+    struct { u64 source_type; u16 capacity; int8_t priority; const char* name; void* device; } qdesc = {
+        0, 0x80u, 0, "test_q", nullptr};
+    void* queue = nullptr;
+    CHECK(((create_queue_fn)fvt[3])(factory, &qdesc, &k_queue1_iid, &queue) == 0 && queue != nullptr,
+          "IDStorageFactory::CreateQueue creates async IDStorageQueue1");
+
+    u8 dst[64] = {};
+    struct {
+      u8 options[16];
+      u8 source[24];
+      u8 destination[40];
+      u32 uncompressed_size;
+      u64 cancellation_tag;
+      const char* name;
+    } req = {};
+    u32 read_offset_sz = (u32)(sizeof(payload) - 1);
+    memcpy(req.source + 0, &file, 8);
+    u64 off0 = 0;
+    memcpy(req.source + 8, &off0, 8);
+    memcpy(req.source + 16, &read_offset_sz, 4);
+    void* dst_ptr = dst;
+    memcpy(req.destination + 0, &dst_ptr, 8);
+    memcpy(req.destination + 8, &read_offset_sz, 4);
+    req.uncompressed_size = read_offset_sz;
+
+    auto** qvt = *(void***)queue;
+    typedef void(TRT_GUEST_ABI* enqueue_req_fn)(void*, const void*);
+    typedef void(TRT_GUEST_ABI* enqueue_stat_fn)(void*, void*, u32);
+    typedef void(TRT_GUEST_ABI* submit_fn)(void*);
+    typedef void(TRT_GUEST_ABI* close_fn)(void*);
+    ((enqueue_req_fn)qvt[3])(queue, &req);
+    ((enqueue_stat_fn)qvt[4])(queue, status, 0);
+    ((submit_fn)qvt[6])(queue);
+
+    auto** svt = *(void***)status;
+    typedef u8(TRT_GUEST_ABI* is_complete_fn)(void*, u32);
+    typedef long(TRT_GUEST_ABI* get_hr_fn)(void*, u32);
+    bool done = false;
+    for (int i = 0; i < 200; ++i) {
+      if (((is_complete_fn)svt[3])(status, 0)) {
+        done = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(done && ((get_hr_fn)svt[4])(status, 0) == 0,
+          "IDStorageQueue async read completed with S_OK");
+    CHECK(memcmp(dst, payload, sizeof(payload) - 1) == 0,
+          "DirectStorage read transferred exact file bytes into memory");
+
+    ((close_fn)qvt[8])(queue);
+    ((release_fn)qvt[2])(queue);
+    ((release_fn)svt[2])(status);
+    auto** filevt = *(void***)file;
+    ((close_fn)filevt[3])(file);
+    ((release_fn)filevt[2])(file);
+    ((release_fn)fvt[2])(factory);
+    unlink(tmpl);
+  }
 
   // 6. D3D9 PERF
   printf("-- D3D9 PERF\n");

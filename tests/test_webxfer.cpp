@@ -565,6 +565,82 @@ int main() {
           "named stopping point persisted in attempt history");
   }
 
+  // ---- External USB storage (NTFS + exFAT) & USB install workflow ----
+  {
+    std::string usb_ntfs_root = root + "/usb_ntfs";
+    std::string usb_ntfs_game = usb_ntfs_root + "/Games/NtfsGame";
+    {
+      std::string mk = "mkdir -p '" + usb_ntfs_game + "'";
+      (void)system(mk.c_str());
+      FILE* ef = fopen((usb_ntfs_game + "/NtfsGame.exe").c_str(), "wb");
+      if (ef) { fputs("MZ\x90\x00", ef); fclose(ef); }
+    }
+    longan::webxfer_storage_volume ntfs_vol;
+    ntfs_vol.name = "E: MYUSB";
+    ntfs_vol.path = usb_ntfs_root;
+    ntfs_vol.label = "MYUSB";
+    ntfs_vol.fs = "NTFS";
+    ntfs_vol.total_bytes = 64ULL * 1024 * 1024 * 1024;
+    ntfs_vol.free_bytes = 32ULL * 1024 * 1024 * 1024;
+    ntfs_vol.win32_readable = true;
+    ntfs_vol.broker_readable = true;
+    ntfs_vol.game_roots = {usb_ntfs_root + "/Games"};
+    ntfs_vol.items.push_back({"usb-1", "NtfsGame", usb_ntfs_root, "NTFS",
+                              usb_ntfs_game, "folder", "NtfsGame.exe", 4096, true, false});
+
+    longan::webxfer_storage_volume exfat_vol;
+    exfat_vol.name = "F: EXFATUSB";
+    exfat_vol.path = "F:\\";
+    exfat_vol.label = "EXFATUSB";
+    exfat_vol.fs = "exFAT";
+    exfat_vol.total_bytes = 128ULL * 1024 * 1024 * 1024;
+    exfat_vol.free_bytes = 96ULL * 1024 * 1024 * 1024;
+    exfat_vol.win32_readable = false;
+    exfat_vol.broker_readable = true;
+    exfat_vol.items.push_back({"usb-2", "ExfatPacked", "F:\\", "exFAT",
+                               "F:\\Games\\ExfatPacked.zip", "zip", "", 1048576, false, false});
+
+    longan::webxfer_set_external_storage({ntfs_vol, exfat_vol}, "ready");
+
+    const std::string storage = http_req(port, "GET", "/api/storage", "");
+    CHECK(storage.find("\"fs\":\"NTFS\"") != std::string::npos &&
+              storage.find("\"fs\":\"exFAT\"") != std::string::npos &&
+              storage.find("\"id\":\"usb-1\"") != std::string::npos &&
+              storage.find("\"id\":\"usb-2\"") != std::string::npos,
+          "/api/storage exposes both NTFS & exFAT volumes and downloadable items");
+
+    const std::string games = http_req(port, "GET", "/games", "");
+    CHECK(games.find("\"name\":\"NtfsGame\"") != std::string::npos &&
+              games.find("\"location\":\"usb\"") != std::string::npos &&
+              games.find("\"fs\":\"NTFS\"") != std::string::npos,
+          "/games includes external NTFS USB game with metadata");
+
+    const std::string rescan_resp = http_req(port, "POST", "/api/usb/rescan", "");
+    CHECK(rescan_resp.find("202 Accepted") != std::string::npos &&
+              longan::webxfer_poll_rescan(),
+          "POST /api/usb/rescan triggers full storage rescan");
+
+    const std::string bad_inst = http_req(port, "POST", "/api/usb/install", "{\"id\":\"missing\"}");
+    CHECK(bad_inst.find("404 Not Found") != std::string::npos,
+          "POST /api/usb/install rejects unknown USB item id");
+
+    const std::string ok_inst = http_req(port, "POST", "/api/usb/install", "{\"id\":\"usb-2\"}");
+    std::string pid, pname;
+    CHECK(ok_inst.find("202 Accepted") != std::string::npos &&
+              longan::webxfer_poll_usb_install(&pid, &pname) &&
+              pid == "usb-2" && pname == "ExfatPacked",
+          "POST /api/usb/install queues USB archive download/install for host");
+
+    longan::webxfer_set_usb_install_status(true, "Copying ExfatPacked", 512, 1024, "");
+    const std::string st_usb = http_req(port, "GET", "/api/status", "");
+    CHECK(st_usb.find("\"download_phase\":\"Copying ExfatPacked\"") != std::string::npos &&
+              st_usb.find("\"download_done\":512") != std::string::npos &&
+              st_usb.find("\"download_total\":1024") != std::string::npos,
+          "/api/status surfaces live USB install progress");
+    longan::webxfer_set_usb_install_status(false, "", 1024, 1024, "", "USB -> ExfatPacked");
+    longan::webxfer_set_external_storage({}, "ready");
+  }
+
   longan::webxfer_shutdown();
   std::string cmd = "rm -rf " + root;
   (void)system(cmd.c_str());

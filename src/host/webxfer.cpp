@@ -149,6 +149,13 @@ struct inflight_guard {
 std::mutex g_external_storage_mu;
 std::vector<webxfer_storage_volume> g_external_storage;
 std::string g_storage_broker_status = "checking";
+std::mutex g_usb_install_mu;
+bool g_usb_install_requested = false;
+std::string g_usb_install_item_id;
+std::string g_usb_install_game_name;
+std::atomic<bool> g_usb_install_active{false};
+std::atomic<uint64_t> g_usb_done{0}, g_usb_total{0};
+std::string g_usb_phase;  // guarded by g_usb_install_mu
 std::atomic<bool> g_url_active{false};
 std::atomic<uint64_t> g_url_received{0}, g_url_expected{0};
 std::string g_url_phase;  // guarded by g_mu
@@ -454,16 +461,46 @@ void list_dir_entries(const std::string& dir, std::vector<dir_ent>* out) {
 #endif
 }
 
+struct tagged_game_root {
+  std::string path;
+  std::string location;  // "internal" | "package" | "network" | "usb"
+  std::string drive;
+  std::string fs;
+};
+
+std::vector<tagged_game_root> all_game_roots_tagged() {
+  std::vector<tagged_game_root> roots;
+  auto add_unique = [&](const std::string& p, const std::string& loc,
+                        const std::string& drv, const std::string& fs) {
+    if (p.empty()) return;
+    for (const auto& ex : roots) {
+      if (xfer_ieq(ex.path, p)) return;
+    }
+    roots.push_back({p, loc, drv, fs});
+  };
+  add_unique(g_games_dir, "internal", "Local", "");
+  add_unique(g_package_games_dir, "package", "App", "");
+  {
+    std::lock_guard<std::mutex> network_lock(g_network_root_mu);
+    add_unique(g_network_games_dir, "network", "SMB", "");
+  }
+  {
+    std::lock_guard<std::mutex> ext_lock(g_external_storage_mu);
+    for (const auto& vol : g_external_storage) {
+      std::string drv = vol.path.size() >= 2 && vol.path[1] == ':'
+                            ? vol.path.substr(0, 2)
+                            : vol.name;
+      for (const auto& r : vol.game_roots) {
+        add_unique(r, "usb", drv, vol.fs);
+      }
+    }
+  }
+  return roots;
+}
+
 std::vector<std::string> game_roots() {
   std::vector<std::string> roots;
-  if (!g_games_dir.empty()) roots.push_back(g_games_dir);
-  if (!g_package_games_dir.empty() && g_package_games_dir != g_games_dir)
-    roots.push_back(g_package_games_dir);
-  std::lock_guard<std::mutex> network_lock(g_network_root_mu);
-  if (!g_network_games_dir.empty() &&
-      g_network_games_dir != g_games_dir &&
-      g_network_games_dir != g_package_games_dir)
-    roots.push_back(g_network_games_dir);
+  for (const auto& tr : all_game_roots_tagged()) roots.push_back(tr.path);
   return roots;
 }
 
@@ -1278,20 +1315,33 @@ bool parse_json_str_field(const std::string& json, const char* key, std::string*
 }
 
 std::string games_json() {
-  const auto roots = game_roots();
+  const auto roots = all_game_roots_tagged();
+  std::vector<webxfer_storage_volume> ext_volumes;
+  {
+    std::lock_guard<std::mutex> ext_lock(g_external_storage_mu);
+    ext_volumes = g_external_storage;
+  }
   const std::string sep(1, XFER_SEP);
   std::set<std::string> seen;
+  std::set<std::string> internal_names;
+  {
+    std::vector<dir_ent> ients;
+    list_dir_entries(g_games_dir, &ients);
+    for (const auto& e : ients) {
+      if (e.is_dir) internal_names.insert(xfer_lower(e.name));
+    }
+  }
   std::string j = "[";
   bool first = true;
   for (const auto& root : roots) {
     std::vector<dir_ent> ents;
-    list_dir_entries(root, &ents);
+    list_dir_entries(root.path, &ents);
     std::sort(ents.begin(), ents.end(), [](const dir_ent& a, const dir_ent& b) {
       return a.name < b.name;
     });
     for (const auto& d : ents) {
       if (!d.is_dir || !seen.insert(xfer_lower(d.name)).second) continue;
-      const std::string gdir = root + sep + d.name;
+      const std::string gdir = root.path + sep + d.name;
       std::vector<std::string> exes;
       std::string exe;
       scan_game_exes(gdir, d.name, &exes, &exe);
@@ -1301,6 +1351,20 @@ std::string games_json() {
       std::string input = read_small_text(gdir + sep + "tiramisu_input.txt");
       if (input.empty()) input = "auto";
       const pe_compat_info compat = inspect_pe_compat(gdir, exe);
+      const bool is_int = (root.location == "internal") ||
+                          (internal_names.count(xfer_lower(d.name)) > 0);
+      std::string usb_id;
+      if (root.location == "usb") {
+        for (const auto& vol : ext_volumes) {
+          for (const auto& item : vol.items) {
+            if (!item.path.empty() && xfer_ieq(item.path, gdir)) {
+              usb_id = item.id;
+              break;
+            }
+          }
+          if (!usb_id.empty()) break;
+        }
+      }
       if (!first) j += ",";
       first = false;
       j += "{\"name\":\"" + json_escape(d.name) + "\",\"exe\":\"" +
@@ -1308,12 +1372,44 @@ std::string games_json() {
            "\",\"args\":\"" + json_escape(args) + "\",\"input\":\"" +
            json_escape(input) + "\",\"arch\":\"" + json_escape(compat.arch) +
            "\",\"compat\":\"" + json_escape(compat.badge) + "\",\"compat_ok\":" +
-           (compat.ok ? "true" : "false") + ",\"exes\":[";
+           (compat.ok ? "true" : "false") +
+           ",\"location\":\"" + json_escape(root.location) + "\"" +
+           ",\"drive\":\"" + json_escape(root.drive) + "\"" +
+           ",\"fs\":\"" + json_escape(root.fs) + "\"" +
+           ",\"usb_id\":\"" + json_escape(usb_id) + "\"" +
+           ",\"installed_internal\":" + (is_int ? "true" : "false") +
+           ",\"win32_readable\":true,\"exes\":[";
       for (size_t i = 0; i < exes.size(); ++i) {
         if (i) j += ",";
         j += "\"" + json_escape(exes[i]) + "\"";
       }
       j += "]}";
+    }
+  }
+  // Surface broker-only NTFS USB games so users can see & download them to Xbox.
+  for (const auto& vol : ext_volumes) {
+    std::string drv = vol.path.size() >= 2 && vol.path[1] == ':'
+                          ? vol.path.substr(0, 2)
+                          : vol.name;
+    for (const auto& item : vol.items) {
+      if (item.kind != "folder" && item.kind != "iso") continue;
+      if (!seen.insert(xfer_lower(item.name)).second) continue;
+      const bool is_int = item.installed_internal ||
+                          (internal_names.count(xfer_lower(item.name)) > 0);
+      if (!first) j += ",";
+      first = false;
+      const std::string badge =
+          item.win32_readable ? "USB ready" : "USB broker — download to Xbox to play";
+      j += "{\"name\":\"" + json_escape(item.name) + "\",\"exe\":\"" +
+           json_escape(item.exe) + "\",\"appid\":\"\",\"args\":\"\",\"input\":\"auto\","
+           "\"arch\":\"x64\",\"compat\":\"" + json_escape(badge) + "\",\"compat_ok\":" +
+           (item.win32_readable ? "true" : "false") +
+           ",\"location\":\"usb\",\"drive\":\"" + json_escape(drv) +
+           "\",\"fs\":\"" + json_escape(vol.fs.empty() ? item.fs : vol.fs) +
+           "\",\"usb_id\":\"" + json_escape(item.id) +
+           "\",\"installed_internal\":" + (is_int ? "true" : "false") +
+           ",\"win32_readable\":" + (item.win32_readable ? "true" : "false") +
+           ",\"exes\":[]}";
     }
   }
   return j + "]";
@@ -1385,7 +1481,11 @@ const char* k_upload_page =
   "<div class=row style='margin-bottom:6px'>"
   "<input id=dlurl placeholder='Direct .zip URL for Xbox to download itself (https://...)' style='flex:1;min-width:200px'>"
   "<button class='btn btn-sec' onclick=downloadFromUrl()>Download on Xbox</button></div>"
-  "<div id=externalStorage class=conn-sub>Checking external storage...</div>"
+  "<div id=externalStorage class=conn-sub style='margin:10px 0 8px'>Checking external storage (NTFS / exFAT)...</div>"
+  "<div id=usbWrap style='display:none;margin:8px 0 12px;padding:12px;border:1px solid rgba(255,255,255,.10);border-radius:14px;background:rgba(255,255,255,.03)'>"
+  "<div class=game-top style='margin-bottom:8px'><b style='font-size:14px;color:#fff'>USB &amp; External Drives (NTFS / exFAT)</b>"
+  "<button class='btn btn-sec' style='padding:7px 12px;font-size:12px' onclick=rescanUsb()>Rescan USB Drives</button></div>"
+  "<div id=usbList></div></div>"
   "<div id=bar><div id=fill></div></div>"
   "<div id=log role=status style='font-size:13px;color:#d5cecc;min-height:18px'>Ready over LAN</div></div>"
   "<dialog id=profileEdit class=card><form method=dialog><h2 id=profileTitle>Game settings</h2>"
@@ -1544,25 +1644,43 @@ const char* k_upload_page =
   "const inps=['auto','controller','kbm','pad2kbm'].map(m=>'<option value=\"'+m+'\"'+(m===x.input?' selected':'')+'>Input: '+m+'</option>').join('');"
   "const ccol=(x.compat_ok===false)?'#ff9aa8':'#b6e3c6';"
   "const cbadge=x.compat?('<span class=pill style=\"color:'+ccol+';border-color:rgba(255,255,255,.16)\">'+esc(x.compat)+'</span>'):'';"
+  "const sbadge=x.location==='usb'?('<span class=pill style=\"border-color:rgba(243,219,196,.35);color:#f3dbc4\">USB '+(x.drive||'')+(x.fs?' · '+esc(x.fs):'')+'</span>'):'';"
+  "const dlUsb=(x.usb_id&&!x.installed_internal)?('<button class=\"btn btn-sec\" onclick=\"installFromUsb(\\''+esc(x.usb_id)+'\\',\\''+esc(x.name)+'\\')\">Download to Xbox</button>'):'';"
+  "const canDel=x.location!=='usb';"
+  "const playAct=x.win32_readable===false?('<button class=btn onclick=\"installFromUsb(\\''+esc(x.usb_id)+'\\',\\''+esc(x.name)+'\\')\">Download to Xbox ▶</button>'):('<button class=btn onclick=\"launch(\\''+esc(x.name)+'\\','+(x.compat_ok!==false)+',\\''+esc(x.compat||'')+'\\')\">Launch ▶</button>');"
   "return '<div class=game><div class=game-top><div class=game-head>'"
   "+'<img class=cover-thumb src=\"/api/cover/'+encodeURIComponent(x.name)+'?t='+Date.now()+'\" onerror=\"this.style.opacity=0.2\">'"
-  "+'<b>'+esc(x.name)+'</b> '+cbadge+'</div><div class=row>'"
-  "+'<button class=btn onclick=\"launch(\\''+esc(x.name)+'\\','+(x.compat_ok!==false)+',\\''+esc(x.compat||'')+'\\')\">Launch ▶</button>'"
+  "+'<b>'+esc(x.name)+'</b> '+sbadge+' '+cbadge+'</div><div class=row>'"
+  "+playAct+dlUsb"
   "+'<button class=\"btn btn-sec\" onclick=\"E(\\'cov'+i+'\\').click()\">Cover</button>'"
   "+'<input type=file id=cov'+i+' accept=\"image/*\" style=\"display:none\" onchange=\"uploadCover(\\''+esc(x.name)+'\\',this)\">'"
   "+'<button class=\"btn btn-sec\" data-game=\"'+esc(x.name)+'\" onclick=\"editGameProfile(this.dataset.game)\">Game settings</button>'"
   "+'<button class=\"btn btn-sec\" onclick=\"saveCfg('+i+',\\''+esc(x.name)+'\\')\">Save</button>'"
-  "+'<button class=\"btn btn-danger\" onclick=\"delGame(\\''+esc(x.name)+'\\')\">Delete</button></div></div>'"
+  "+(canDel?'<button class=\"btn btn-danger\" onclick=\"delGame(\\''+esc(x.name)+'\\')\">Delete</button>':'')+'</div></div>'"
   "+'<div class=game-cfg><select id=exe'+i+'>'+opts+'</select><select id=inp'+i+'>'+inps+'</select>'"
   "+'<input id=app'+i+' placeholder=\"Steam AppID (optional)\" value=\"'+esc(x.appid)+'\">'"
   "+'<input id=arg'+i+' placeholder=\"Launch args (e.g. -windowed)\" value=\"'+esc(x.args)+'\"></div></div>';}).join('');}"
+  "function fmtBytes(b){if(!b)return '';if(b>=1073741824)return (b/1073741824).toFixed(1)+' GB';return (b/1048576).toFixed(1)+' MB';}"
+  "async function rescanUsb(){setLog('Rescanning NTFS / exFAT USB drives...');await fetch('/api/usb/rescan',{method:'POST'});setTimeout(()=>{refreshStorage();refresh();},900);}"
+  "async function installFromUsb(id,name){if(!id)return;const custom=(E('gname').value||'').trim();"
+  "const tgt=custom||name;setLog('Installing '+tgt+' from USB to Xbox SSD...');E('fill').style.width='4%';"
+  "try{const r=await fetch('/api/usb/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id,name:custom})});"
+  "setLog(await r.text());if(r.ok)hadDownload=true;else E('fill').style.width='0%';"
+  "}catch(e){E('fill').style.width='0%';setLog('USB install error: '+e.message);}}"
   "async function refreshStorage(){try{const r=await fetch('/api/storage');"
-  "if(!r.ok)throw Error(r.status);const s=await r.json(),v=s.volumes;"
-  "E('externalStorage').textContent=!v.length?(s.broker_status==='checking'?'Checking external storage...':"
-  "s.broker_status==='unavailable'?'Windows removable storage unavailable; no game drive paths found':"
-  "'No external game drives detected'):"
-  "v.map(d=>d.name+(d.game_roots.length?' — '+d.game_roots.join(', '):"
-  "' — no accessible Games or TiramisuGames folder')).join(' · ');"
+  "if(!r.ok)throw Error(r.status);const s=await r.json(),v=s.volumes||[];"
+  "E('externalStorage').textContent=!v.length?(s.broker_status==='checking'?'Checking external storage (NTFS / exFAT)...':"
+  "s.broker_status==='unavailable'?'Windows removable storage unavailable; insert an NTFS or exFAT USB drive':"
+  "'No external USB drives detected (supports NTFS & exFAT)'):"
+  "v.map(d=>{const fs=d.fs?(' ['+d.fs+']'):'';const free=d.free_bytes?(' · '+fmtBytes(d.free_bytes)+' free'):'';"
+  "const cnt=(d.items&&d.items.length)?(' · '+d.items.length+' item(s)'):(d.game_roots.length?(' · '+d.game_roots.join(', ')):' · ready');return d.name+fs+free+cnt;}).join('  |  ');"
+  "const wrap=E('usbWrap'),ul=E('usbList');if(!wrap||!ul)return;"
+  "const allItems=[];v.forEach(d=>(d.items||[]).forEach(it=>allItems.push({vol:d,it})));"
+  "if(!v.length){wrap.style.display='none';ul.innerHTML='';return;}"
+  "wrap.style.display='block';"
+  "if(!allItems.length){ul.innerHTML='<div style=\"color:#9e9699;font-size:12px\">USB drive detected ('+v.map(d=>esc(d.name+(d.fs?' '+d.fs:''))).join(', ')+') — place game folders, .zip archives, or .iso images on the drive (or in Games/) and tap Rescan.</div>';return;}"
+  "ul.innerHTML=allItems.map(({vol,it})=>'<div class=setrow><div><b>'+esc(it.name)+'</b> <span style=\"color:#9e9699;font-size:12px\">['+esc(vol.fs||it.kind)+' · '+esc(it.kind.toUpperCase())+(it.size_bytes?' · '+fmtBytes(it.size_bytes):'')+(it.win32_readable===false?' · Broker Copy':'')+']</span></div>'"
+  "+(it.installed_internal?'<span class=pill>Installed on Xbox</span>':'<button class=\"btn btn-sec\" onclick=\"installFromUsb(\\''+esc(it.id)+'\\',\\''+esc(it.name)+'\\')\">Download to Xbox</button>')+'</div>').join('');"
   "}catch{E('externalStorage').textContent='External storage status unavailable';}}"
   "let hadDownload=false;"
   "async function refreshStatus(){try{const r=await fetch('/api/status');if(!r.ok)throw Error(r.status);const s=await r.json();"
@@ -2524,14 +2642,95 @@ void handle_client(sock_t s) {
       if (!first) json += ',';
       first = false;
       json += "{\"name\":\"" + json_escape(volume.name) + "\",\"path\":\"" +
-              json_escape(volume.path) + "\",\"game_roots\":[";
+              json_escape(volume.path) + "\",\"label\":\"" + json_escape(volume.label) +
+              "\",\"fs\":\"" + json_escape(volume.fs) + "\",\"total_bytes\":" +
+              std::to_string(volume.total_bytes) + ",\"free_bytes\":" +
+              std::to_string(volume.free_bytes) + ",\"win32_readable\":" +
+              (volume.win32_readable ? "true" : "false") + ",\"broker_readable\":" +
+              (volume.broker_readable ? "true" : "false") + ",\"game_roots\":[";
       for (size_t i = 0; i < volume.game_roots.size(); ++i) {
         if (i) json += ',';
         json += "\"" + json_escape(volume.game_roots[i]) + "\"";
       }
+      json += "],\"items\":[";
+      for (size_t i = 0; i < volume.items.size(); ++i) {
+        if (i) json += ',';
+        const auto& it = volume.items[i];
+        json += "{\"id\":\"" + json_escape(it.id) + "\",\"name\":\"" + json_escape(it.name) +
+                "\",\"kind\":\"" + json_escape(it.kind) + "\",\"path\":\"" +
+                json_escape(it.path) + "\",\"exe\":\"" + json_escape(it.exe) +
+                "\",\"size_bytes\":" + std::to_string(it.size_bytes) +
+                ",\"win32_readable\":" + (it.win32_readable ? "true" : "false") +
+                ",\"installed_internal\":" + (it.installed_internal ? "true" : "false") + "}";
+      }
       json += "]}";
     }
     respond(s, "200 OK", "application/json", json + "]}");
+    return;
+  }
+
+  if (strcmp(method, "POST") == 0 && url_path == "/api/usb/rescan") {
+    {
+      std::lock_guard<std::mutex> lk(g_mu);
+      g.rescan_requested = true;
+      g.rescan_game.clear();
+    }
+    respond(s, "202 Accepted", "application/json", "{\"ok\":true}");
+    return;
+  }
+
+  if (strcmp(method, "POST") == 0 && url_path == "/api/usb/install") {
+    std::string body;
+    if (content_len == 0 || content_len > 16384 ||
+        !recv_exact_all(s, pre, pre_len, content_len, &body)) {
+      respond(s, "400 Bad Request", "text/plain", "Invalid USB install request");
+      return;
+    }
+    std::string item_id, custom_name;
+    if (!parse_json_str_field(body, "id", &item_id) || item_id.empty()) {
+      respond(s, "400 Bad Request", "text/plain", "Missing USB item id");
+      return;
+    }
+    parse_json_str_field(body, "name", &custom_name);
+    webxfer_usb_item found{};
+    bool has_item = false;
+    {
+      std::lock_guard<std::mutex> lock(g_external_storage_mu);
+      for (const auto& vol : g_external_storage) {
+        for (const auto& it : vol.items) {
+          if (it.id == item_id) {
+            found = it;
+            has_item = true;
+            break;
+          }
+        }
+        if (has_item) break;
+      }
+    }
+    if (!has_item) {
+      respond(s, "404 Not Found", "text/plain", "USB item not found; rescan drives");
+      return;
+    }
+    std::string target_name = trim_ws(custom_name).empty() ? found.name : custom_name;
+    if (!sanitize_game_name(target_name, &target_name) ||
+        target_name.front() == '.' || target_name.back() == '.') {
+      respond(s, "400 Bad Request", "text/plain", "Enter a valid target game name");
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lk(g_usb_install_mu);
+      if (g_usb_install_active.load() || g_usb_install_requested) {
+        respond(s, "409 Conflict", "text/plain", "Another USB install is already running");
+        return;
+      }
+      g_usb_install_requested = true;
+      g_usb_install_item_id = item_id;
+      g_usb_install_game_name = target_name;
+      g_usb_phase = "Starting USB copy";
+    }
+    g_usb_done.store(0);
+    g_usb_total.store(found.size_bytes);
+    respond(s, "202 Accepted", "text/plain", "Downloading " + target_name + " from USB");
     return;
   }
 
@@ -2562,6 +2761,12 @@ void handle_client(sock_t s) {
       last_upload = g.last_upload;
       last_error = g.last_error;
       download_phase = g_url_phase;
+      if (download_phase.empty()) {
+        std::lock_guard<std::mutex> ulk(g_usb_install_mu);
+        if (g_usb_install_active.load() || g_usb_install_requested) {
+          download_phase = g_usb_phase;
+        }
+      }
       launch_requested = g.launch_requested;
       launch_name = g.launch_name;
       last_launch_result = g.last_launch_result;
@@ -2598,6 +2803,7 @@ void handle_client(sock_t s) {
     }
     const std::string ctrl_code = webxfer_control_code();
     char buf[4096];
+    const bool use_usb_prog = !g_url_active.load() && (g_usb_install_active.load() || g_usb_done.load() > 0);
     snprintf(buf, sizeof(buf),
              "{\"running\":%s,\"guest_running\":%s,\"running_game\":\"%s\",\"url\":\"%s\","
              "\"last_upload\":\"%s\",\"last_error\":\"%s\","
@@ -2623,8 +2829,8 @@ void handle_client(sock_t s) {
              json_escape(ctrl_code).c_str(),
              upload_done, upload_total,
              json_escape(download_phase).c_str(),
-             static_cast<unsigned long long>(g_url_received.load()),
-             static_cast<unsigned long long>(g_url_expected.load()));
+             static_cast<unsigned long long>(use_usb_prog ? g_usb_done.load() : g_url_received.load()),
+             static_cast<unsigned long long>(use_usb_prog ? g_usb_total.load() : g_url_expected.load()));
     respond(s, "200 OK", "application/json", buf);
     return;
   }
@@ -3329,6 +3535,45 @@ int webxfer_score_ipv4(const char* dotted) {
   if (a == 10u) return 250;
   if (a == 172u && b >= 16u && b <= 31u) return 200;
   return 100;
+}
+
+bool webxfer_poll_usb_install(std::string* out_item_id, std::string* out_name) {
+  std::lock_guard<std::mutex> lk(g_usb_install_mu);
+  if (!g_usb_install_requested) return false;
+  g_usb_install_requested = false;
+  if (out_item_id) *out_item_id = g_usb_install_item_id;
+  if (out_name) *out_name = g_usb_install_game_name;
+  return true;
+}
+
+void webxfer_set_usb_install_status(bool active, const std::string& phase,
+                                    uint64_t done_bytes, uint64_t total_bytes,
+                                    const std::string& error,
+                                    const std::string& completed_note) {
+  g_usb_install_active.store(active);
+  g_usb_done.store(done_bytes);
+  g_usb_total.store(total_bytes);
+  {
+    std::lock_guard<std::mutex> lk(g_usb_install_mu);
+    g_usb_phase = active ? phase : std::string{};
+  }
+  if (!active && (!error.empty() || !completed_note.empty())) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    g.last_error = error;
+    if (!completed_note.empty()) g.last_upload = completed_note;
+  }
+}
+
+bool webxfer_extract_zip_to_dir(const std::string& zip_path, const std::string& dest_dir,
+                                std::string* out_note, bool require_complete) {
+  std::string note;
+  bool ok = extract_zip(zip_path, dest_dir, &note, require_complete);
+  if (out_note) *out_note = note;
+  return ok;
+}
+
+bool webxfer_sanitize_game_name(const std::string& raw, std::string* out) {
+  return sanitize_game_name(raw, out);
 }
 
 void webxfer_set_external_storage(const std::vector<webxfer_storage_volume>& volumes,

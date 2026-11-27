@@ -12,15 +12,44 @@
 
 namespace longan {
 
+struct webxfer_usb_item {
+  std::string id;
+  std::string name;
+  std::string volume_path;
+  std::string fs;
+  std::string path;
+  std::string kind;  // "folder" | "zip" | "iso"
+  std::string exe;
+  uint64_t size_bytes = 0;
+  bool win32_readable = true;
+  bool installed_internal = false;
+  bool operator==(const webxfer_usb_item&) const = default;
+};
+
 struct webxfer_storage_volume {
   std::string name;
   std::string path;
   std::vector<std::string> game_roots;
+  std::string label;
+  std::string fs;
+  uint64_t total_bytes = 0;
+  uint64_t free_bytes = 0;
+  bool win32_readable = true;
+  bool broker_readable = false;
+  std::vector<webxfer_usb_item> items;
   bool operator==(const webxfer_storage_volume&) const = default;
 };
 
 void webxfer_set_external_storage(const std::vector<webxfer_storage_volume>& volumes,
                                   const std::string& broker_status);
+bool webxfer_poll_usb_install(std::string* out_item_id, std::string* out_name);
+void webxfer_set_usb_install_status(bool active, const std::string& phase,
+                                    uint64_t done_bytes, uint64_t total_bytes,
+                                    const std::string& error,
+                                    const std::string& completed_note = {});
+bool webxfer_extract_zip_to_dir(const std::string& zip_path, const std::string& dest_dir,
+                                std::string* out_note, bool require_complete = true);
+bool webxfer_sanitize_game_name(const std::string& raw, std::string* out);
 
 struct webxfer_state {
   bool running = false;
