@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.5.1] — Dashboard preview, circular imports, and render diagnostics
+
+- Restored and packaged the standalone controller-friendly dashboard preview.
+- Integrated two-phase PE64 dependency loading and tested mutually importing
+  DLLs and load rollback.
+- Added D3D11 backbuffer identity and output-mask counters to the render report.
+- Updated contributor and release documentation and removed internal prompt files.
+
+[Complete 0.2.5.1 notes](docs/releases/0.2.5.1.md)
+
 ## [0.2.5.0] — USB and Device Portal imports, loader and middleware updates
 
 - Added automatic USB discovery improvements and the Device Portal
