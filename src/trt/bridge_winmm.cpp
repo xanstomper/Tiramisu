@@ -43,6 +43,24 @@ extern "C" unsigned int __stdcall timeEndPeriod(unsigned int uPeriod);
 
 namespace {
 
+// Messages for the device errors this bridge can report.
+template <typename Char>
+u32 mci_error_string(u32 error, Char* out, u32 cap) {
+  if (!out || !cap) return 0;
+  const char* text = nullptr;
+  switch (error) {
+    case 257: text = "The specified device ID is invalid."; break;
+    case 263: text = "The specified device name is invalid."; break;
+  }
+  u32 i = 0;
+  while (text && i < cap - 1 && text[i]) {
+    out[i] = static_cast<Char>(text[i]);
+    ++i;
+  }
+  out[i] = 0;
+  return text != nullptr;
+}
+
 // timeGetTime: ms since boot, wrapping at 2^32 like Windows.
 u32 now_ms() {
   struct timespec ts;
@@ -331,6 +349,19 @@ u32 TRT_GUEST_ABI trt_mciSendCommandA(u32 dev, u32 msg, u64 p1, u64 p2) {
 u32 TRT_GUEST_ABI trt_mciSendCommandW(u32 dev, u32 msg, u64 p1, u64 p2) {
   (void)dev; (void)msg; (void)p1; (void)p2;
   return 263;  // MCIERR_INVALID_DEVICE_NAME
+}
+
+u32 TRT_GUEST_ABI trt_mciSendStringA(const char*, char*, u32, void*) {
+  trt_core_log("winmm: mciSendStringA -> MCIERR_INVALID_DEVICE_NAME");
+  return 263;
+}
+
+u32 TRT_GUEST_ABI trt_mciGetErrorStringA(u32 error, char* out, u32 cap) {
+  return mci_error_string(error, out, cap);
+}
+
+u32 TRT_GUEST_ABI trt_mciGetErrorStringW(u32 error, u16* out, u32 cap) {
+  return mci_error_string(error, out, cap);
 }
 
 // ---- media key helpers some engines import ----
@@ -960,7 +991,10 @@ int trt_bridge_register_winmm(void) {
       {"joySetCapture", (void*)&trt_joySetCapture},
       {"joyReleaseCapture", (void*)&trt_joyReleaseCapture},
       {"joyConfigChanged", (void*)&trt_joyConfigChanged},
+      {"mciSendStringA", (void*)&trt_mciSendStringA},
       {"mciSendStringW", (void*)&trt_mciSendStringW},
+      {"mciGetErrorStringA", (void*)&trt_mciGetErrorStringA},
+      {"mciGetErrorStringW", (void*)&trt_mciGetErrorStringW},
       {"mciSendCommandA", (void*)&trt_mciSendCommandA},
       {"mciSendCommandW", (void*)&trt_mciSendCommandW},
       {"GetProfileStringW", (void*)&trt_GetProfileStringW},
