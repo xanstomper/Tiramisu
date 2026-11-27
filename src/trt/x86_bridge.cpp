@@ -1575,16 +1575,14 @@ static int lookup_arg_count(const char* module, const char* symbol) {
         return lookup_arg_count("advapi32", symbol);
     }
 
-    // Default: unknown, return -1 to indicate "use default"
+    // A bridge may only call the host and unwind the guest stack with a known ABI.
     return -1;
     #undef ARGENTRY
 }
 
 // Conformance API: the argument count this bridge will pop for module!symbol,
-// or -1 when no ABI entry exists. -1 is not harmless - the trap dispatcher then
-// falls back to a 4-argument guess, which is exactly how a 1-arg stdcall once
-// ate OpenTTD's return address and jumped to 0x0000B5E3. The conformance suite
-// requires every registered BUILTIN symbol to answer without guessing.
+// or -1 when no ABI entry exists. The trap dispatcher stops at that call so
+// the saved return address and arguments remain available for diagnosis.
 int trt_abi_arg_count(const char* module, const char* symbol) {
     if (!module || !symbol) return -1;
     int n = lookup_arg_count(module, symbol);
@@ -2204,25 +2202,32 @@ extern "C" int x86_arg_count(const char* module, const char* symbol) {
 extern "C" uint32_t x86_dispatch_import(x86_context* ctx, int trap_index,
                                         const char* module, const char* symbol,
                                         int* out_nargs, int* out_cdecl) {
+    const int nargs = trt_abi_arg_count(module, symbol);
+    *out_nargs = nargs;
+    *out_cdecl = 0;
+    if (nargs < 0 || nargs > 16) {
+        char name[128];
+        snprintf(name, sizeof(name), "%s", symbol && symbol[0] ? symbol : "#ordinal");
+        if (trap_index >= 0 && (!symbol || !symbol[0])) {
+            u16 ordinal = 0;
+            trt_pe32_trap_info(trap_index, nullptr, 0, nullptr, 0, &ordinal, nullptr);
+            snprintf(name, sizeof(name), "#%u", static_cast<unsigned>(ordinal));
+        }
+        char line[256];
+        snprintf(line, sizeof(line), "x86_bridge: unsupported ABI for %s!%s (argc=%d)",
+                 module ? module : "?", name, nargs);
+        if (ctx->log) ctx->log(line);
+        ctx->execution = X86_EXEC_UNHANDLED_TRAP;
+        ctx->running = 0;
+        return 0;
+    }
+    *out_cdecl = lookup_cdecl(module, symbol);
     uint32_t args[16];
     uint32_t esp = ctx->regs.esp + 4; // skip return address
     for (int i = 0; i < 16; i++) args[i] = x86_mem_read32(ctx, esp + i * 4);
 
-    int cdecl_call = lookup_cdecl(module, symbol);
-    int nargs = lookup_arg_count(module, symbol);
-    if (nargs < 0) {
-        nargs = trt_dynamic_deduce_arg_count(module, symbol);
-        char buf[256];
-        snprintf(buf, sizeof(buf),
-                 "x86_bridge: [AUTONOMOUS SYNTHESIS] %s!%s deduced stdcall nargs=%d",
-                 module, symbol ? symbol : "?", nargs);
-        if (ctx->log) ctx->log(buf);
-    }
-
     uint32_t result = 0;
     if (special_import(ctx, module, symbol, args, &result)) {
-        *out_nargs = nargs;
-        *out_cdecl = cdecl_call;
         return result;
     }
 
@@ -2234,23 +2239,14 @@ extern "C" uint32_t x86_dispatch_import(x86_context* ctx, int trap_index,
         snprintf(buf, sizeof(buf), "x86_bridge: unresolved %s!%s -> dynamic synth return 0x%x",
                  module, symbol ? symbol : "?", syn_val);
         if (ctx->log) ctx->log(buf);
-        *out_nargs = nargs;
-        *out_cdecl = cdecl_call;
         return syn_val;
     }
-    result = x86_call_fn(ctx, fn, module, symbol, args, nargs);
-    *out_nargs = nargs;
-    *out_cdecl = cdecl_call;
-    return result;
+    return x86_call_fn(ctx, fn, module, symbol, args, nargs);
 }
 
 // Legacy entry point kept for direct callers.
 extern "C" uint32_t x86_import_thunk_handler(x86_context* ctx, const char* module,
                                              const char* symbol) {
-    uint32_t args[16];
-    uint32_t esp = ctx->regs.esp + 4;
-    for (int i = 0; i < 16; i++) args[i] = x86_mem_read32(ctx, esp + i * 4);
-    int nargs = lookup_arg_count(module, symbol);
-    if (nargs < 0) nargs = 4;
-    return x86_call_bridge(ctx, module, symbol, args, nargs);
+    int nargs = 0, cdecl_call = 0;
+    return x86_dispatch_import(ctx, -1, module, symbol, &nargs, &cdecl_call);
 }

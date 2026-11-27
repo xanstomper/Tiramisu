@@ -305,6 +305,21 @@ int main() {
         CHECK(nargs == 0, "GetLastError has 0 args");
     }
 
+    printf("== import dispatch: unknown ABI preserves guest state ==\n");
+    {
+        x86_context unknown{};
+        unknown.running = 1;
+        unknown.regs.esp = 0x0010E000;
+        unknown.regs.eip = 0xf0000020;
+        int nargs = 0, cdecl_call = 0;
+        x86_dispatch_import(&unknown, -1, "mystery.dll", "OpenCustomDevice",
+                            &nargs, &cdecl_call);
+        CHECK(!unknown.running && unknown.execution == X86_EXEC_UNHANDLED_TRAP && nargs == -1,
+              "dispatch stops when the ABI is unknown");
+        CHECK(unknown.regs.esp == 0x0010E000 && unknown.regs.eip == 0xf0000020,
+              "an unsupported call leaves the guest stack and instruction pointer intact");
+    }
+
     printf("== import dispatch: TLS alloc/set/get ==\n");
     {
         ctx.regs.esp = 0x0010E000;

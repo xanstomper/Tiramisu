@@ -3,10 +3,9 @@
 //
 // Tiramisu reimplements Windows, so its worst failure mode is not a missing
 // function - it is a registered function whose calling convention the x86
-// dispatcher has to GUESS. The dispatcher falls back to a 4-argument stdcall
-// when there is no ABI entry, so a 1-argument stdcall pops 12 extra bytes and
-// the guest returns into garbage (OpenTTD jumped to 0x0000B5E3 exactly that
-// way). A wrong guess is invisible in a coverage report and fatal at runtime.
+// dispatcher cannot verify. Guessing a 4-argument stdcall used to pop 12
+// extra bytes for a 1-argument API (OpenTTD jumped to 0x0000B5E3 that way).
+// The dispatcher now stops at the named call when ABI metadata is missing.
 //
 // This test enumerates the whole registry, requires an ABI answer for every
 // symbol Tiramisu claims to implement, and compares the remaining gaps with
@@ -133,8 +132,8 @@ int main(int argc, char** argv) {
          fixed, (int)baseline.size(), (int)gaps.size());
   // Scope matters: this table is the PE32 trap dispatcher's. A 64-bit guest
   // passes arguments in registers and the callee never pops, so a missing
-  // entry is harmless there - it is fatal only for a 32-bit title, where the
-  // dispatcher guesses and pops the guest's return address off the stack.
+  // entry is harmless there. PE32 execution needs this metadata to safely
+  // pass arguments and return to the guest.
   printf("CONFORMANCE: %d of %d claimed BUILTIN symbol(s) have an exact x86 "
          "ABI entry (gaps affect PE32 titles only)\n",
          with_abi, builtin);
