@@ -1,6 +1,7 @@
 #pragma once
 
 #include "host_log.h"
+#include "cursor_policy.h"
 #include "../trt/input.h"
 
 #include <GameInput.h>
@@ -96,6 +97,13 @@ class native_gameinput {
     const ULONGLONG last = last_mouse_ms_.load();
     return last != 0 && (GetTickCount64() - last) < within_ms;
   }
+  bool mouse_motion_recent(ULONGLONG now, ULONGLONG within_ms) const {
+    return pointer_event_recent(now, last_mouse_motion_ms_.load(), within_ms);
+  }
+  bool mouse_buttons_recent(ULONGLONG now, ULONGLONG within_ms) const {
+    return pointer_event_recent(now, last_mouse_button_ms_.load(), within_ms);
+  }
+
   bool mouse_connected() const { return mouse_connected_.load(); }
   bool wheel_active_recent() const {
     const ULONGLONG last = last_wheel_ms_.load();
@@ -113,8 +121,11 @@ class native_gameinput {
       interceptor_last_ms_[vk].store(GetTickCount64());
   }
 
+  void resume_mouse() { mouse_focused_.store(true); }
+
   void suspend() {
     // The CoreWindow focus handler releases both native and guest input.
+    mouse_focused_.store(false);
     keyboard_active_.store(false);
     mouse_active_.store(false);
     last_wheel_ms_.store(0);
@@ -123,10 +134,7 @@ class native_gameinput {
     keys_ = {};
     {
       std::lock_guard<std::mutex> lock(mouse_mu_);
-      mouse_ = {};
-      mouse_baseline_ = false;
-      dev_mouse_ = {};
-      dev_mouse_baseline_ = false;
+      reset_mouse_tracking();
     }
     mouse_click_pending_.store(false);
     keyboard_missing_since_ = 0;
@@ -147,6 +155,15 @@ class native_gameinput {
         clicked |= update_mouse(reading);
       });
       if (!mouse_active_recent(300)) clicked |= poll_device_mouse();
+    } else if (!mouse_callback_recent()) {
+      // Some hosts accept subscription but deliver no reading callbacks.
+      // Sample only the latest event and share its baseline with the callback.
+      winrt::com_ptr<IGameInputReading> reading;
+      if (SUCCEEDED(input_->GetCurrentReading(GameInputKindMouse, nullptr, reading.put())) &&
+          reading) {
+        std::lock_guard<std::mutex> lock(mouse_mu_);
+        if (!mouse_callback_recent()) clicked |= update_mouse(*reading);
+      }
     }
     return clicked;
   }
@@ -336,7 +353,12 @@ class native_gameinput {
     auto* self = static_cast<native_gameinput*>(context);
     if (!self || !reading) return;
     std::lock_guard<std::mutex> lock(self->mouse_mu_);
-    if (self->update_mouse(*reading)) self->mouse_click_pending_.store(true);
+    if (!self->mouse_focused_.load()) return;
+    if (self->update_mouse(*reading, true)) self->mouse_click_pending_.store(true);
+  }
+
+  bool mouse_callback_recent() const {
+    return pointer_event_recent(GetTickCount64(), last_mouse_callback_ms_.load(), 300);
   }
 
   struct key {
@@ -361,12 +383,20 @@ class native_gameinput {
     for (unsigned button = 0; button < 5; ++button) {
       if (mouse_.buttons & (1u << button)) trt_input_mouse_button(button, false);
     }
+    reset_mouse_tracking();
+  }
+
+  void reset_mouse_tracking() {
     mouse_ = {};
     mouse_baseline_ = false;
     dev_mouse_ = {};
     dev_mouse_baseline_ = false;
+    last_mouse_reading_timestamp_ = 0;
     mouse_active_.store(false);
     last_mouse_ms_.store(0);
+    last_mouse_motion_ms_.store(0);
+    last_mouse_button_ms_.store(0);
+    last_mouse_callback_ms_.store(0);
     last_wheel_ms_.store(0);
   }
 
@@ -523,7 +553,9 @@ class native_gameinput {
       const auto dy = delta(next.positionY, prev.positionY);
       if (dx || dy) {
         mouse_active_.store(true);
-        last_mouse_ms_.store(GetTickCount64());
+        const auto now = GetTickCount64();
+        last_mouse_ms_.store(now);
+        last_mouse_motion_ms_.store(now);
         if (!mouse_motion_seen_) {
           mouse_motion_seen_ = true;
           log_line("input: native GameInput mouse movement applied");
@@ -545,7 +577,9 @@ class native_gameinput {
       const unsigned mask = 1u << button;
       if (!(changed & mask)) continue;
       mouse_active_.store(true);
-      last_mouse_ms_.store(GetTickCount64());
+      const auto now = GetTickCount64();
+      last_mouse_ms_.store(now);
+      last_mouse_button_ms_.store(now);
       if (!mouse_button_seen_) {
         mouse_button_seen_ = true;
         log_line("input: native GameInput mouse button applied");
@@ -559,9 +593,13 @@ class native_gameinput {
     return clicked;
   }
 
-  bool update_mouse(IGameInputReading& reading) {
+  bool update_mouse(IGameInputReading& reading, bool callback = false) {
     GameInputMouseState next{};
     if (!reading.GetMouseState(&next)) return false;
+    if (callback) last_mouse_callback_ms_.store(GetTickCount64());
+    const auto timestamp = reading.GetTimestamp();
+    if (timestamp && timestamp < last_mouse_reading_timestamp_) return false;
+    if (timestamp) last_mouse_reading_timestamp_ = timestamp;
     return apply_mouse_state(next, mouse_, mouse_baseline_);
   }
 
@@ -604,7 +642,12 @@ class native_gameinput {
   host_key_fn host_key_fn_ = nullptr;
   std::atomic<bool> keyboard_active_{false};
   std::atomic<bool> mouse_active_{false};
+  std::atomic<bool> mouse_focused_{true};
+  uint64_t last_mouse_reading_timestamp_ = 0;
   std::atomic<ULONGLONG> last_mouse_ms_{0};
+  std::atomic<ULONGLONG> last_mouse_motion_ms_{0};
+  std::atomic<ULONGLONG> last_mouse_button_ms_{0};
+  std::atomic<ULONGLONG> last_mouse_callback_ms_{0};
   std::atomic<ULONGLONG> last_wheel_ms_{0};
   std::atomic<bool> mouse_connected_{false};
   std::atomic<bool> keyboard_connected_{false};

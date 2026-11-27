@@ -112,13 +112,20 @@ On a previously tested Series S, the Edge-identity package received physical
 mouse input (console log: `keyboard=1 mouse=1`, `PointerDevices count=1`,
 `physical relative mouse motion received`).
 
-When Tiramisu receives pointer input, its white arrow with a dark outline
-replaces the shell cursor on the dashboard and quick menu. It stays visible
-when the mouse is idle. Games with a live Tiramisu presentation overlay can show
-the same style of arrow, while honoring the guest's cursor visibility and
-clipping. Other rendering paths use the shell cursor. GameInput, MouseDevice
-and CoreWindow can all deliver physical motion. Overlapping button reports
-generate one guest press or release.
+When Tiramisu receives physical pointer input, its small white arrow with a
+dark outline replaces the shell cursor where the app can control visibility.
+The arrow is about 16 pixels tall at 1080p. It scales with the presentation
+surface, including low-resolution guest backbuffers that the console
+upscales. The dashboard and quick menu keep the arrow when the mouse is idle
+or a controller is also in use. The guest overlay follows the game's cursor
+visibility and clipping. Other presentation paths use the shell cursor.
+
+GameInput, MouseDevice, and CoreWindow can deliver physical motion. Tiramisu
+tracks button updates separately so a source that only reports movement
+doesn't block clicks from another source. A GameInput subscription that stops
+delivering callbacks can fall back to polling the latest mouse reading.
+Overlapping button reports share the same guest state.
+
 
 **Games disappear after the identity change** because the PFN determines the
 LocalState folder. Migrate the old state (games, profiles, covers, drive_c,
@@ -157,16 +164,12 @@ The allowlist is a publisher opt-in held outside the package.
 
 What the host does instead, and what was fixed for it:
 
-- **Every pointer source the shell is willing to deliver is now consumed.**
-  `PointerPressed` / `PointerMoved` / `PointerReleased` no longer bail out
-  because GameInput *once* reported a mouse: they defer only while GameInput has
-  produced data in the last 300 ms (`mouse_active_recent()`), so a GameInput
-  device that goes quiet can no longer silence CoreWindow pointer input for the
-  rest of the session.
-- **The Win32 fallback runs in-game.** `GetCursorPos` + `GetAsyncKeyState`
-  (L/R/M) used to be confined to the launcher; it now feeds the guest during
-  play too, and yields for 500 ms after any real CoreWindow pointer event so the
-  two absolute sources never fight over a frame.
+- **Input sources are monitored separately.** Recent GameInput motion takes
+  precedence over other motion sources. CoreWindow and Win32 button handling
+  can continue when GameInput only produces motion.
+- **Win32 polling works during gameplay.** GetCursorPos defers to recent
+  CoreWindow or relative motion, and button polling defers to recent button
+  events. Mouse movement alone does not disable the button fallback.
 - **Auto exposes connected devices.** Choose Controller under Default input
   mode to use a keyboard-backed gamepad when there is no physical controller.
   Choose Pad as mouse, press F1, or click the right stick to drive the pointer
