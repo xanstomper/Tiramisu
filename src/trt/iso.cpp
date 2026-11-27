@@ -17,6 +17,7 @@
 #include <string.h>
 
 #include <algorithm>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -162,6 +163,7 @@ struct sector_map {
 
 struct trt_iso {
   FILE* f = nullptr;
+  mutable std::mutex read_mu;
   sector_map sm;
   uint64_t image_bytes = 0;
   iso_node* root = nullptr;
@@ -177,7 +179,8 @@ struct trt_iso {
 namespace {
 
 // ---- image byte access -----------------------------------------------------
-bool rd_at(trt_iso* iso, uint64_t off, void* buf, size_t len) {
+bool rd_at(const trt_iso* iso, uint64_t off, void* buf, size_t len) {
+  std::lock_guard<std::mutex> read_lock(iso->read_mu);
   if (!iso->f) return false;
   if (iso_seek(iso->f, off) != 0) return false;
   return fread(buf, 1, len, iso->f) == len;
@@ -261,8 +264,18 @@ bool parse_iso_dir(trt_iso* iso, iso_node* dir, uint32_t lba, uint64_t len,
     std::string name;
     if (name_len == 1 && name_p[0] == 0) name = ".";
     else if (name_len == 1 && name_p[0] == 1) name = "..";
-    else if (joliet) name = utf16be_to_utf8(name_p, name_len);
-    else name = iso_name_clean(name_p, name_len);
+    else if (joliet) {
+      name = utf16be_to_utf8(name_p, name_len);
+      // A Joliet file identifier can retain the ISO file version delimiter.
+      const size_t semi = name.rfind(';');
+      if (!is_dir && semi != std::string::npos && semi + 1 < name.size() &&
+          std::all_of(name.begin() + semi + 1, name.end(), [](char c) {
+            return c >= '0' && c <= '9';
+          })) {
+        name.resize(semi);
+        if (!name.empty() && name.back() == '.') name.pop_back();
+      }
+    } else name = iso_name_clean(name_p, name_len);
 
     p += rec_len;
     if (name.empty() || name == "." || name == "..") continue;
@@ -681,9 +694,7 @@ uint32_t trt_iso_read(const trt_iso* iso, const char* path, uint64_t off,
       const uint64_t file_off =
           ext_off + sector_index * iso->sm.stride + in_sector;
       if (file_off + take > iso->image_bytes) break;
-      if (!rd_at(const_cast<trt_iso*>(iso), file_off, dst + done,
-                 (size_t)take))
-        break;
+      if (!rd_at(iso, file_off, dst + done, (size_t)take)) break;
       done += (uint32_t)take;
       local += take;
     }

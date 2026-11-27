@@ -55,6 +55,7 @@ const trt_backend* g_be = nullptr;
 trt_resolver g_rs;
 char g_search_dir[512] = "";
 char g_content_root[512] = "";
+char g_content_image_drive = 0;
 char g_set_dll_dir[512] = "";
 struct extra_dll_dir {
   char path[512];
@@ -192,6 +193,7 @@ void trt_runtime_init(const trt_backend* be, const char* search_dir) {
   if (search_dir) snprintf(g_search_dir, sizeof(g_search_dir), "%s", search_dir);
   else g_search_dir[0] = 0;
   g_content_root[0] = 0;
+  g_content_image_drive = 0;
   g_set_dll_dir[0] = 0;
   memset(g_extra_dll_dirs, 0, sizeof(g_extra_dll_dirs));
   g_load_dir_depth = 0;
@@ -202,6 +204,11 @@ void trt_runtime_init(const trt_backend* be, const char* search_dir) {
 void trt_runtime_set_content_root(const char* host_dir) {
   const int n = snprintf(g_content_root, sizeof(g_content_root), "%s", host_dir ? host_dir : "");
   if (n < 0 || static_cast<size_t>(n) >= sizeof(g_content_root)) g_content_root[0] = 0;
+}
+
+void trt_runtime_set_content_image_drive(char drive) {
+  drive = lower_of(drive);
+  g_content_image_drive = (drive >= 'a' && drive <= 'z') ? drive : 0;
 }
 
 void trt_runtime_set_dll_dir(const char* host_dir) {
@@ -258,6 +265,18 @@ int trt_runtime_find_dll(const char* name_or_rel, char* out, size_t cap) {
   // The merged game root may supply DLLs outside the executable directory.
   if (g_content_root[0] && probe_dll_in_dir(g_content_root, name_or_rel, out, cap)) {
     return 0;
+  }
+  // Qualified paths are handled by the guest's normal path resolver.
+  if (g_content_image_drive && !strpbrk(name_or_rel, "/\\:") &&
+      strcmp(name_or_rel, ".") && strcmp(name_or_rel, "..")) {
+    char guest_path[512];
+    const char* suffix = has_dot_in_base(name_or_rel) ? "" : ".dll";
+    const int n = snprintf(guest_path, sizeof(guest_path), "%c:\\%s%s",
+                           g_content_image_drive, name_or_rel, suffix);
+    int is_dir = 0;
+    if (n > 0 && static_cast<size_t>(n) < sizeof(guest_path) &&
+        trt_vfs_image_materialize_utf8(guest_path, out, cap, &is_dir) == 0 &&
+        !is_dir) return 0;
   }
   return -1;
 }

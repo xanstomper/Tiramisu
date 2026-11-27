@@ -108,13 +108,32 @@ mapping failures visible before the guest entry point.
 
 ### Make launch decisions reproducible
 
-Use one resolved install tree, one provider registry, and one launch plan for
-Play and the offline harness. Extend current import discovery to record the
-requesting image and runtime provider. Preserve both startup and delay-load
-evidence. Compare static renderer candidates against runtime calls. Make a
-verified plan portable across hardware profiles through explicit limits and
-backends. Test actual multi-depot publication, partial files, optional APIs,
-missing providers, architecture mismatches, and rollback.
+The synthesizer now writes a bounded dependency graph to the launch profile.
+Each edge names its requesting image and imported module, records whether it
+is needed during startup, and includes the relative bundled candidate when
+available. The probe distinguishes scanned bundled images, invalid images,
+architecture mismatches, the scan limit, and requests that need runtime
+resolution. Check `dependency_edges_omitted` before relying on graph coverage.
+The graph describes static discovery. For a mounted image, it scans the
+staged files beside the executable. The runtime trace establishes the
+provider, resolved export, initialization result, and executed behavior.
+
+For mounted-image Play, the runtime can look up a bare module name at the
+mounted drive's root after its existing directory search. It materializes
+only the requested root file. The ISO regression covers the nested executable
+directory, root lookup, adjacent DLL precedence, missing names, and runtime
+reset. Joliet's numeric file-version suffix is normalized after decoding the
+name, so the guest can request the DLL by its Windows filename. Test large
+adjacent assets and cold-cache replacement separately.
+[ECMA-119 Joliet specification](https://ecma-international.org/wp-content/uploads/ECMA-119_5th_edition_december_2024.pdf)
+
+Compare the same install through folder and image mounts and through Play and
+the offline harness. Prioritize the first difference in executable identity,
+working directory, DLL resolution, asset accessibility, or writes. Pair static
+renderer candidates with actual device, draw, and Present events. Use one
+provider registry to record ABI, license, and supported host requirements for
+each verified implementation. Re-run the profile gate when the install
+fingerprint or host changes.
 
 Start in [Steam content handling](../src/host/steam_client.cpp),
 [install readiness](../src/host/steam_install.cpp),

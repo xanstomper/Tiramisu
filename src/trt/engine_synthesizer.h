@@ -69,6 +69,23 @@ enum trt_audio_middleware {
   TRT_AUDIO_WWISE
 };
 
+// File-level evidence collected before the loader binds any imports.
+enum class trt_import_probe {
+  runtime_resolution,
+  bundled,
+  invalid_image,
+  wrong_architecture,
+  scan_limit
+};
+
+struct trt_import_dependency {
+  std::string requester;  // install-relative executable or DLL
+  std::string module;
+  std::string candidate;  // install-relative bundled DLL, if found
+  bool startup;
+  trt_import_probe probe;
+};
+
 struct trt_engine_profile {
   std::string game_name;
   std::string game_dir;
@@ -111,6 +128,8 @@ struct trt_engine_profile {
   // Ordinary imports reachable without following a delay-loaded dependency.
   std::vector<std::string> startup_modules;
   bool import_roles_scanned = false;
+  std::vector<trt_import_dependency> dependencies;
+  size_t dependency_edges_omitted = 0;
   std::string summary;
 };
 

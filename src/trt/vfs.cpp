@@ -8,6 +8,7 @@
 #include "iso.h"
 
 #include <errno.h>
+#include <mutex>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -141,6 +142,7 @@ struct vfs_image {
 vfs_image g_images[8];
 int g_image_count = 0;
 char g_iso_cache_root[512] = "";
+std::mutex g_iso_materialize_mu;
 
 // guest current-working-directory drive and full normalized directory
 char g_cwd_drive[8] = "z:";
@@ -660,7 +662,7 @@ void trt_vfs_unmount_image(const char* drive_prefix) {
 
 // Resolve a guest path to (image, in-image path). Returns the image or null.
 static trt_iso* image_lookup_locked(const char* guest_utf8, char* rel_out,
-                                    size_t rel_cap) {
+                                    size_t rel_cap, char* drive_out = nullptr) {
   if (!guest_utf8 || g_image_count == 0) return nullptr;
   char drv[3] = {}, rest[1024] = "";
   if (normalize_guest_locked(guest_utf8, drv, rest, sizeof(rest), nullptr, 0,
@@ -669,6 +671,7 @@ static trt_iso* image_lookup_locked(const char* guest_utf8, char* rel_out,
   vfs_image* im = image_find_locked(drv);
   if (!im || !im->iso) return nullptr;
   if (rel_out && rel_cap) snprintf(rel_out, rel_cap, "/%s", rest);
+  if (drive_out) *drive_out = lower_of(drv[0]);
   return im->iso;
 }
 
@@ -706,29 +709,29 @@ static void cache_sanitize(const char* in, char* out, size_t cap) {
 // Returns 0 when the path exists in the image, -1 when it does not.
 int trt_vfs_image_materialize(const u16* guest_path, char* host_out,
                               size_t host_cap, int* is_dir_out) {
-  if (!guest_path || !host_out || host_cap == 0) return -1;
+  if (!guest_path) return -1;
+  char utf8[1024];
+  utf16_to_utf8(guest_path, utf8, sizeof(utf8));
+  return trt_vfs_image_materialize_utf8(utf8, host_out, host_cap, is_dir_out);
+}
+
+int trt_vfs_image_materialize_utf8(const char* guest_path, char* host_out,
+                                   size_t host_cap, int* is_dir_out) {
+  if (!guest_path || !guest_path[0] || !host_out || host_cap == 0) return -1;
   char rel[1024] = "";
-  trt_iso* iso = trt_vfs_image_for_guest_utf16(guest_path, rel, sizeof(rel));
+  char root[512], drive = 0;
+  // A file open and a DLL lookup may both populate the cache.
+  std::lock_guard<std::mutex> cache_lock(g_iso_materialize_mu);
+  vfs_lock();
+  trt_iso* iso = image_lookup_locked(guest_path, rel, sizeof(rel), &drive);
+  snprintf(root, sizeof(root), "%s", g_iso_cache_root);
+  vfs_unlock();
   if (!iso) return -1;
 
   int is_dir = 0;
   u64 size = 0;
   if (trt_iso_stat(iso, rel, &is_dir, &size) != 0) return -1;
   if (is_dir_out) *is_dir_out = is_dir;
-
-  char root[512];
-  vfs_lock();
-  snprintf(root, sizeof(root), "%s", g_iso_cache_root);
-  char drv[8] = "d:";
-  {
-    char utf8[1024];
-    utf16_to_utf8(guest_path, utf8, sizeof(utf8));
-    char d2[3] = {}, r2[1024] = "";
-    if (normalize_guest_locked(utf8, d2, r2, sizeof(r2), nullptr, 0, false) == 0 &&
-        d2[0])
-      snprintf(drv, sizeof(drv), "%c", lower_of(d2[0]));
-  }
-  vfs_unlock();
 
   if (!root[0]) {
     // no cache root configured: fall back next to the image
@@ -737,7 +740,9 @@ int trt_vfs_image_materialize(const u16* guest_path, char* host_out,
   char safe[1024];
   cache_sanitize(rel, safe, sizeof(safe));
   char path[1600];
-  snprintf(path, sizeof(path), "%s/%c%s", root, drv[0], safe);
+  const int n = snprintf(path, sizeof(path), "%s/%c%s", root, drive, safe);
+  if (n < 0 || static_cast<size_t>(n) >= sizeof(path) ||
+      static_cast<size_t>(n) >= host_cap) return -1;
   for (char* q = path; *q; ++q)
     if (*q == '\\') *q = '/';
 

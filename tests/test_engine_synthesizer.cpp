@@ -987,6 +987,59 @@ int main() {
 
   }
 
+  printf("== 19. Dependency evidence from the selected executable ==\n");
+  {
+    char directory[] = "tests/out/test_dependency_evidence_XXXXXX";
+    CHECK(mkdtemp(directory), "created isolated dependency evidence fixture");
+    const std::string root = directory;
+    make_pe_with_imports(root + "/Game.exe", 0x10b,
+                         {"Renderer.dll", "Wrong.dll", "Incomplete.dll"}, 0x400,
+                         "Optional.dll");
+    make_pe_with_imports(root + "/Renderer.dll", 0x10b, {"d3d9.dll"});
+    make_pe_with_imports(root + "/Optional.dll", 0x10b, {"vulkan-1.dll"});
+    make_pe_with_imports(root + "/Wrong.dll", 0x20b, {"d3d12.dll"});
+    make_fake_file(root + "/Incomplete.dll", "unfinished download");
+
+    trt_engine_profile profile;
+    CHECK(trt_synthesize_engine(root.c_str(), "Game.exe", &profile),
+          "synthesizer discovered the fixture");
+    const auto has = [&](const char* requester, const char* module, const char* candidate,
+                         bool startup, trt_import_probe probe) {
+      return std::any_of(profile.dependencies.begin(), profile.dependencies.end(),
+                         [&](const trt_import_dependency& edge) {
+        return edge.requester == requester && edge.module == module &&
+               edge.candidate == candidate && edge.startup == startup && edge.probe == probe;
+      });
+    };
+    CHECK(has("Game.exe", "renderer.dll", "Renderer.dll", true, trt_import_probe::bundled),
+          "the executable records the selected game-supplied DLL");
+    CHECK(has("Renderer.dll", "d3d9.dll", "", true, trt_import_probe::runtime_resolution),
+          "an import records the requesting DLL and requires runtime resolution");
+    CHECK(has("Optional.dll", "vulkan-1.dll", "", false, trt_import_probe::runtime_resolution),
+          "imports through a delay-load edge stay optional and retain their requester");
+    CHECK(has("Game.exe", "wrong.dll", "Wrong.dll", true, trt_import_probe::wrong_architecture) &&
+              has("Game.exe", "incomplete.dll", "Incomplete.dll", true, trt_import_probe::invalid_image),
+          "the report distinguishes wrong architecture from an incomplete DLL");
+    CHECK(profile.preferred_gfx == TRT_GFX_D3D9 &&
+              !std::binary_search(profile.imported_modules.begin(), profile.imported_modules.end(),
+                                  std::string("d3d12.dll")),
+          "a wrong-architecture DLL cannot influence renderer selection");
+
+    trt_host_caps caps{};
+    caps.compositor = caps.d3d11_device = caps.audio_device = 1;
+    trt_preflight_report report;
+    trt_engine_launch_preflight(&profile, &caps, &report);
+    CHECK(std::any_of(report.notes.begin(), report.notes.end(), [](const std::string& note) {
+            return note.find("Game.exe -> Wrong.dll") != std::string::npos;
+          }), "preflight reports the requester and wrong-architecture candidate");
+    std::ifstream plan(root + "/.tiramisu/profile.json");
+    const std::string json((std::istreambuf_iterator<char>(plan)), {});
+    CHECK(json.find("\"dependencies\"") != std::string::npos &&
+              json.find("\"probe\":\"invalid_image\"") != std::string::npos &&
+              json.find("\"dependency_edges_omitted\": 0") != std::string::npos,
+          "preflight persists dependency evidence in the launch profile");
+  }
+
   printf("ALL ENGINE SYNTHESIZER CHECKS PASSED CLEANLY.\n");
   return 0;
 }

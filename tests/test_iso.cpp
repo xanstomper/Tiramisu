@@ -6,6 +6,7 @@
 // This is the "any .iso is bootable" evidence: a disc game's data files are
 // reachable through the guest's own path requests without extracting the
 // whole image.
+#include "../src/trt/images.h"
 #include "../src/trt/iso.h"
 #include "../src/trt/trt.h"
 
@@ -119,7 +120,7 @@ static size_t dir_record(unsigned char* dst, unsigned lba, unsigned len,
 // Build an ISO9660 image with a Joliet tree:
 //   /README.TXT           (plain iso root, 40 bytes)
 //   /DATA/LEVEL1.PAK      (joliet: Data/Level1.pak, 9000 bytes across sectors)
-static std::vector<unsigned char> build_iso9660() {
+static std::vector<unsigned char> build_iso9660(bool with_root_dll = false) {
   img m;
   const unsigned kBlocks = 64;
   m.b.assign(kBlocks * kSec, 0);
@@ -130,6 +131,7 @@ static std::vector<unsigned char> build_iso9660() {
   m.bytes(40ull * kSec, pak.data(), pak.size());
   const char* readme = "tiramisu iso9660 gate: hello from a disc image\n";
   m.bytes(30ull * kSec, readme, strlen(readme));
+  if (with_root_dll) m.bytes(31ull * kSec, "test-dll", 8);
 
   // --- PVD at LBA 16
   {
@@ -178,6 +180,7 @@ static std::vector<unsigned char> build_iso9660() {
     o += dir_record(d + o, 20, kSec, 1, "..", 0);
     o += dir_record(d + o, 30, 44, 0, "README.TXT;1", 0);
     o += dir_record(d + o, 22, kSec, 1, "DATA", 0);
+    if (with_root_dll) dir_record(d + o, 31, 8, 0, "SHARED.DLL;1", 0);
   }
   // --- plain ISO /DATA at LBA 22
   {
@@ -195,6 +198,7 @@ static std::vector<unsigned char> build_iso9660() {
     o += dir_record(d + o, 21, kSec, 1, "..", 1);
     o += dir_record(d + o, 30, 44, 0, "readme.txt", 1);
     o += dir_record(d + o, 23, kSec, 1, "Data", 1);
+    if (with_root_dll) dir_record(d + o, 31, 8, 0, "Shared.dll;1", 1);
   }
   // --- Joliet /Data at LBA 23
   {
@@ -618,11 +622,61 @@ static void test_guest_apis() {
   check(trt_vfs_is_image_utf16(wpath) == 0, "unmounting removes the drive");
 }
 
+static void test_image_root_dll() {
+  printf("STAGE 6 DLL resolution from a mounted image root\n");
+  char root[] = "/tmp/opencode/tiramisu-image-dll-XXXXXX";
+  if (!mkdtemp(root)) {
+    check(false, "fixture directory created");
+    return;
+  }
+  const std::string base = root;
+  const std::string image = base + "/test.iso";
+  const std::string cache = base + "/cache";
+  write_file(image.c_str(), build_iso9660(true));
+  trt_vfs_set_iso_cache_root(cache.c_str());
+  check(trt_vfs_mount_image("d:", image.c_str()) == 1, "image mounts");
+
+  char app_dir[1024] = {};
+  int is_dir = 0;
+  check(trt_vfs_image_materialize_utf8("D:\\Data", app_dir, sizeof(app_dir),
+                                       &is_dir) == 0 && is_dir,
+        "created the cache directory for a nested entry point");
+  trt_runtime_init(nullptr, app_dir);
+  char path[1024] = {};
+  check(trt_runtime_find_dll("Shared.dll", path, sizeof(path)) != 0,
+        "looking in the executable directory alone misses the DLL");
+  trt_runtime_set_content_image_drive('D');
+  check(trt_runtime_find_dll("Shared", path, sizeof(path)) == 0,
+        "the runtime resolves the root DLL and appends its default suffix");
+  FILE* file = fopen(path, "rb");
+  char bytes[8] = {};
+  check(file && fread(bytes, 1, sizeof(bytes), file) == sizeof(bytes) &&
+            !memcmp(bytes, "test-dll", sizeof(bytes)),
+        "the on-demand DLL has the original image bytes");
+  if (file) fclose(file);
+  const std::string adjacent = std::string(app_dir) + "/Shared.dll";
+  write_file(adjacent.c_str(), {'s','i','b','l','i','n','g'});
+  check(trt_runtime_find_dll("Shared.dll", path, sizeof(path)) == 0 &&
+            adjacent == path,
+        "a DLL next to the executable takes precedence over the root");
+  check(trt_runtime_find_dll("Absent.dll", path, sizeof(path)) != 0,
+        "an absent image DLL produces a miss");
+  check(trt_runtime_find_dll("D:\\Shared.dll", path, sizeof(path)) != 0,
+        "the root fallback leaves qualified paths to the normal resolver");
+  trt_runtime_init(nullptr, nullptr);
+  check(trt_runtime_find_dll("Shared.dll", path, sizeof(path)) != 0,
+        "a new runtime clears the image root");
+  trt_vfs_unmount_image("d:");
+  trt_vfs_set_iso_cache_root("");
+  const std::string clean = "rm -rf " + base;
+  if (system(clean.c_str()) != 0) check(false, "removed the fixture");
+}
+
 // Discovery: a game that keeps its disc in a subfolder, and a .cue sheet whose
 // FILE track is the mountable image, must both be found and mounted - the two
 // layouts where "the game files were not mounted" used to be the whole bug.
 static void test_image_discovery() {
-  printf("STAGE 6 image discovery (.cue, nested folders)\n");
+  printf("STAGE 7 image discovery (.cue, nested folders)\n");
   const char* root = "/tmp/opencode/tira-discover";
   const char* nested = "/tmp/opencode/tira-discover/game/disc";
   char cmd[512];
@@ -679,6 +733,7 @@ int main() {
   test_raw_2352();
   test_not_an_image();
   test_guest_apis();
+  test_image_root_dll();
   test_image_discovery();
   printf("%s (%d pass, %d fail)\n", g_fail ? "RESULT: FAIL" : "RESULT: ALL PASS",
          g_pass, g_fail);
