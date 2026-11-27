@@ -22,13 +22,13 @@ the title and device, using the gates below.
 2. Read the current title matrix, known issues, support roadmap, and
    [universal runtime work map](docs/universal-runtime-work-map.md). Verify
    assumptions against the current Play path and the latest device evidence.
-3. Reproduce the first failing stage in an authorized title. The 0.2.4.57
-   Series S replay reached 1,699 successful D3D11 Presents for Cuphead at
-   1920×1080 and read black frames. Sekiro reached native entry before the
+3. Reproduce the first failing stage in an authorized title. The 0.2.4.59
+   Series S replay reached 1,594 successful D3D11 Presents for Cuphead.
+   Readbacks and five screen captures remained black. Sekiro reached native entry before the
    dashboard became unreachable, with zero observed D3D11 device calls.
    Investigate the shared mechanisms behind those findings. Follow the user's
    current title and console test scope.
-   [Series S replay](docs/proof/xbox-series-s-2026-11-26-runtime-057.json)
+   [Series S replay](docs/proof/xbox-series-s-2026-11-27-runtime-059.json)
 4. Write a focused failing regression, implement the shared contract, run the
    relevant offline and UWP gates, and repeat through Play. Continue into the
    next confirmed blocker after a green build. Preserve a verified fallback
@@ -111,6 +111,42 @@ Use authentic metadata and approved components with verifiable provenance.
 Guest libraries and writes stay within the constrained guest environment.
 Keep credentials, private logs, and proprietary assets out of patches and public
 evidence. Record host-side diagnostics when private logs cannot be retrieved.
+
+## Implementation prompts
+
+### Prove the mount before changing the renderer
+
+Start with the install that normal Play actually selected. Identify the trusted
+launch executable, content root, working directory, arguments and writable
+root. Follow one asset from its source depot to its mounted path and through
+the guest file API. For an install with multiple depots, test a nested
+executable that needs a root DLL and a data directory beside the executable.
+Reconcile manifest sizes and available digests before publishing the install.
+Exercise missing, truncated and case-colliding assets, interrupted updates and
+save persistence. Record relative paths and outcomes in the local diagnosis.
+Publish aggregate results. Preserve the original executables and directory tree.
+
+### Resolve an API through actual execution
+
+Select the earliest required operation that fails after a verified mount.
+Trace the requesting image, ABI, imported or dynamically queried symbol, and
+observed failure. Compare the operation with the Windows contract and the
+applicable Wine conformance case. Exercise a minimal guest through the same
+provider selection as Play. Verify output data, errors, ownership and teardown.
+Require pinned provenance and license information before adding a provider.
+Test an unavailable required provider and an optional provider with a working
+fallback. Repeat on an independent game when its launch is authorized.
+[Wine tests and implementations](https://github.com/wine-mirror/wine/tree/master/dlls)
+[Proton component versions](https://github.com/ValveSoftware/Proton/blob/proton_10.0/.gitmodules)
+
+### Locate the first missing game pixels
+
+For a black frame, verify content availability, capture the renderer's first
+successful device creation and identify the active guest backbuffer after each
+resize. Follow sampled shader inputs, bound render targets, copies and resolves
+to the presented surface. Record texture dimensions, formats, sample counts
+and readback results. Compare game pixels before and after input with the TV
+capture. Advance the title matrix only when menu selection or gameplay responds.
 
 ## Verification and release gates
 
