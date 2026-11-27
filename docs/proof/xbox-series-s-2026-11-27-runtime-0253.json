@@ -1,0 +1,146 @@
+{
+  "console": "Xbox Series S",
+  "date": "2026-11-27",
+  "package_version": "0.2.5.3",
+  "package_type": "standard Xbox Dev Mode diagnostic build",
+  "source_commit": "200b32b7fc647a0ca2f6458ea7b650641749a63f",
+  "package_sha256": "01d4a181f48f608688899394eac85a64019b366eba3342683c96adb847ddb2c7",
+  "entry_point": "Play",
+  "gates": {
+    "offline": "passed with Celeste execution disabled",
+    "load_only_pe_corpus": {
+      "passed": 123,
+      "failed": 0,
+      "skipped": 0
+    },
+    "uwp_build": "passed",
+    "install": "passed"
+  },
+  "cuphead": {
+    "elapsed_ms": 105000,
+    "render": {
+      "d3d11_device_calls": 1,
+      "d3d11_swapchains": 1,
+      "d3d11_successful_presents": 4599,
+      "guest_lit_pixels": 0,
+      "host_lit_pixels": 0,
+      "surface_other_lit_pixels": 0,
+      "surface_bound_retired": 0,
+      "surface_bound_untagged": 32,
+      "coverage_samples": 32,
+      "shader_input_bc3_nontransparent_lit_peak": 256,
+      "fallback_calls": 0
+    },
+    "screen_captures": [
+      {
+        "phase": 30,
+        "lit_pixels": 0,
+        "total": 129600
+      },
+      {
+        "phase": 65,
+        "lit_pixels": 0,
+        "total": 129600
+      },
+      {
+        "phase": 105,
+        "lit_pixels": 0,
+        "total": 129600
+      },
+      {
+        "phase": "key-90",
+        "lit_pixels": 0,
+        "total": 129600
+      },
+      {
+        "phase": "key-13",
+        "lit_pixels": 0,
+        "total": 129600
+      },
+      {
+        "phase": "key-40",
+        "lit_pixels": 0,
+        "total": 129600
+      }
+    ],
+    "input": "paired dashboard keyboard Z, Enter and Down",
+    "visible_menu": false,
+    "visible_game_response": false
+  },
+  "sekiro": {
+    "first_replay": {
+      "last_active_sample": {
+        "elapsed_ms": 9000,
+        "observed_calls": 548,
+        "fallback_calls": 0,
+        "checkpoint": {
+          "available": true,
+          "phase": 4,
+          "outcome": 1,
+          "code": 0
+        },
+        "d3d11_device_calls": 0,
+        "d3d11_swapchains": 0,
+        "d3d11_successful_presents": 0,
+        "guest_lit_pixels": 0,
+        "host_lit_pixels": 0,
+        "surface_other_lit_pixels": 0,
+        "surface_bound_retired": 0,
+        "surface_bound_untagged": 0,
+        "coverage_samples": 0,
+        "shader_input_bc3_nontransparent_lit_peak": 0,
+        "guest_commit_mib": 555,
+        "guest_active": true
+      },
+      "last_api_observation": {
+        "ms_from_first_active": 4663,
+        "observed_calls": 549,
+        "fallback_calls": 0,
+        "recent": [
+          "WaitForSingleObject",
+          "WaitForSingleObject",
+          "WaitForSingleObject",
+          "WaitForSingleObject",
+          "WaitForSingleObject",
+          "WaitForSingleObject",
+          "SetEvent",
+          "WaitForSingleObject",
+          "SetEvent",
+          "WaitForSingleObject",
+          "SetEvent",
+          "WaitForSingleObject"
+        ]
+      },
+      "reopened_checkpoint": {
+        "available": true,
+        "phase": 4,
+        "outcome": 1,
+        "code": 0
+      },
+      "worker_fault": {
+        "available": false,
+        "phase": 0,
+        "code": 0
+      }
+    },
+    "independent_process_replay": {
+      "maximum_sampled_process_commit_mib": 815,
+      "maximum_sampled_guest_commit_mib": 556,
+      "guest_budget_mib": 4096,
+      "last_sample_with_process_ms": 21615,
+      "first_sample_without_process_ms": 21890,
+      "consecutive_absent_samples": 3,
+      "last_guest_sample": {
+        "ms": 1563,
+        "guest_mib": 556,
+        "budget_mib": 4096,
+        "d3d11_device_calls": 0,
+        "fallback_calls": 0,
+        "observed_calls": 508,
+        "phase": 4
+      },
+      "termination_code_available": false
+    },
+    "visible_menu": false
+  }
+}
