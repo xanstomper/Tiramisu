@@ -66,6 +66,7 @@ constexpr int k_get_count = 30;
 constexpr int k_mt_get_major = 33;
 constexpr int k_smp_get_time = 35, k_smp_set_time = 36;
 constexpr int k_smp_buf_count = 39, k_smp_add_buffer = 42;
+constexpr int k_smp_contiguous = 41, k_smp_copy = 46;
 constexpr int k_smp_remove_all = 44, k_smp_total_len = 45;
 // IMFMediaBuffer
 constexpr int k_buf_lock = 3, k_buf_unlock = 4;
@@ -227,9 +228,50 @@ void test_mfplat() {
       u32 total = 0;
       CHECK(slot<get_len_fn>(smp, k_smp_total_len)(smp, &total) == 0 && total == 128,
             "IMFSample::GetTotalLength sums the buffer lengths (128)");
+      using contiguous_fn = i32(TRT_GUEST_ABI*)(void*, void**);
+      using copy_fn = i32(TRT_GUEST_ABI*)(void*, void*);
+      auto contiguous = slot<contiguous_fn>(smp, k_smp_contiguous);
+      auto copy = slot<copy_fn>(smp, k_smp_copy);
+      void* combined = nullptr;
+      CHECK(contiguous(smp, &combined) == 0 && combined == buf,
+            "a single buffer is returned with a new reference");
+      slot<release_fn>(combined, k_release)(combined);
+      void* next = nullptr;
+      CHECK(p_buf(3, &next) == 0 && next, "allocate a second media buffer");
+      u8* bytes = nullptr;
+      CHECK(slot<lock_fn>(next, k_buf_lock)(next, &bytes, nullptr, nullptr) == 0 && bytes,
+            "lock the source buffer");
+      memcpy(bytes, "end", 3);
+      slot<unlock_fn>(next, k_buf_unlock)(next);
+      CHECK(slot<set_len_fn>(next, k_buf_set_cur)(next, 3) == 0 &&
+                slot<add_buf_fn>(smp, k_smp_add_buffer)(smp, next) == 0,
+            "append a second payload to the sample");
+      CHECK(copy(smp, next) == (i32)0xc00d36b1u,
+            "a short destination reports MF_E_BUFFERTOOSMALL");
+      slot<release_fn>(next, k_release)(next);
+      CHECK(contiguous(smp, &combined) == 0 && combined && combined != buf &&
+                slot<get_count_fn>(smp, k_smp_buf_count)(smp, &nbuf) == 0 && nbuf == 1,
+            "conversion replaces multiple buffers with one contiguous buffer");
+      bytes = nullptr;
+      CHECK(slot<lock_fn>(combined, k_buf_lock)(combined, &bytes, nullptr, &total) == 0 &&
+                total == 131 && bytes && !memcmp(bytes, "PCM!", 5) &&
+                !memcmp(bytes + 128, "end", 3),
+            "the contiguous buffer preserves both payloads in order");
+      slot<unlock_fn>(combined, k_buf_unlock)(combined);
+      slot<release_fn>(combined, k_release)(combined);
+      CHECK(p_buf(131, &next) == 0 && next && copy(smp, next) == 0,
+            "CopyToBuffer writes into a caller-owned buffer");
+      bytes = nullptr;
+      CHECK(slot<lock_fn>(next, k_buf_lock)(next, &bytes, nullptr, &total) == 0 &&
+                total == 131 && bytes && !memcmp(bytes + 128, "end", 3),
+            "CopyToBuffer reports the copied length and preserves payload bytes");
+      slot<unlock_fn>(next, k_buf_unlock)(next);
+      slot<release_fn>(next, k_release)(next);
       CHECK(slot<plain_fn>(smp, k_smp_remove_all)(smp) == 0 &&
                 slot<get_count_fn>(smp, k_smp_buf_count)(smp, &nbuf) == 0 && nbuf == 0,
             "IMFSample::RemoveAllBuffers drops the buffer");
+      CHECK(contiguous(smp, &combined) == (i32)0x8000ffffu && !combined,
+            "an empty sample has no contiguous buffer");
     }
     CHECK(slot<release_fn>(smp, k_release)(smp) == 0,
           "IMFSample::Release drops the last reference");

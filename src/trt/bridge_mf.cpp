@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <new>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +26,9 @@ constexpr i32 E_NOINTERFACE_ = (i32)0x80004002u;
 constexpr i32 E_POINTER_ = (i32)0x80004003u;
 constexpr i32 E_INVALIDARG_ = (i32)0x80070057u;
 constexpr i32 E_NOTIMPL_ = (i32)0x80004001u;
+constexpr i32 E_OUTOFMEMORY_ = (i32)0x8007000eu;
+constexpr i32 E_UNEXPECTED_ = (i32)0x8000ffffu;
+constexpr i32 MF_E_BUFFERTOOSMALL_ = (i32)0xc00d36b1u;
 constexpr i32 MF_E_ATTRIBUTENOTFOUND_ = (i32)0xC00D36E6u;
 constexpr i32 MF_E_INVALIDINDEX_ = (i32)0xC00D36E7u;
 constexpr i32 MF_E_NO_MORE_TYPES_ = (i32)0xC00D36B9u;
@@ -505,6 +509,9 @@ struct mf_buffer_obj {
   std::atomic<u32> ref{1};
   std::vector<u8> data;
   u32 cur_len = 0;
+  u32 charged_bytes = 0;
+
+  ~mf_buffer_obj() { trt_mem_budget_discharge_commit(charged_bytes); }
 };
 i32 TRT_GUEST_ABI mfb_QueryInterface(void* self, const u8* riid, void** out) {
   (void)riid;
@@ -557,6 +564,7 @@ const void* g_mfbuffer_vtbl[8] = {
     (const void*)&mfb_SetCurrentLength,
     (const void*)&mfb_GetMaxLength,
 };
+i32 TRT_GUEST_ABI mf_MFCreateMemoryBuffer(u32 max_len, void** out);
 
 // IMFSample slots 33..46
 i32 TRT_GUEST_ABI mfs_GetSampleFlags(void* s, u32* f) {
@@ -599,9 +607,6 @@ i32 TRT_GUEST_ABI mfs_GetBufferByIndex(void* s, u32 idx, void** out) {
   *out = o->sample_buffers[idx];
   return S_OK_;
 }
-i32 TRT_GUEST_ABI mfs_ConvertToContiguousBuffer(void* s, void** out) {
-  return mfs_GetBufferByIndex(s, 0, out);
-}
 i32 TRT_GUEST_ABI mfs_AddBuffer(void* s, void* buf) {
   if (!buf) return E_INVALIDARG_;
   auto* o = (mf_attr_obj*)s;
@@ -625,21 +630,98 @@ i32 TRT_GUEST_ABI mfs_RemoveAllBuffers(void* s) {
   o->sample_buffers.clear();
   return S_OK_;
 }
-i32 TRT_GUEST_ABI mfs_GetTotalLength(void* s, u32* len) {
-  if (!len) return E_POINTER_;
-  auto* o = (mf_attr_obj*)s;
-  std::lock_guard<std::mutex> lk(o->mu);
-  u32 total = 0;
+i32 sample_buffer_length(const mf_attr_obj& sample, u32* len) {
+  u64 total = 0;
   using getlen_fn = i32(TRT_GUEST_ABI*)(void*, u32*);
-  for (void* b : o->sample_buffers) {
+  for (void* b : sample.sample_buffers) {
     u32 cur = 0;
     const void** vt = *(const void***)b;
-    if (vt && vt[5] && ((getlen_fn)vt[5])(b, &cur) == 0) total += cur;
+    const i32 hr = reinterpret_cast<getlen_fn>(vt[5])(b, &cur);
+    if (hr < 0) return hr;
+    total += cur;
+    if (total > UINT32_MAX) return E_OUTOFMEMORY_;
   }
-  *len = total;
+  *len = static_cast<u32>(total);
   return S_OK_;
 }
-i32 TRT_GUEST_ABI mfs_CopyToBuffer(void*, void*) { return S_OK_; }
+
+i32 sample_copy_buffers(const mf_attr_obj& sample, void* dest, u32 total) {
+  using lock_fn = i32(TRT_GUEST_ABI*)(void*, u8**, u32*, u32*);
+  using unlock_fn = i32(TRT_GUEST_ABI*)(void*);
+  using setlen_fn = i32(TRT_GUEST_ABI*)(void*, u32);
+  const void** dest_vt = *(const void***)dest;
+  u8* dest_data = nullptr;
+  u32 capacity = 0;
+  i32 hr = reinterpret_cast<lock_fn>(dest_vt[3])(dest, &dest_data, &capacity, nullptr);
+  if (hr < 0) return hr;
+
+  u32 copied = 0;
+  if (capacity < total) hr = MF_E_BUFFERTOOSMALL_;
+  else if (total && !dest_data) hr = E_POINTER_;
+  for (void* src : sample.sample_buffers) {
+    if (hr < 0) break;
+    const void** src_vt = *(const void***)src;
+    u8* src_data = nullptr;
+    u32 length = 0;
+    hr = reinterpret_cast<lock_fn>(src_vt[3])(src, &src_data, nullptr, &length);
+    if (hr < 0) break;
+    if (length > capacity - copied) hr = MF_E_BUFFERTOOSMALL_;
+    else if (length && (!src_data || !dest_data)) hr = E_POINTER_;
+    else if (length) {
+      memmove(dest_data + copied, src_data, length);
+      copied += length;
+    }
+    const i32 unlocked = reinterpret_cast<unlock_fn>(src_vt[4])(src);
+    if (hr >= 0) hr = unlocked;
+  }
+  if (hr >= 0) hr = reinterpret_cast<setlen_fn>(dest_vt[6])(dest, copied);
+  const i32 unlocked = reinterpret_cast<unlock_fn>(dest_vt[4])(dest);
+  return hr < 0 ? hr : unlocked;
+}
+
+i32 TRT_GUEST_ABI mfs_GetTotalLength(void* s, u32* len) {
+  if (!len) return E_POINTER_;
+  auto* o = static_cast<mf_attr_obj*>(s);
+  std::lock_guard<std::mutex> lk(o->mu);
+  return sample_buffer_length(*o, len);
+}
+
+i32 TRT_GUEST_ABI mfs_CopyToBuffer(void* s, void* dest) {
+  if (!dest) return E_POINTER_;
+  auto* o = static_cast<mf_attr_obj*>(s);
+  std::lock_guard<std::mutex> lk(o->mu);
+  if (o->sample_buffers.size() == 1 && o->sample_buffers.front() == dest) return S_OK_;
+  u32 total = 0;
+  const i32 hr = sample_buffer_length(*o, &total);
+  return hr < 0 ? hr : sample_copy_buffers(*o, dest, total);
+}
+
+i32 TRT_GUEST_ABI mfs_ConvertToContiguousBuffer(void* s, void** out) {
+  if (!out) return E_POINTER_;
+  *out = nullptr;
+  auto* o = static_cast<mf_attr_obj*>(s);
+  std::lock_guard<std::mutex> lk(o->mu);
+  if (o->sample_buffers.empty()) return E_UNEXPECTED_;
+  if (o->sample_buffers.size() > 1) {
+    u32 total = 0;
+    i32 hr = sample_buffer_length(*o, &total);
+    if (hr < 0) return hr;
+    void* dest = nullptr;
+    hr = mf_MFCreateMemoryBuffer(total, &dest);
+    if (hr < 0) return hr;
+    hr = sample_copy_buffers(*o, dest, total);
+    if (hr < 0) {
+      mfb_Release(dest);
+      return hr;
+    }
+    for (void* src : o->sample_buffers) attr_release_unk(src);
+    o->sample_buffers.resize(1);
+    o->sample_buffers.front() = dest;
+  }
+  *out = o->sample_buffers.front();
+  attr_addref_unk(*out);
+  return S_OK_;
+}
 
 #define MF_ATTR_SLOTS \
     (const void*)&mfa_QueryInterface, \
@@ -975,9 +1057,21 @@ i32 TRT_GUEST_ABI mf_MFCreateMediaType(void** out) {
 }
 i32 TRT_GUEST_ABI mf_MFCreateMemoryBuffer(u32 max_len, void** out) {
   if (!out) return E_POINTER_;
-  auto* b = new mf_buffer_obj();
+  *out = nullptr;
+  auto* b = new (std::nothrow) mf_buffer_obj();
+  if (!b) return E_OUTOFMEMORY_;
+  if (trt_mem_budget_charge_commit(max_len) != 0) {
+    delete b;
+    return E_OUTOFMEMORY_;
+  }
+  b->charged_bytes = max_len;
   b->vtbl = g_mfbuffer_vtbl;
-  b->data.resize(max_len);
+  try {
+    b->data.resize(max_len);
+  } catch (const std::bad_alloc&) {
+    delete b;
+    return E_OUTOFMEMORY_;
+  }
   *out = b;
   return S_OK_;
 }
