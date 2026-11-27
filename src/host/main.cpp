@@ -1484,6 +1484,8 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   }
   trt_vfs_mount("c:", drive_c.c_str());
   trt_vfs_mount("z:", game_dir.c_str());
+  // Clear the prior launch's disc before resolving this title's dependencies.
+  trt_vfs_unmount_image("d:");
   checkpoint_phase(longan::launch_phase::mounted);
   // A game can ship its own defaults. The writable profile for this source
   // layers user overrides on top, including for read-only games and discs.
@@ -1537,8 +1539,9 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
                image.c_str());
       longan::log_line(iline);
     } else {
-      longan::log_line("trt: disc image mount FAILED (not an ISO9660/UDF "
-                       "image) - launching from the folder instead");
+      r.map_rc = TRT_ERR_BAD_ARGS;
+      snprintf(r.detail, sizeof(r.detail), "Could not mount the selected disc image");
+      return r;
     }
   }
   trt_bridge_set_exe_path(guest_exe.c_str());
@@ -1856,6 +1859,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   }
 
   trt_image* img = nullptr;
+  checkpoint_phase(longan::launch_phase::native_mapping);
   {
     std::ifstream f(exe_path, std::ios::binary | std::ios::ate);
     if (!f) {
@@ -1894,8 +1898,11 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     strncpy(r.detail, trt_errstr(r.map_rc), sizeof(r.detail) - 1);
     return r;
   }
-  if (trt_seal_image(&be, img) != TRT_OK) {
-    strncpy(r.detail, "seal failed", sizeof(r.detail) - 1);
+  checkpoint_phase(longan::launch_phase::native_sealing);
+  r.map_rc = trt_seal_image(&be, img);
+  if (r.map_rc != TRT_OK) {
+    snprintf(r.detail, sizeof(r.detail), "seal failed: %s", img->last_detail);
+    trt_unmap(&be, img);
     return r;
   }
   trt_images_register_main_with_path(img, effective_exe.c_str(), exe_path.c_str());

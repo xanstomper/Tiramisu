@@ -93,6 +93,8 @@ remains in LocalState.
 | 4 | Native entry point invoked |
 | 5 | x86 execution invoked |
 | 6 | Managed runtime invoked |
+| 7 | Reading and mapping the native executable |
+| 8 | Applying executable page protections |
 
 | Outcome | Meaning |
 |---|---|

@@ -620,6 +620,14 @@ static void test_guest_apis() {
 
   trt_vfs_unmount_image("d:");
   check(trt_vfs_is_image_utf16(wpath) == 0, "unmounting removes the drive");
+  check(trt_vfs_mount_image("e:", img) == 1, "second drive mounted");
+  for (int i = 0; i < 10; ++i) {
+    check(trt_vfs_mount_image("d:", img) == 1, "a freed drive slot can be reused");
+    trt_vfs_unmount_image("d:");
+  }
+  wpath[0] = 'E';
+  check(trt_vfs_is_image_utf16(wpath) == 1, "unmounting one drive preserves another mount");
+  trt_vfs_unmount_image("e:");
 }
 
 static void test_image_root_dll() {

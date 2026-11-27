@@ -208,7 +208,7 @@ static bool read_checkpoint(const std::string& local_state, const char* filename
     const bool exact = fgetc(file) == EOF && !ferror(file);
     fclose(file);
     if (!read || !exact || fields[0] != 0x31524354u ||
-        fields[1] > static_cast<uint32_t>(launch_phase::managed_runtime) ||
+        fields[1] > static_cast<uint32_t>(launch_phase::native_sealing) ||
         fields[2] > static_cast<uint32_t>(launch_outcome::host_exit)) return false;
     *report = {static_cast<launch_phase>(fields[1]),
                static_cast<launch_outcome>(fields[2]), fields[3]};

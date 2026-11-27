@@ -655,7 +655,9 @@ void trt_vfs_unmount_image(const char* drive_prefix) {
   vfs_image* im = image_find_locked(norm_p);
   if (im) {
     trt_iso_close(im->iso);
-    memset(im, 0, sizeof(*im));
+    vfs_image* last = &g_images[--g_image_count];
+    if (im != last) *im = *last;
+    *last = {};
   }
   vfs_unlock();
 }
