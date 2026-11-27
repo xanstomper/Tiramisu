@@ -2573,9 +2573,10 @@ void handle_client(sock_t s) {
     trt_sync_get_launch_stats(&sync);
     const auto draw = swapchain_guest_draw_probe();
     const auto shader_input = swapchain_guest_shader_input_probe();
-    char buf[2304];
+    char buf[3072];
     snprintf(buf, sizeof(buf),
-             "{\"d3d11_device_calls\":%u,\"d3d11_swapchains\":%u,"
+             "{\"d3d11_exclusive_requests\":%u,\"coverage_samples\":%u,"
+             "\"max_passing_samples\":%llu,\"coverage_result\":%d,\"d3d11_device_calls\":%u,\"d3d11_swapchains\":%u,"
              "\"d3d11_get_buffer_calls\":%u,\"d3d11_present_calls\":%u,"
              "\"d3d11_successful_presents\":%u,\"d3d11_last_present_result\":%d,"
              "\"d3d11_swap_effect\":%u,\"d3d11_buffer_count\":%u,\"d3d11_stable_backbuffer\":%u,"
@@ -2602,7 +2603,8 @@ void handle_client(sock_t s) {
              "\"sync_wait_completed\":%u,\"sync_wait_timeout\":%u,\"sync_wait_failed\":%u,"
              "\"sync_setevent_signaled\":%u,\"sync_setevent_failed\":%u,"
              "\"guest_commit_mib\":%llu,\"guest_commit_budget_mib\":%u}",
-             stats.d3d11_device_calls, stats.d3d11_swapchains, stats.d3d11_get_buffer_calls,
+             resize.exclusive_requests, draw.coverage_samples, draw.max_passing_samples,
+             draw.coverage_result, stats.d3d11_device_calls, stats.d3d11_swapchains, stats.d3d11_get_buffer_calls,
              stats.d3d11_present_calls, stats.d3d11_successful_presents,
              stats.d3d11_last_present_result, stats.d3d11_swap_effect,
              stats.d3d11_buffer_count, stats.d3d11_stable_backbuffer,

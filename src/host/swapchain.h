@@ -46,6 +46,9 @@ struct guest_draw_probe {
   unsigned other_surface_samples, other_lit_pixels;
   unsigned other_width, other_height, other_format;
   int other_surface_result;
+  unsigned coverage_samples;
+  unsigned long long max_passing_samples;
+  int coverage_result;
 };
 struct guest_shader_input_probe {
   unsigned snapshots, bound_views, samples, lit_pixels;

@@ -84,6 +84,7 @@ typedef struct trt_gpu_resize_stats {
   u32 buffer_calls, buffer_requested_width, buffer_requested_height;
   u32 buffer_client_width, buffer_client_height, buffer_present_count;
   int buffer_result;
+  u32 exclusive_requests;
 } trt_gpu_resize_stats;
 
 void trt_gpu_get_resize_stats(trt_gpu_resize_stats* stats);

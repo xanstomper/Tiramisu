@@ -629,8 +629,11 @@ int main(int argc, char** argv) {
       using fs_t = int (TRT_GUEST_ABI *)(void*, int, void*);
       using rb_t = int (TRT_GUEST_ABI *)(void*, u32, u32, u32, u32, u32);
       using pres_t = int (TRT_GUEST_ABI *)(void*, u32, u32);
-      CHECK(((fs_t)svt[10])(proxy_sc, 1, nullptr) == 0,
-            "IDXGISwapChain::SetFullscreenState(TRUE) -> S_OK on CoreWindow");
+      CHECK(((fs_t)svt[10])(proxy_sc, 1, nullptr) == static_cast<int>(0x887A0022u),
+            "exclusive fullscreen reports DXGI_ERROR_NOT_CURRENTLY_AVAILABLE");
+      CHECK(((fs_t)svt[10])(proxy_sc, 0, nullptr) == 0 &&
+                ((fs_t)svt[10])(proxy_sc, 0, adp) == static_cast<int>(0x887A0001u),
+            "returning to windowed mode requires a null target");
       CHECK(((rb_t)svt[13])(proxy_sc, 2, 1920, 1080, 87, 0) == 0,
             "IDXGISwapChain::ResizeBuffers handles fixed CoreWindow cleanly");
       CHECK(((pres_t)svt[8])(proxy_sc, 0, 0x200u) == 0 && g_presented == 2,

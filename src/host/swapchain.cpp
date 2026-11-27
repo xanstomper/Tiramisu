@@ -44,6 +44,11 @@ winrt::com_ptr<ID3D11RenderTargetView> g_rtv;
 winrt::com_ptr<ID3D11Texture2D> g_guest_backbuffer, g_guest_resolved;
 DXGI_FORMAT g_guest_resolve_format = DXGI_FORMAT_UNKNOWN;
 winrt::com_ptr<ID3D11Query> g_guest_draw_query;
+winrt::com_ptr<ID3D11Query> g_coverage_query;
+bool g_coverage_pending = false;
+std::atomic<unsigned> g_coverage_samples{0};
+std::atomic<unsigned long long> g_max_passing_samples{0};
+std::atomic<int> g_coverage_result{0};
 bool g_guest_draw_query_active = false;
 bool g_guest_draw_query_pending = false;
 std::atomic<unsigned> g_guest_draw_state{0}, g_guest_draw_samples{0};
@@ -463,9 +468,28 @@ void draw_guest_cursor() {
 
 void end_guest_draw_sample() {
   if (g_guest_draw_query_active) {
+    if (g_coverage_query) {
+      g_ctx->End(g_coverage_query.get());
+      g_coverage_pending = true;
+    }
     g_ctx->End(g_guest_draw_query.get());
     g_guest_draw_query_active = false;
     g_guest_draw_query_pending = true;
+  }
+  if (g_coverage_pending) {
+    UINT64 passing = 0;
+    const HRESULT hr = g_ctx->GetData(g_coverage_query.get(), &passing, sizeof(passing),
+                                      D3D11_ASYNC_GETDATA_DONOTFLUSH);
+    if (hr != S_FALSE) {
+      g_coverage_pending = false;
+      g_coverage_result.store(hr);
+      if (SUCCEEDED(hr)) {
+        g_max_passing_samples.store(std::max(g_max_passing_samples.load(), passing));
+        g_coverage_samples.fetch_add(1);
+      } else {
+        g_coverage_query = nullptr;
+      }
+    }
   }
   if (!g_guest_draw_query_pending) return;
 
@@ -495,7 +519,7 @@ void end_guest_draw_sample() {
 
 void begin_guest_draw_sample() {
   if (!g_guest_draw_samples_remaining || g_guest_draw_state.load() >= 3 ||
-      g_guest_draw_query_pending) return;
+      g_guest_draw_query_pending || g_coverage_pending) return;
   if (g_guest_draw_pause) {
     --g_guest_draw_pause;
     return;
@@ -511,6 +535,11 @@ void begin_guest_draw_sample() {
   }
   // Start after drawing the host cursor. Only guest work between presents
   // contributes to the next result. Query polling never flushes or waits.
+  if (!g_coverage_query && SUCCEEDED(g_coverage_result.load())) {
+    const D3D11_QUERY_DESC desc{D3D11_QUERY_OCCLUSION, 0};
+    g_coverage_result.store(g_device->CreateQuery(&desc, g_coverage_query.put()));
+  }
+  if (g_coverage_query) g_ctx->Begin(g_coverage_query.get());
   g_ctx->Begin(g_guest_draw_query.get());
   g_guest_draw_query_active = true;
   if (g_guest_draw_state.load() == 0) g_guest_draw_state.store(1);
@@ -827,6 +856,12 @@ void swapchain_reset_guest_draw_probe() {
   g_guest_cursor_present_ms.store(0);
   g_guest_cursor_visible.store(false);
   if (g_guest_draw_query_active && g_ctx) g_ctx->End(g_guest_draw_query.get());
+  if (g_guest_draw_query_active && g_ctx && g_coverage_query) g_ctx->End(g_coverage_query.get());
+  g_coverage_query = nullptr;
+  g_coverage_pending = false;
+  g_coverage_samples.store(0);
+  g_max_passing_samples.store(0);
+  g_coverage_result.store(0);
   g_guest_draw_query = nullptr;
   g_guest_draw_query_active = false;
   g_guest_draw_query_pending = false;
@@ -882,7 +917,8 @@ guest_draw_probe swapchain_guest_draw_probe() {
           g_guest_nonempty_draw_samples.load(), g_surface_guest_rtv.load(),
           g_surface_other_rtv.load(), g_other_surface_samples.load(), g_other_lit_pixels.load(),
           g_other_width.load(), g_other_height.load(), g_other_format.load(),
-          g_other_surface_result.load()};
+          g_other_surface_result.load(), g_coverage_samples.load(),
+          g_max_passing_samples.load(), g_coverage_result.load()};
 }
 
 

@@ -384,12 +384,13 @@ int TRT_GUEST_ABI fake_sc_GetBuffer(void* self, u32 buffer, const void* riid, vo
   return TRT_E_NOTIMPL;
 }
 int TRT_GUEST_ABI fake_sc_SetFullscreenState(void* self, int fullscreen, void* target) {
-  (void)self; (void)target;
-  char line[128];
-  snprintf(line, sizeof(line),
-           "trt: IDXGISwapChain::SetFullscreenState(%d) -> S_OK (CoreWindow)",
-           fullscreen);
-  trt_core_log(line);
+  (void)self;
+  if (!fullscreen && target) return static_cast<int>(0x887A0001u);
+  if (fullscreen) {
+    std::lock_guard<std::mutex> lock(g_resize_stats_mutex);
+    ++g_resize_stats.exclusive_requests;
+    return static_cast<int>(0x887A0022u);  // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
+  }
   return 0;
 }
 int TRT_GUEST_ABI fake_sc_GetFullscreenState(void* self, int* fullscreen, void** target) {
