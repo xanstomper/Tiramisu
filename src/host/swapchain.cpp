@@ -845,6 +845,7 @@ DXGI_FORMAT srv_format_for(DXGI_FORMAT f) {
 }
 
 struct d3d11_blit_pipe {
+  winrt::com_ptr<ID3DDeviceContextState> state;
   winrt::com_ptr<ID3D11VertexShader> vs;
   winrt::com_ptr<ID3D11PixelShader> ps;
   winrt::com_ptr<ID3D11SamplerState> samp;
@@ -858,11 +859,24 @@ struct d3d11_blit_pipe {
   bool ready = false;
   bool logged = false;
 } g_blit_pipe;
+bool g_blit_failed_logged = false;
 
 bool ensure_d3d11_blit_pipe() {
   if (g_blit_pipe.ready) return true;
   if (g_blit_pipe.init_attempted || !g_device) return false;
   g_blit_pipe.init_attempted = true;
+
+  const auto level = g_device->GetFeatureLevel();
+  const HRESULT state_hr = g_device->CreateDeviceContextState(
+      0, &level, 1, D3D11_SDK_VERSION, __uuidof(ID3D11Device),
+      nullptr, g_blit_pipe.state.put());
+  if (FAILED(state_hr)) {
+    char line[128];
+    snprintf(line, sizeof(line), "swapchain: blit context creation failed (0x%08lx)",
+             static_cast<unsigned long>(state_hr));
+    longan::log_line(line);
+    return false;
+  }
 
   static const char* k_blit_ps =
       "Texture2D srcTex : register(t0);\n"
@@ -929,7 +943,6 @@ bool blit_texture_to_backbuffer(ID3D11Texture2D* src, ID3D11Texture2D* dst) {
       g_blit_pipe.srv_copy_h = sd.Height;
       g_blit_pipe.srv_copy_fmt = sd.Format;
     }
-    g_ctx->CopyResource(g_blit_pipe.srv_copy.get(), src);
     sample_tex = g_blit_pipe.srv_copy.get();
   }
 
@@ -945,34 +958,11 @@ bool blit_texture_to_backbuffer(ID3D11Texture2D* src, ID3D11Texture2D* dst) {
   if (FAILED(g_device->CreateRenderTargetView(dst, nullptr, rtv.put())))
     return false;
 
-  // Save guest D3D11 pipeline state so presentation never mutates guest bindings.
-  ID3D11RenderTargetView* old_rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
-  ID3D11DepthStencilView* old_dsv = nullptr;
-  g_ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, old_rtvs, &old_dsv);
-  ID3D11BlendState* old_bs = nullptr;
-  float old_bf[4] = {};
-  UINT old_sm = 0xFFFFFFFFu;
-  g_ctx->OMGetBlendState(&old_bs, old_bf, &old_sm);
-  ID3D11DepthStencilState* old_dss = nullptr;
-  UINT old_sref = 0;
-  g_ctx->OMGetDepthStencilState(&old_dss, &old_sref);
-  ID3D11RasterizerState* old_rs = nullptr;
-  g_ctx->RSGetState(&old_rs);
-  UINT old_vp_cnt = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
-  D3D11_VIEWPORT old_vps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
-  g_ctx->RSGetViewports(&old_vp_cnt, old_vps);
-  ID3D11VertexShader* old_vs = nullptr;
-  ID3D11PixelShader* old_ps = nullptr;
-  g_ctx->VSGetShader(&old_vs, nullptr, nullptr);
-  g_ctx->PSGetShader(&old_ps, nullptr, nullptr);
-  ID3D11ShaderResourceView* old_srv0 = nullptr;
-  ID3D11SamplerState* old_samp0 = nullptr;
-  g_ctx->PSGetShaderResources(0, 1, &old_srv0);
-  g_ctx->PSGetSamplers(0, 1, &old_samp0);
-  ID3D11InputLayout* old_il = nullptr;
-  g_ctx->IAGetInputLayout(&old_il);
-  D3D11_PRIMITIVE_TOPOLOGY old_topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-  g_ctx->IAGetPrimitiveTopology(&old_topo);
+  // The immediate context also holds guest UAVs, predicates and shader class
+  // instances. Run the host draw with isolated state so those survive Present.
+  winrt::com_ptr<ID3DDeviceContextState> guest_state;
+  g_ctx->SwapDeviceContextState(g_blit_pipe.state.get(), guest_state.put());
+  if (sample_tex != src) g_ctx->CopyResource(sample_tex, src);
 
   // Execute fullscreen scaled / format-converting blit.
   ID3D11RenderTargetView* new_rtv = rtv.get();
@@ -993,31 +983,9 @@ bool blit_texture_to_backbuffer(ID3D11Texture2D* src, ID3D11Texture2D* dst) {
   g_ctx->PSSetSamplers(0, 1, &new_samp);
   g_ctx->Draw(3, 0);
 
-  // Unbind our SRV and restore guest state cleanly.
-  ID3D11ShaderResourceView* null_srv = nullptr;
-  g_ctx->PSSetShaderResources(0, 1, &null_srv);
-  g_ctx->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, old_rtvs, old_dsv);
-  g_ctx->OMSetBlendState(old_bs, old_bf, old_sm);
-  g_ctx->OMSetDepthStencilState(old_dss, old_sref);
-  g_ctx->RSSetState(old_rs);
-  if (old_vp_cnt > 0) g_ctx->RSSetViewports(old_vp_cnt, old_vps);
-  g_ctx->VSSetShader(old_vs, nullptr, 0);
-  g_ctx->PSSetShader(old_ps, nullptr, 0);
-  g_ctx->PSSetShaderResources(0, 1, &old_srv0);
-  g_ctx->PSSetSamplers(0, 1, &old_samp0);
-  g_ctx->IASetInputLayout(old_il);
-  g_ctx->IASetPrimitiveTopology(old_topo);
-
-  for (auto* r : old_rtvs) if (r) r->Release();
-  if (old_dsv) old_dsv->Release();
-  if (old_bs) old_bs->Release();
-  if (old_dss) old_dss->Release();
-  if (old_rs) old_rs->Release();
-  if (old_vs) old_vs->Release();
-  if (old_ps) old_ps->Release();
-  if (old_srv0) old_srv0->Release();
-  if (old_samp0) old_samp0->Release();
-  if (old_il) old_il->Release();
+  // Drop references to the swapchain buffer before preserving the blit state.
+  g_ctx->ClearState();
+  g_ctx->SwapDeviceContextState(guest_state.get(), nullptr);
 
   if (!g_blit_pipe.logged) {
     g_blit_pipe.logged = true;
@@ -1051,8 +1019,15 @@ void TRT_GUEST_ABI prepare_d3d11_present() {
           sd.SampleDesc.Count == dd.SampleDesc.Count &&
           formats_copy_compatible(sd.Format, dd.Format)) {
         g_ctx->CopyResource(back.get(), present_source);
-      } else if (!blit_texture_to_backbuffer(present_source, back.get())) {
-        g_ctx->CopyResource(back.get(), present_source);
+      } else if (!blit_texture_to_backbuffer(present_source, back.get()) &&
+                 !g_blit_failed_logged) {
+        g_blit_failed_logged = true;
+        char line[192];
+        snprintf(line, sizeof(line),
+                 "swapchain: could not convert guest target %ux%u fmt=%u to %ux%u fmt=%u",
+                 sd.Width, sd.Height, static_cast<unsigned>(sd.Format),
+                 dd.Width, dd.Height, static_cast<unsigned>(dd.Format));
+        longan::log_line(line);
       }
     }
     measure_surface_pair(present_source, back.get());
@@ -1165,6 +1140,7 @@ HRESULT create_d3d11_corewindow_swapchain() {
 } // namespace
 
 void swapchain_reset_guest_draw_probe() {
+  g_blit_failed_logged = false;
   g_guest_cursor_present_ms.store(0);
   g_guest_cursor_visible.store(false);
   if (g_guest_draw_query_active && g_ctx) g_ctx->End(g_guest_draw_query.get());
@@ -1545,6 +1521,7 @@ void* swapchain_dxgi() { return g_swap.get(); }
 void* swapchain_d3d() { return g_device.get(); }
 
 void swapchain_shutdown() {
+  g_blit_pipe = {};
   d3d9_rt::shutdown();
   gl_rt::shutdown();
   vk_rt::shutdown();
