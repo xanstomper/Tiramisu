@@ -39,6 +39,7 @@ void* trt_resolve_full(void* user, const char* module, const char* symbol,
 
 // ---- registry ----
 trt_image* trt_images_find(const char* name);      // case-insensitive
+trt_image* trt_images_find_path(const char* host_path);
 trt_image* trt_images_by_handle(void* handle);
 trt_image* trt_images_first(void);                  // the main guest image
                                                  // (the exe); falls back to
@@ -64,6 +65,8 @@ const char* trt_images_synth_name(void* handle);
 // trt_images_first() (GetModuleHandle(NULL), FindResource(NULL)) answers
 // with the exe rather than whichever image registered first.
 void trt_images_register_main(trt_image* img, const char* guest_name);
+void trt_images_register_main_with_path(trt_image* img, const char* guest_name,
+                                         const char* host_path);
 // Register an alias for an image (e.g. launcher name when redirected to shipping exe).
 void trt_images_register_alias(trt_image* img, const char* alias_name);
 

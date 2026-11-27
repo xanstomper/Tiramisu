@@ -147,6 +147,8 @@ void* fake_system_load(const char* module, const char* symbol) {
 // Linux test host, so the guest binds their addresses directly in the IAT
 // (on the console both sides are Win64 and this is the exact same path) ----
 extern "C" void* TRT_STDCALL trt_LoadLibraryW(const u16*);
+extern "C" void* TRT_STDCALL trt_GetModuleHandleW(const u16*);
+extern "C" int TRT_STDCALL trt_GetModuleHandleExW(u32, const u16*, void**);
 extern "C" void* TRT_STDCALL trt_GetProcAddress(void*, const char*);
 extern "C" void* TRT_STDCALL trt_GetProcessHeap(void);
 extern "C" u32 TRT_STDCALL trt_GetLastError(void);
@@ -282,6 +284,23 @@ int main(int argc, char** argv) {
           "qualified aliases of the same path reuse the mapped module");
     CHECK(trt_LoadLibraryW((const u16*)u"guestdll.dll") == original,
           "a bare DLL name still selects the first loaded module");
+    CHECK(trt_GetModuleHandleW(qualified) == alternate &&
+              trt_GetModuleHandleW((const u16*)u"Z:\\guestdll.dll") == original,
+          "path-qualified handle lookup selects the matching loaded module");
+    void* queried = nullptr;
+    CHECK(trt_GetModuleHandleExW(0, (const u16*)u"z:/SUB/guestdll", &queried) &&
+              queried == alternate,
+          "GetModuleHandleExW uses the same qualified identity");
+    CHECK(!trt_GetModuleHandleW((const u16*)u"Z:\\absent\\guestdll.dll") &&
+              trt_GetLastError() == 126,
+          "an absent qualified DLL query fails even when its basename is loaded");
+    CHECK(!trt_GetModuleHandleW((const u16*)u"Z:\\sub\\nested.dll") &&
+              trt_GetLastError() == 126 && !trt_images_find("nested.dll"),
+          "querying an existing unloaded DLL does not load it");
+    CHECK(trt_GetModuleHandleW((const u16*)u"c:/Windows/system32/kernel32") == kernel32 &&
+              !trt_GetModuleHandleW((const u16*)u"Z:\\sub\\kernel32.dll") &&
+              trt_GetLastError() == 126,
+          "qualified system handles are limited to the virtual system directory");
     if (alternate) {
       u16 actual[128] = {};
       const char16_t expected[] = u"Z:\\sub\\guestdll.dll";
@@ -311,6 +330,14 @@ int main(int argc, char** argv) {
           "a partial directory name does not shadow the root mount");
     CHECK(trt_vfs_host_to_guest("/games/example/sub/a.dll", path, 4) != 0,
           "short mounted-path buffer is rejected");
+
+    // Play registers the main image separately from the DLL loader.
+    trt_images_reset();
+    trt_images_register_main_with_path(img, "guest_libload.exe", argv[1]);
+    const void* main_handle = trt_images_handle(img);
+    CHECK(trt_GetModuleHandleW(nullptr) == main_handle &&
+              trt_GetModuleHandleW((const u16*)u"Z:\\bin\\guest_libload.exe") == main_handle,
+          "the main executable is discoverable by null or its mounted path");
   }
 
   printf("\nRESULT: %s\n", failures ? "FAILURES" : "ALL PASS");

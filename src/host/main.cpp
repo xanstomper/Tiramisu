@@ -2561,7 +2561,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     strncpy(r.detail, "seal failed", sizeof(r.detail) - 1);
     return r;
   }
-  trt_images_register_main(img, effective_exe.c_str());
+  trt_images_register_main_with_path(img, effective_exe.c_str(), exe_path.c_str());
   if (effective_exe != exe) {
     trt_images_register_alias(img, exe.c_str());
   }

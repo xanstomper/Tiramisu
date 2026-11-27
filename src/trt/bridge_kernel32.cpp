@@ -3031,6 +3031,10 @@ bool eq_ci(const char* a, const char* b) {
   return *a == 0 && *b == 0;
 }
 
+bool is_bare_module_name(const char* name) {
+  return !strpbrk(name, ":\\/");
+}
+
 bool can_use_system_module_for_path(const char* path) {
   if (!path[0]) return false;
   const char* name = module_path_without_device_prefix(path);
@@ -3100,9 +3104,7 @@ static void* load_library_impl(const u16* path, u32 flags) {
     }
     // If bare name (no path separators/drive) matches an already-loaded image
     // (including from SetDllDirectory / Plugins subdir), return that handle.
-    const bool bare = !strchr(utf8_in, ':') && !strchr(utf8_in, '\\') &&
-                      !strchr(utf8_in, '/');
-    if (bare) {
+    if (is_bare_module_name(utf8_in)) {
       if (trt_image* loaded = trt_images_find(b)) {
         return trt_images_handle(loaded);
       }
@@ -3229,26 +3231,34 @@ void* TRT_STDCALL trt_GetModuleHandleW(const u16* name) {
   gap_trace_record("GetModuleHandleW");
   void* h = nullptr;
   const char* st_base = "(null)";
-  char st_u8[256];
+  char st_u8[1024];
   if (!name || !name[0]) {
     trt_image* first = trt_images_first();
     h = first ? trt_images_handle(first) : nullptr;
-  } else if (trt_utf16_to_utf8(name, st_u8, sizeof(st_u8)) != 0) {
-    h = nullptr;
-  } else {
+  } else if (trt_utf16_to_utf8(name, st_u8, sizeof(st_u8)) == 0) {
     st_base = path_basename(st_u8);
-    trt_image* img = trt_images_find(st_base);
-    if (img) {
-      h = trt_images_handle(img);
+    trt_image* img = nullptr;
+    if (is_bare_module_name(st_u8)) {
+      img = trt_images_find(st_base);
     } else {
-      // STAGE 7 (OrTMM): the CRT boot asks for "kernel32.dll" (and apiset
-      // contract names) by handle before any file exists for them. A known
-      // SYSTEM/BUILTIN module name gets the synthetic handle — a NULL here
-      // failfasts the CRT before WinMain.
-      h = system_module_handle(st_base);
+      char host[1024];
+      // Check the mounted path first. Lookup can succeed even if the
+      // already mapped file is no longer present at that location.
+      if (trt_vfs_resolve_utf16(name, host, sizeof(host)) == 0)
+        img = trt_images_find_path(host);
+      if (!img && guest_path_to_host(name, host, sizeof(host)))
+        img = trt_images_find_path(host);
     }
+    if (img)
+      h = trt_images_handle(img);
+    else if (can_use_system_module_for_path(st_u8))
+      h = system_module_handle(st_u8);
   }
-  { char st_line[320]; if (h) snprintf(st_line, sizeof(st_line), "modtrace: GetModuleHandleW -> \"%s\" handle=%p", st_base, h); else snprintf(st_line, sizeof(st_line), "modtrace: GetModuleHandleW -> \"%s\" handle=NULL", st_base); trt_core_log(st_line); }
+  char line[320];
+  snprintf(line, sizeof(line), "modtrace: GetModuleHandleW -> \"%.252s\" handle=%p",
+           st_base, h);
+  trt_core_log(line);
+  if (!h) err_ref_for_current_thread() = 126;  // ERROR_MOD_NOT_FOUND
   return h;
 }
 

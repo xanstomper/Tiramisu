@@ -287,6 +287,15 @@ trt_image* trt_images_find(const char* name) {
   return nullptr;
 }
 
+trt_image* trt_images_find_path(const char* host_path) {
+  if (!host_path || !host_path[0]) return nullptr;
+  std::lock_guard<std::mutex> lock(g_img_mu);
+  for (int i = 0; i < g_image_count; ++i) {
+    if (path_ieq(g_images[i].path, host_path)) return g_images[i].img;
+  }
+  return nullptr;
+}
+
 trt_image* trt_images_by_handle(void* handle) {
   if (!handle) return nullptr;
   // STAGE 7: HMODULE == image base (guest code dereferences handles as a
@@ -324,6 +333,11 @@ trt_image* trt_images_first(void) {
 }
 
 void trt_images_register_main(trt_image* img, const char* guest_name) {
+  trt_images_register_main_with_path(img, guest_name, nullptr);
+}
+
+void trt_images_register_main_with_path(trt_image* img, const char* guest_name,
+                                         const char* host_path) {
   if (!img) return;
   std::lock_guard<std::mutex> lk(g_img_mu);
   if (g_image_count >= TRT_MAX_GUEST_IMAGES) return;
@@ -331,7 +345,9 @@ void trt_images_register_main(trt_image* img, const char* guest_name) {
   guest_image& g = g_images[g_image_count];
   memset(&g, 0, sizeof(g));
   snprintf(g.name, sizeof(g.name), "%s", base);
-  snprintf(g.path, sizeof(g.path), "<mapped>");
+  const char* registered_path =
+      host_path && host_path[0] && strlen(host_path) < sizeof(g.path) ? host_path : "<mapped>";
+  snprintf(g.path, sizeof(g.path), "%s", registered_path);
   g.img = img;
   g_main_image = img;
   // STAGE 7: HMODULE == image base on Windows (guest code dereferences it:
@@ -536,14 +552,8 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
     return nullptr;
   }
 
-  // A concrete file has already won resolution. Reuse that file's image
-  // across reentrant calls so its TLS and process attach run once.
-  {
-    std::lock_guard<std::mutex> lock(g_img_mu);
-    for (int i = 0; i < g_image_count; ++i) {
-      if (path_ieq(g_images[i].path, host_path)) return g_images[i].img;
-    }
-  }
+  // Reuse the resolved file's image so its TLS and process attach run once.
+  if (trt_image* loaded = trt_images_find_path(host_path)) return loaded;
   const char* req_base = base_name(guest_name ? guest_name : host_path);
   size_t size = 0;
   u8* file = read_whole_file(host_path, &size);
