@@ -46,6 +46,9 @@ extern "C" int trt_cs_size_for_guest(void);
 #include <sys/uio.h>
 #include <unistd.h>
 #endif
+#ifdef _WIN32
+#include <io.h>
+#endif
 #include "bridge_openal.h"
 #include "bridge_ole.h"
 #include "bridge_shell.h"
@@ -2187,6 +2190,46 @@ void trt_bridge_set_cwd(const char* guest_dir) {
   }
 }
 
+// Open an existing writable file before shortening it. The open handle keeps a
+// concurrent rename from redirecting the truncation to a replacement pathname.
+static FILE* truncate_existing_file(const u16* name, const char* host, u32* error) {
+  char visible[1024];
+  int directory = 0;
+  if (trt_vfs_resolve_utf16_rw(name, 0, visible, sizeof(visible)) != 0 ||
+      trt_vfs_stat(visible, &directory, nullptr) != 0) {
+    *error = 2;  // ERROR_FILE_NOT_FOUND
+    return nullptr;
+  }
+  if (directory) {
+    *error = 5;  // ERROR_ACCESS_DENIED
+    return nullptr;
+  }
+  if (strcmp(visible, host) != 0) {
+    // The base file exists only in the read-only install. Its truncated
+    // contents are empty, so materialize just that result in the overlay.
+    trt_vfs_ensure_parents(host);
+    if (FILE* created = fopen(host, "w+bx")) return created;
+    if (errno != EEXIST) {
+      *error = errno == ENOSPC ? 112 : 5;
+      return nullptr;
+    }
+  }
+  FILE* file = fopen(host, "r+b");
+  if (!file) {
+    *error = errno == ENOENT ? 2 : 5;
+    return nullptr;
+  }
+#ifdef _WIN32
+  const int result = _chsize_s(_fileno(file), 0);
+#else
+  const int result = ftruncate(fileno(file), 0) == 0 ? 0 : errno;
+#endif
+  if (result == 0) return file;
+  fclose(file);
+  *error = result == ENOSPC ? 112 : 5;
+  return nullptr;
+}
+
 void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
                                   void* sa, u32 disposition, u32 flags,
                                   void* tmpl) {
@@ -2200,6 +2243,10 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
   // disposition: 1 CREATE_NEW, 2 CREATE_ALWAYS, 3 OPEN_EXISTING,
   // 4 OPEN_ALWAYS, 5 TRUNCATE_EXISTING
   const u32 disp = disposition ? disposition : 3;
+  if (disp == 5 && !(access & (0x40000000u | 0x10000000u | 0x00000002u))) {
+    err_ref_for_current_thread() = 5;  // Truncation requires FILE_WRITE_DATA.
+    return (void*)(uintptr_t)-1;
+  }
   const int for_write = (write || disp == 1 || disp == 2 || disp == 4 || disp == 5) ? 1 : 0;
   char host[1024];
   // A disc image is read-only, exactly like the disc it came from: a write
@@ -2287,10 +2334,10 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
       return (void*)(uintptr_t)-1;
     }
   }
-  if (for_write) {
+  if (for_write && disp != 5) {
     trt_vfs_ensure_parents(host);
     // Copy-on-write when opening an existing Z: file for modification
-    if ((disp == 3 || disp == 4 || disp == 5) &&
+    if ((disp == 3 || disp == 4) &&
         trt_vfs_stat(host, nullptr, nullptr) != 0) {
       char ro[1024];
       int is_dir = 0;
@@ -2325,7 +2372,12 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
     os = fopen(host, "r+b");
     if (!os) os = fopen(host, "w+b");
   } else if (disp == 5) {
-    os = fopen(host, "w+b");
+    u32 error = 0;
+    os = truncate_existing_file(name, host, &error);
+    if (!os) {
+      err_ref_for_current_thread() = error;
+      return (void*)(uintptr_t)-1;
+    }
   } else {
     os = fopen(host, write ? "r+b" : "rb");
   }
@@ -2338,7 +2390,7 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
     // once and retry, exactly like a fresh Windows install dir.
     trt_vfs_ensure_parents(host);
     os = fopen(host, "r+b");
-    if (!os && (disp == 2 || disp == 5)) os = fopen(host, "w+b");
+    if (!os && disp == 2) os = fopen(host, "w+b");
   }
   if (!os) {
     const int open_errno = errno;
