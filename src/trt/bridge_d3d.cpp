@@ -326,10 +326,8 @@ int TRT_GUEST_ABI fake_sc_GetPrivateData(void* self, const void* name, u32* sz, 
   using fn_t = int (TRT_GUEST_ABI *)(void*, const void*, u32*, void*);
   return ((fn_t)slot)(sc, name, sz, data);
 }
-int TRT_GUEST_ABI fake_sc_GetParent(void* self, const void* riid, void** parent) {
-  (void)self; (void)riid; (void)parent;
-  return TRT_E_NOTIMPL;
-}
+// Both a virtual swap chain and a virtual adapter belong to the guest factory.
+int TRT_GUEST_ABI get_factory_parent(void*, const void* riid, void** parent);
 int TRT_GUEST_ABI fake_sc_GetDevice(void* self, const void* riid, void** dev) {
   (void)self;
   void* sc = active_sc();
@@ -696,7 +694,7 @@ const void* g_swapchain_proxy_vtbl[41] = {
     (const void*)&fake_sc_SetPrivateData,           // 3
     (const void*)&fake_sc_SetPrivateDataInterface,  // 4
     (const void*)&fake_sc_GetPrivateData,           // 5
-    (const void*)&fake_sc_GetParent,                // 6
+    (const void*)&get_factory_parent,                // 6
     (const void*)&fake_sc_GetDevice,                // 7
     (const void*)&fake_sc_Present,                  // 8
     (const void*)&fake_sc_GetBuffer,                // 9
@@ -776,10 +774,6 @@ u32 TRT_GUEST_ABI adp_release(void* self) {
 int TRT_GUEST_ABI adp_priv(void*, const void*, u32, const void*) { return TRT_E_NOTIMPL; }
 int TRT_GUEST_ABI adp_priv_iface(void*, const void*, void*) { return TRT_E_NOTIMPL; }
 int TRT_GUEST_ABI adp_get_priv(void*, const void*, u32*, void*) { return TRT_E_NOTIMPL; }
-int TRT_GUEST_ABI adp_get_parent(void*, const void*, void** p) {
-  if (p) *p = nullptr;
-  return TRT_E_NOTIMPL;
-}
 struct offline_output {
   const void** vtbl;
   u32 refcount;
@@ -840,11 +834,9 @@ int TRT_GUEST_ABI out_qi(void* self, const void* riid, void** ppv) {
 extern offline_output g_offline_output_obj;
 extern offline_adapter g_offline_adapter_obj;
 
-int TRT_GUEST_ABI out_get_parent(void*, const void*, void** pp) {
-  if (!pp) return TRT_E_INVALIDARG;
-  *pp = &g_offline_adapter_obj;
-  adp_addref(&g_offline_adapter_obj);
-  return 0;
+int TRT_GUEST_ABI out_get_parent(void*, const void* riid, void** parent) {
+  if (!parent) return TRT_E_INVALIDARG;
+  return adp_qi(&g_offline_adapter_obj, riid, parent);
 }
 
 static void out_active_dims(u32* w, u32* h) {
@@ -1127,7 +1119,7 @@ const void* g_offline_adapter_vtbl[19] = {
     (const void*)&adp_priv,        // 3
     (const void*)&adp_priv_iface,  // 4
     (const void*)&adp_get_priv,    // 5
-    (const void*)&adp_get_parent,  // 6
+    (const void*)&get_factory_parent,  // 6
     (const void*)&adp_enum_outputs,// 7
     (const void*)&adp_get_desc,    // 8
     (const void*)&adp_check_iface, // 9
@@ -1151,17 +1143,12 @@ struct fake_factory {
   u32 refcount;
 };
 
-const void** g_real_factory_vtbl = nullptr;  // the console's real factory
-
-// forward a call to the console's real factory (same slot, same args)
+// GetParent can return the proxy before the guest calls CreateDXGIFactory.
 void* g_real_vtbl_slot(int index) {
-  if (index >= 25) {
-    if (!g_hooks.factory6) return nullptr;
-    const void** vt6 = *(const void***)g_hooks.factory6;
-    return vt6 ? (void*)vt6[index] : nullptr;
-  }
-  if (!g_real_factory_vtbl) return nullptr;
-  return (void*)g_real_factory_vtbl[index];
+  void* factory = index >= 25 ? g_hooks.factory6 : g_hooks.factory;
+  if (!factory) return nullptr;
+  const auto vtable = *static_cast<const void***>(factory);
+  return vtable ? const_cast<void*>(vtable[index]) : nullptr;
 }
 
 bool is_factory_iid(const void* riid) {
@@ -1203,7 +1190,11 @@ u32 TRT_GUEST_ABI fake_Release(void* self) {
 int TRT_GUEST_ABI fake_SetPrivateData(void*, const void*, u32, const void*) { return TRT_E_NOTIMPL; }
 int TRT_GUEST_ABI fake_SetPrivateDataInterface(void*, const void*, void*) { return TRT_E_NOTIMPL; }
 int TRT_GUEST_ABI fake_GetPrivateData(void*, const void*, void*, u32*) { return TRT_E_NOTIMPL; }
-int TRT_GUEST_ABI fake_GetParent(void*, void**) { return TRT_E_NOTIMPL; }
+int TRT_GUEST_ABI fake_GetParent(void*, const void*, void** parent) {
+  if (!parent) return TRT_E_INVALIDARG;
+  *parent = nullptr;
+  return TRT_E_NOINTERFACE;
+}
 
 int create_swapchain_impl(void* device, u32 w, u32 h, u32 fmt, u32 count,
                           u32 swap_effect, void** swapchain, void* hwnd,
@@ -1449,6 +1440,15 @@ static_assert(sizeof(g_offline_adapter_vtbl) / sizeof(g_offline_adapter_vtbl[0])
 
 fake_factory g_factory_obj = {g_factory_vtbl, 1};
 
+int TRT_GUEST_ABI get_factory_parent(void*, const void* riid, void** parent) {
+  if (!parent) return TRT_E_INVALIDARG;
+  if (!riid) {
+    *parent = nullptr;
+    return TRT_E_INVALIDARG;
+  }
+  return fake_QueryInterface(&g_factory_obj, riid, parent);
+}
+
 } // namespace
 
 extern "C" {
@@ -1528,15 +1528,7 @@ extern "C" int TRT_GUEST_ABI trt_D3D11CreateDeviceAndSwapChain(void* adapter, u3
 // through the out parameter - returning the pointer itself is a classic
 // mistake and the guest reads it as a failing HRESULT.
 extern "C" int TRT_GUEST_ABI trt_CreateDXGIFactory(void* riid, void** out_factory) {
-  (void)riid;
-  if (!out_factory) return TRT_E_NOINTERFACE;
-  // the real factory's vtable is needed to forward adapter enumeration
-  if (g_hooks.factory) {
-    void** vt = (void**)g_hooks.factory;
-    g_real_factory_vtbl = (const void**)vt[0];
-  }
-  *out_factory = (void*)&g_factory_obj;
-  return 0;  // S_OK
+  return fake_QueryInterface(&g_factory_obj, riid, out_factory);
 }
 
 extern "C" int TRT_GUEST_ABI trt_CreateDXGIFactory1(void* riid, void** out_factory) {

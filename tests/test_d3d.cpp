@@ -616,6 +616,27 @@ int main(int argc, char** argv) {
           "IDXGIFactory::CreateSwapChain (4-arg) yields proxy swapchain");
     if (proxy_sc) {
       const void** svt = *(const void***)proxy_sc;
+      using parent_fn = int (TRT_GUEST_ABI *)(void*, const void*, void**);
+      using ref_fn = u32 (TRT_GUEST_ABI *)(void*);
+      struct Guid { u32 data1; u16 data2, data3; u8 data4[8]; };
+      const Guid factory_iid{0x7b7166ec, 0x21c7, 0x44ae, {0xb2,0x1a,0xc9,0xae,0x32,0x1a,0xe3,0x69}};
+      const Guid adapter_iid{0x2411e7e1, 0x12ac, 0x4ccf, {0xbd,0x14,0x97,0x98,0xe8,0x53,0x4d,0xc0}};
+      const Guid unknown{};
+      constexpr int no_interface = static_cast<int>(0x80004002u);
+      void* parent = nullptr;
+      const u32 baseline = ((ref_fn)fvt[1])(dxgi_fac);
+      ((ref_fn)fvt[2])(dxgi_fac);
+      CHECK(((parent_fn)svt[6])(proxy_sc, &factory_iid, &parent) == 0 && parent == dxgi_fac,
+            "swap chain exposes the same guest factory that created it");
+      if (parent == dxgi_fac) {
+        CHECK(((ref_fn)fvt[2])(parent) + 1 == baseline, "parent query owns one factory reference");
+      }
+      parent = proxy_sc;
+      CHECK(((parent_fn)svt[6])(proxy_sc, &unknown, &parent) == no_interface && !parent,
+            "swap chain clears the parent for an unsupported interface");
+      parent = proxy_sc;
+      CHECK(((parent_fn)fvt[6])(dxgi_fac, &factory_iid, &parent) == no_interface && !parent,
+            "root DXGI factory has no parent");
       struct { u32 fields[5]; u32 guard[2]; } fullscreen{
           {9, 9, 9, 9, 9}, {0xababababu, 0xcdcdcdcdu}};
       using fullscreen_desc_t = int (TRT_GUEST_ABI *)(void*, void*);
@@ -660,6 +681,20 @@ int main(int argc, char** argv) {
             "the CoreWindow fallback supplies a virtual output");
       if (output) {
         const auto* ovt = *static_cast<const void***>(output);
+        parent = output;
+        CHECK(((parent_fn)ovt[6])(output, &factory_iid, &parent) == no_interface && !parent,
+              "output rejects a factory IID when its parent is an adapter");
+        void* adapter = nullptr;
+        CHECK(((parent_fn)ovt[6])(output, &adapter_iid, &adapter) == 0 && adapter,
+              "output returns its adapter for the adapter IID");
+        if (adapter) {
+          const auto* adapter_vt = *static_cast<const void***>(adapter);
+          parent = nullptr;
+          CHECK(((parent_fn)adapter_vt[6])(adapter, &factory_iid, &parent) == 0 && parent == dxgi_fac,
+                "output to adapter to factory preserves guest factory identity");
+          if (parent == dxgi_fac) ((ref_fn)fvt[2])(parent);
+          ((ref_fn)adapter_vt[2])(adapter);
+        }
         using modes_fn = int (TRT_GUEST_ABI *)(void*, u32, u32, u32*, void*);
         using closest_fn = int (TRT_GUEST_ABI *)(void*, const void*, void*, void*);
         u32 modes[2][7]{};

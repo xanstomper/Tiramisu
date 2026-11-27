@@ -569,7 +569,8 @@ void begin_guest_draw_sample() {
 }
 
 HRESULT enqueue_surface_sample(surface_sample& sample, ID3D11Texture2D* source,
-                               DXGI_FORMAT view_format = DXGI_FORMAT_UNKNOWN) {
+                               DXGI_FORMAT view_format = DXGI_FORMAT_UNKNOWN,
+                               unsigned mip = 0, unsigned slice = 0) {
   D3D11_TEXTURE2D_DESC desc{};
   source->GetDesc(&desc);
   const bool typeless = desc.Format == DXGI_FORMAT_BC3_TYPELESS ||
@@ -589,8 +590,11 @@ HRESULT enqueue_surface_sample(surface_sample& sample, ID3D11Texture2D* source,
     default: return E_NOTIMPL;
   }
   if (desc.SampleDesc.Count != 1 || !desc.Width || !desc.Height) return E_NOTIMPL;
-
-  if (desc.Width % unit || desc.Height % unit) return E_NOTIMPL;
+  if (mip >= desc.MipLevels || mip >= 32 || slice >= desc.ArraySize) return E_INVALIDARG;
+  const unsigned width = std::max(1u, desc.Width >> mip);
+  const unsigned height = std::max(1u, desc.Height >> mip);
+  if (width % unit || height % unit) return E_NOTIMPL;
+  const unsigned subresource = D3D11CalcSubresource(mip, slice, desc.MipLevels);
   if (!sample.texture || sample.format != format) {
     D3D11_TEXTURE2D_DESC staging{};
     staging.Width = staging.Height = kGuestProbeGrid * unit;
@@ -609,12 +613,12 @@ HRESULT enqueue_surface_sample(surface_sample& sample, ID3D11Texture2D* source,
   // Each region holds one pixel or one native compressed block.
   for (unsigned y = 0; y < kGuestProbeGrid; ++y) {
     for (unsigned x = 0; x < kGuestProbeGrid; ++x) {
-      const unsigned px = (2 * x + 1) * desc.Width / (2 * kGuestProbeGrid);
-      const unsigned py = (2 * y + 1) * desc.Height / (2 * kGuestProbeGrid);
+      const unsigned px = (2 * x + 1) * width / (2 * kGuestProbeGrid);
+      const unsigned py = (2 * y + 1) * height / (2 * kGuestProbeGrid);
       const unsigned left = px / unit * unit, top = py / unit * unit;
       const D3D11_BOX region{left, top, 0, left + unit, top + unit, 1};
       g_ctx->CopySubresourceRegion(sample.texture.get(), 0, x * unit, y * unit, 0,
-                                   source, 0, &region);
+                                   source, subresource, &region);
     }
   }
   sample.pending = true;
@@ -668,9 +672,19 @@ void sample_other_render_target(ID3D11RenderTargetView* view, ID3D11Resource* re
   D3D11_RENDER_TARGET_VIEW_DESC view_desc{};
   view->GetDesc(&view_desc);
   hr = E_NOTIMPL;
-  if (view_desc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D &&
-      view_desc.Texture2D.MipSlice == 0) {
-    hr = enqueue_surface_sample(g_other_surface_probe, texture.get(), view_desc.Format);
+  switch (view_desc.ViewDimension) {
+    case D3D11_RTV_DIMENSION_TEXTURE2D:
+      hr = enqueue_surface_sample(g_other_surface_probe, texture.get(), view_desc.Format,
+                                  view_desc.Texture2D.MipSlice);
+      break;
+    case D3D11_RTV_DIMENSION_TEXTURE2DARRAY:
+      // The probe samples the first slice exposed by a layered view.
+      hr = enqueue_surface_sample(g_other_surface_probe, texture.get(), view_desc.Format,
+                                  view_desc.Texture2DArray.MipSlice,
+                                  view_desc.Texture2DArray.FirstArraySlice);
+      break;
+    default:
+      break;
   }
   g_other_surface_result.store(hr);
 }
@@ -699,13 +713,13 @@ void sample_guest_shader_input() {
     texture->GetDesc(&desc);
     views[slot].width = desc.Width;
     views[slot].height = desc.Height;
-    if (chosen || srv.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D ||
-        srv.Texture2D.MostDetailedMip != 0) continue;
+    if (chosen || srv.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D) continue;
     g_shader_input_slot.store(slot);
     g_shader_input_width.store(desc.Width);
     g_shader_input_height.store(desc.Height);
     g_shader_input_format.store(srv.Format);
-    const HRESULT hr = enqueue_surface_sample(g_shader_input_surface, texture.get(), srv.Format);
+    const HRESULT hr = enqueue_surface_sample(g_shader_input_surface, texture.get(), srv.Format,
+                                               srv.Texture2D.MostDetailedMip);
     g_shader_input_result.store(hr);
     chosen = SUCCEEDED(hr);
   }
