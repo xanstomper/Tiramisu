@@ -213,6 +213,17 @@ bool ends_with_ci(const std::string& s, const std::string& suffix) {
   return lower_str(s.substr(s.size() - suffix.size())) == lower_str(suffix);
 }
 
+const char* import_probe_name(trt_import_probe probe) {
+  switch (probe) {
+    case trt_import_probe::runtime_resolution: return "runtime_resolution";
+    case trt_import_probe::bundled: return "bundled";
+    case trt_import_probe::invalid_image: return "invalid_image";
+    case trt_import_probe::wrong_architecture: return "wrong_architecture";
+    case trt_import_probe::scan_limit: return "scan_limit";
+  }
+  return "unknown";
+}
+
 // One profile.json writer: the synthesizer calls it once, the launch preflight
 // calls it again with the verdict attached, so the file the user reads always
 // matches the profile the launch used.
@@ -262,6 +273,21 @@ bool write_profile_json(const std::string& base_dir,
       fprintf(pf, "%s\"%s\"", i ? ", " : "", json_escape(p->startup_modules[i]).c_str());
     }
     fprintf(pf, "],\n");
+  }
+  if (p->import_roles_scanned) {
+    fprintf(pf, "  \"dependencies\": [");
+    bool first = true;
+    for (const auto& dependency : p->dependencies) {
+      fprintf(pf, "%s\n    {\"requester\":\"%s\",\"module\":\"%s\","
+                  "\"candidate\":\"%s\",\"startup\":%s,\"probe\":\"%s\"}",
+              first ? "" : ",", json_escape(dependency.requester).c_str(),
+              json_escape(dependency.module).c_str(),
+              json_escape(dependency.candidate).c_str(),
+              dependency.startup ? "true" : "false", import_probe_name(dependency.probe));
+      first = false;
+    }
+    fprintf(pf, "%s],\n  \"dependency_edges_omitted\": %zu,\n",
+            first ? "" : "\n  ", p->dependency_edges_omitted);
   }
   fprintf(pf, "  \"graphics_from_delay_imports\": %s,\n",
           p->graphics_from_delay_imports ? "true" : "false");
@@ -706,6 +732,8 @@ std::string parent_directory(const std::string& path) {
 
 struct launch_imports {
   std::vector<std::string> all, startup;
+  std::vector<trt_import_dependency> dependencies;
+  size_t edges_omitted = 0;
 };
 
 launch_imports collect_launch_imports(const std::string& game_dir,
@@ -722,52 +750,77 @@ launch_imports collect_launch_imports(const std::string& game_dir,
     if (!added && file < *existing->second) existing->second = &file;
   }
 
-  std::unordered_set<std::string> modules, startup_modules, visited_files;
+  launch_imports result;
+  std::unordered_set<std::string> modules, startup_modules;
+  std::unordered_map<std::string, trt_import_probe> scanned_files;
   using pending_imports = std::pair<std::vector<std::string>, std::string>;
   std::deque<pending_imports> startup, deferred;
-  const auto enqueue = [&](pe_scan image, const std::string& directory, bool required) {
+  const auto enqueue = [&](pe_scan image, const std::string& requester, bool required) {
     if (!required) {
-      deferred.emplace_back(std::move(image.modules), directory);
+      deferred.emplace_back(std::move(image.modules), requester);
       return;
     }
     std::vector<std::string> delay;
     std::set_difference(image.modules.begin(), image.modules.end(),
                         image.startup_modules.begin(), image.startup_modules.end(),
                         std::back_inserter(delay));
-    if (!delay.empty()) deferred.emplace_back(std::move(delay), directory);
-    startup.emplace_back(std::move(image.startup_modules), directory);
+    if (!delay.empty()) deferred.emplace_back(std::move(delay), requester);
+    startup.emplace_back(std::move(image.startup_modules), requester);
   };
-  enqueue(main, exe_dir, true);
+  enqueue(main, executable, true);
   size_t remaining = 64;
+  constexpr size_t kMaxReportedEdges = 256;
   // Exhaust the ordinary import graph first. Every edge from a delayed DLL
   // is optional, even if the child import is ordinary within that DLL.
   while (!startup.empty() || !deferred.empty()) {
     const bool required = !startup.empty();
     auto& queue = required ? startup : deferred;
-    auto [imports, importer_dir] = std::move(queue.front());
+    auto [imports, requester] = std::move(queue.front());
     queue.pop_front();
+    const auto importer_dir = lower_str(parent_directory(requester));
     for (const auto& module : imports) {
       modules.insert(module);
       if (required) startup_modules.insert(module);
-      if (!remaining || module.find_first_of("/\\:") != std::string::npos ||
-          module == "steam_api.dll" || module == "steam_api64.dll") continue;
-      auto candidate = dll_paths.find(path_join(importer_dir, module));
-      if (candidate == dll_paths.end()) candidate = dll_paths.find(path_join(exe_dir, module));
-      if (candidate == dll_paths.end()) candidate = dll_paths.find(module);
-      if (candidate == dll_paths.end()) continue;
 
-      const auto& relative = *candidate->second;
-      if (!visited_files.insert(relative).second) continue;
-      --remaining;
-      pe_scan dependency;
-      if (scan_pe_file(path_join(game_dir, relative), &dependency) &&
-          dependency.machine == main.machine && dependency.is_pe32 == main.is_pe32) {
-        enqueue(std::move(dependency), lower_str(parent_directory(relative)), required);
+      trt_import_dependency edge{requester, module, {}, required,
+                                  trt_import_probe::runtime_resolution};
+      // These names require the actual loader's path or bridge policy.
+      if (module.find_first_of("/\\:") == std::string::npos &&
+          module != "steam_api.dll" && module != "steam_api64.dll") {
+        auto candidate = dll_paths.find(path_join(importer_dir, module));
+        if (candidate == dll_paths.end()) candidate = dll_paths.find(path_join(exe_dir, module));
+        if (candidate == dll_paths.end()) candidate = dll_paths.find(module);
+        if (candidate != dll_paths.end()) {
+          edge.candidate = *candidate->second;
+          const auto seen = scanned_files.find(edge.candidate);
+          if (seen != scanned_files.end()) {
+            edge.probe = seen->second;
+          } else if (!remaining) {
+            edge.probe = trt_import_probe::scan_limit;
+          } else {
+            --remaining;
+            pe_scan dependency;
+            if (!scan_pe_file(path_join(game_dir, edge.candidate), &dependency)) {
+              edge.probe = trt_import_probe::invalid_image;
+            } else if (dependency.machine != main.machine ||
+                       dependency.is_pe32 != main.is_pe32) {
+              edge.probe = trt_import_probe::wrong_architecture;
+            } else {
+              edge.probe = trt_import_probe::bundled;
+              enqueue(std::move(dependency), edge.candidate, required);
+            }
+            scanned_files.emplace(edge.candidate, edge.probe);
+          }
+        }
       }
+      if (result.dependencies.size() < kMaxReportedEdges)
+        result.dependencies.push_back(std::move(edge));
+      else
+        ++result.edges_omitted;
     }
   }
-  launch_imports result{
-      {modules.begin(), modules.end()}, {startup_modules.begin(), startup_modules.end()}};
+  result.all.assign(modules.begin(), modules.end());
+  result.startup.assign(startup_modules.begin(), startup_modules.end());
   std::sort(result.all.begin(), result.all.end());
   std::sort(result.startup.begin(), result.startup.end());
   return result;
@@ -1031,6 +1084,8 @@ static bool synthesize_engine(const char* game_dir, const char* target_exe_hint,
   auto imports = collect_launch_imports(base_dir, chosen.rel_path, scan, all_files);
   out_profile->imported_modules = std::move(imports.all);
   out_profile->startup_modules = std::move(imports.startup);
+  out_profile->dependencies = std::move(imports.dependencies);
+  out_profile->dependency_edges_omitted = imports.edges_omitted;
   out_profile->import_roles_scanned = true;
   auto mod_is = [&](const char* name) {
     const std::string want = lower_str(name);
@@ -1759,6 +1814,25 @@ extern "C" int trt_engine_launch_preflight(const trt_engine_profile* prof,
     }
     return false;
   };
+  size_t reported = 0;
+  for (const auto& edge : prof->dependencies) {
+    if (edge.probe != trt_import_probe::invalid_image &&
+        edge.probe != trt_import_probe::wrong_architecture) continue;
+    if (reported++ == 8) {
+      out->notes.push_back("More bundled dependency issues are listed in profile.json");
+      break;
+    }
+    out->notes.push_back(std::string(edge.startup ? "Startup" : "Delay-load") +
+        " dependency " + edge.requester + " -> " + edge.candidate +
+        (edge.probe == trt_import_probe::invalid_image
+             ? " is unreadable or has an invalid PE header"
+             : " has a different architecture from the executable"));
+  }
+  if (prof->dependency_edges_omitted) {
+    out->notes.push_back("Dependency report capped; omitted edges: " +
+                         std::to_string(prof->dependency_edges_omitted));
+  }
+
   for (const auto& m : prof->imported_modules) {
     if (m.empty()) continue;
     if (m.find("easyanticheat") != std::string::npos ||
