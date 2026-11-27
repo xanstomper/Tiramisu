@@ -43,6 +43,8 @@
 # linkable UWP Mono. Whether Celeste runs under it on the Series S can
 # only be proven by a console test (no UWP runtime exists on Linux).
 set -euo pipefail
+# Build tools can write progress to stdout. Reserve stdout for the archive path.
+exec 3>&1 >&2
 export PATH="$HOME/.local/bin:$PATH"
 here="$(cd "$(dirname "$0")/../.." && pwd)"
 UWP_DIR="$here/third_party/mono-uwp"
@@ -85,7 +87,7 @@ current_stamp="$(cat "${stamp_inputs[@]}" 2>/dev/null | sha256sum | cut -d' ' -f
 if [[ -z "${MONO_UWP_REBUILD:-}" && -f "$LIB" && -f "$OUT/.mono-uwp-stamp" && \
       "$(cat "$OUT/.mono-uwp-stamp")" == "$current_stamp" ]]; then
   log "up to date: $LIB"
-  echo "$LIB"
+  printf '%s\n' "$LIB" >&3
   exit 0
 fi
 
@@ -197,7 +199,7 @@ for lib in eglib libmini libmonoruntime libmonoutils libgcmonosgen; do
   # include/README.md). Per-lib object dirs: object names are
   # basename-derived and could collide across libraries.
   UWP_OBJ_DIR="$CACHE/obj-$lib" "$CB/scripts/build.sh" --uwp --static-lib \
-    --out "$OUT/.parts/$lib.lib" --jobs "$(nproc)" \
+    --out "$OUT/.parts/$lib.lib" --jobs "${TRT_JOBS:-2}" \
     -I "$UWP_DIR/include" -I "$SRC" -I "$SRC/mono" -I "$SRC/mono/eglib" \
     "${lib_srcs[@]}" \
     -- "${common_defs[@]}" "${extra_defs[@]}" \
@@ -239,4 +241,4 @@ log "symbols present: mono_jit_init, mono_jit_exec, +10 more"
 
 echo "$current_stamp" > "$OUT/.mono-uwp-stamp"
 log "built $LIB ($(du -h "$LIB" | cut -f1))"
-echo "$LIB"
+printf '%s\n' "$LIB" >&3
