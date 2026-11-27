@@ -1,5 +1,7 @@
 # Tiramisu — support roadmap (measured)
 
+For the 2026-11-27 source and branch audit, device results and next behavioral tests, see the [Windows game compatibility inventory](compatibility-inventory.md).
+
 > Written 2026-11-21 from tool runs on THIS tree (`tools/pe_readiness.py`,
 > `tests/test_corpus` over all 53 corpus PEs, bridge inventory). Every number
 > below is reproducible with the command in its section. Nothing here is from
