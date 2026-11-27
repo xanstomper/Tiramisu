@@ -47,7 +47,7 @@ extern "C" {
 namespace {
 
 constexpr u32 k_res_dir_entry_size = 8;   // IMAGE_RESOURCE_DIRECTORY_ENTRY
-constexpr u32 k_res_data_entry_size = 16; // IMAGE_RESOURCE_DATA_ENTRY
+[[maybe_unused]] constexpr u32 k_res_data_entry_size = 16; // IMAGE_RESOURCE_DATA_ENTRY
 
 struct res_key {
   u32 type;        // 0 = none given (FindResourceExW NULL type is illegal)
@@ -169,7 +169,7 @@ bool res_walk(const u8* base, u64 rsrc_rva, const res_key& k,
 }
 
 // standard type ids (winuser.h RT_*)
-constexpr u32 k_RT_CURSOR = 1, k_RT_BITMAP = 2, k_RT_ICON = 3,
+[[maybe_unused]] constexpr u32 k_RT_CURSOR = 1, k_RT_BITMAP = 2, k_RT_ICON = 3,
               k_RT_MENU = 4, k_RT_DIALOG = 5, k_RT_STRING = 6,
               k_RT_FONTDIR = 7, k_RT_FONT = 8, k_RT_ACCELERATOR = 9,
               k_RT_RCDATA = 10, k_RT_MESSAGETABLE = 11, k_RT_GROUP_CURSOR = 12,

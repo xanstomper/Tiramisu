@@ -165,6 +165,38 @@ static int lookup_arg_count(const char* module, const char* symbol) {
     if (module && (strcasecmp(module, "dstoragecore") == 0 ||
                    strcasecmp(module, "dstoragecore.dll") == 0))
         module = "dstorage";
+    // Module aliases: single canonical ABI table for equivalent Win32/middleware DLL names.
+    if (module && (strcasecmp(module, "sechost") == 0 ||
+                   strcasecmp(module, "sechost.dll") == 0))
+        module = "advapi32";
+    if (module && strncasecmp(module, "api-ms-win-core-winrt", 21) == 0)
+        module = "combase";
+    if (module && (strcasecmp(module, "d3d12core") == 0 ||
+                   strcasecmp(module, "d3d12core.dll") == 0))
+        module = "d3d12";
+    if (module && (strcasecmp(module, "fmodl") == 0 || strcasecmp(module, "fmodl.dll") == 0 ||
+                   strcasecmp(module, "fmodex") == 0 || strcasecmp(module, "fmodex.dll") == 0 ||
+                   strcasecmp(module, "fmodex64") == 0 || strcasecmp(module, "fmodex64.dll") == 0 ||
+                   strcasecmp(module, "fmodstudio") == 0 || strcasecmp(module, "fmodstudio.dll") == 0 ||
+                   strcasecmp(module, "fmodstudiol") == 0 || strcasecmp(module, "fmodstudiol.dll") == 0))
+        module = "fmod";
+    if (module && (strcasecmp(module, "bink2w32") == 0 || strcasecmp(module, "bink2w32.dll") == 0 ||
+                   strcasecmp(module, "bink2w64") == 0 || strcasecmp(module, "bink2w64.dll") == 0 ||
+                   strcasecmp(module, "binkw32") == 0 || strcasecmp(module, "binkw32.dll") == 0 ||
+                   strcasecmp(module, "binkw64") == 0 || strcasecmp(module, "binkw64.dll") == 0))
+        module = "bink";
+    if (module && (strcasecmp(module, "aksoundengine") == 0 || strcasecmp(module, "aksoundengine.dll") == 0 ||
+                   strcasecmp(module, "aksoundenginep") == 0 || strcasecmp(module, "aksoundenginep.dll") == 0 ||
+                   strcasecmp(module, "akmemorymgr") == 0 || strcasecmp(module, "akmemorymgr.dll") == 0 ||
+                   strcasecmp(module, "akstreammgr") == 0 || strcasecmp(module, "akstreammgr.dll") == 0 ||
+                   strcasecmp(module, "akmusicengine") == 0 || strcasecmp(module, "akmusicengine.dll") == 0 ||
+                   strcasecmp(module, "ak::soundengine") == 0 || strcasecmp(module, "ak::soundengine.dll") == 0))
+        module = "wwise";
+    if (module && strncasecmp(module, "eossdk-win", 10) == 0)
+        module = "eos";
+    if (module && (strcasecmp(module, "galaxy64") == 0 || strcasecmp(module, "galaxy64.dll") == 0 ||
+                   strcasecmp(module, "galaxy") == 0 || strcasecmp(module, "galaxy.dll") == 0))
+        module = "galaxy";
 
     // ---- General table (module, symbol, stdcall arg count) ----
     struct arg_ent { const char* mod; const char* sym; int n; };
@@ -1059,6 +1091,277 @@ static int lookup_arg_count(const char* module, const char* symbol) {
         {"gdi32","CreatePalette",1},
         {"gdi32","RealizePalette",1},
         {"gdi32","ChoosePixelFormat",2},
+        // kernel32 / kernelbase remaining threadpool, VirtualAlloc2, WER
+        {"kernel32","CallbackMayRunLong",1},{"kernel32","CloseThreadpoolCleanupGroupMembers",3},
+        {"kernel32","CreateFileMappingNumaW",7},{"kernel32","DisassociateCurrentThreadFromCallback",1},
+        {"kernel32","IsThreadpoolTimerSet",1},{"kernel32","QueueUserAPC2",4},
+        {"kernel32","SetThreadpoolCallbackCleanupGroup",3},{"kernel32","SetThreadpoolCallbackPool",2},
+        {"kernel32","SetThreadpoolCallbackRunsLong",1},{"kernel32","SetThreadpoolThreadMaximum",2},
+        {"kernel32","SetThreadpoolThreadMinimum",2},{"kernel32","SetThreadpoolTimerEx",4},
+        {"kernel32","SetThreadpoolWaitEx",4},{"kernel32","SubmitThreadpoolWork",1},
+        {"kernel32","TrySubmitThreadpoolCallback",3},{"kernel32","VirtualAlloc2",7},
+        {"kernel32","VirtualAlloc2FromApp",7},{"kernel32","VirtualAllocEx",5},
+        {"kernel32","VirtualFreeEx",4},{"kernel32","VirtualProtectEx",5},
+        {"kernel32","WaitForMultipleObjectsEx",5},{"kernel32","WaitForThreadpoolWaitCallbacks",2},
+        {"kernel32","WaitForThreadpoolWorkCallbacks",2},{"kernel32","WerGetFlags",2},
+        {"kernel32","WerRegisterMemoryBlock",2},{"kernel32","WerRegisterRuntimeExceptionModule",2},
+        {"kernel32","WerSetFlags",1},{"kernel32","WerUnregisterMemoryBlock",1},
+        {"kernel32","WerUnregisterRuntimeExceptionModule",2},
+        // advapi32 / sechost (SCM, ETW, LSA, SIDs)
+        {"advapi32","CloseServiceHandle",1},{"advapi32","ControlService",3},
+        {"advapi32","ConvertSidToStringSidW",2},{"advapi32","ConvertStringSidToSidA",2},
+        {"advapi32","ConvertStringSidToSidW",2},{"advapi32","CreateServiceA",13},
+        {"advapi32","CreateServiceW",13},{"advapi32","DeleteService",1},
+        {"advapi32","EnumServicesStatusExA",10},{"advapi32","EnumServicesStatusExW",10},
+        {"advapi32","EventEnabled",2},{"advapi32","EventProviderEnabled",3},
+        {"advapi32","EventRegister",4},{"advapi32","EventSetInformation",4},
+        {"advapi32","EventUnregister",1},{"advapi32","EventWrite",4},
+        {"advapi32","EventWriteEx",8},{"advapi32","EventWriteString",4},
+        {"advapi32","EventWriteTransfer",6},{"advapi32","LookupAccountNameA",7},
+        {"advapi32","LookupAccountNameW",7},{"advapi32","LookupAccountSidA",7},
+        {"advapi32","LookupAccountSidW",7},{"advapi32","LookupPrivilegeValueA",3},
+        {"advapi32","LookupPrivilegeValueW",3},{"advapi32","LsaClose",1},
+        {"advapi32","LsaFreeMemory",1},{"advapi32","LsaLookupNames2",6},
+        {"advapi32","LsaLookupSids",5},{"advapi32","LsaLookupSids2",6},
+        {"advapi32","LsaOpenPolicy",4},{"advapi32","LsaQueryInformationPolicy",3},
+        {"advapi32","NotifyServiceStatusChangeA",3},{"advapi32","NotifyServiceStatusChangeW",3},
+        {"advapi32","OpenSCManagerA",3},{"advapi32","OpenSCManagerW",3},
+        {"advapi32","OpenServiceA",3},{"advapi32","OpenServiceW",3},
+        {"advapi32","QueryServiceConfigA",4},{"advapi32","QueryServiceConfigW",4},
+        {"advapi32","QueryServiceStatus",2},{"advapi32","QueryServiceStatusEx",5},
+        {"advapi32","RegisterServiceCtrlHandlerA",2},{"advapi32","RegisterServiceCtrlHandlerW",2},
+        {"advapi32","RegisterServiceCtrlHandlerExA",3},{"advapi32","RegisterServiceCtrlHandlerExW",3},
+        {"advapi32","SetServiceStatus",2},{"advapi32","StartServiceA",3},
+        {"advapi32","StartServiceW",3},{"advapi32","StartServiceCtrlDispatcherA",1},
+        {"advapi32","StartServiceCtrlDispatcherW",1},
+        // combase / api-ms-win-core-winrt-*
+        {"combase","CoCreateFreeThreadedMarshaler",2},{"combase","CoCreateGuid",1},
+        {"combase","CoCreateInstance",5},{"combase","CoFreeUnusedLibraries",0},
+        {"combase","CoGetApartmentType",2},{"combase","CoGetClassObject",5},
+        {"combase","CoInitializeEx",2},{"combase","CoTaskMemAlloc",1},
+        {"combase","CoTaskMemFree",1},{"combase","CoTaskMemRealloc",2},
+        {"combase","CoUninitialize",0},{"combase","GetRestrictedErrorInfo",1},
+        {"combase","PropVariantClear",1},{"combase","RoActivateInstance",2},
+        {"combase","RoGetActivationFactory",3},{"combase","RoGetAgileReference",4},
+        {"combase","RoGetBufferMarshaler",1},{"combase","RoInitialize",1},
+        {"combase","RoOriginateError",2},{"combase","RoOriginateErrorW",3},
+        {"combase","RoSetErrorReportingFlags",1},{"combase","RoTransformError",3},
+        {"combase","RoUninitialize",0},{"combase","SetRestrictedErrorInfo",1},
+        {"combase","StringFromGUID2",3},{"combase","WindowsCompareStringOrdinal",3},
+        {"combase","WindowsConcatString",3},{"combase","WindowsCreateString",3},
+        {"combase","WindowsCreateStringReference",4},{"combase","WindowsDeleteString",1},
+        {"combase","WindowsDuplicateString",2},{"combase","WindowsGetStringLen",1},
+        {"combase","WindowsGetStringRawBuffer",2},{"combase","WindowsIsStringEmpty",1},
+        // ole32
+        {"ole32","CLSIDFromProgID",2},{"ole32","CLSIDFromString",2},
+        {"ole32","CoCreateFreeThreadedMarshaler",2},{"ole32","CoCreateGuid",1},
+        {"ole32","CoFreeUnusedLibraries",0},{"ole32","CoFreeUnusedLibrariesEx",2},
+        {"ole32","CoGetApartmentType",2},{"ole32","CoGetClassObject",5},
+        {"ole32","CoGetContextToken",1},{"ole32","CoGetCurrentProcess",0},
+        {"ole32","CoGetInterfaceAndReleaseStream",3},{"ole32","CoGetObjectContext",2},
+        {"ole32","CoInitializeSecurity",9},{"ole32","CoMarshalInterThreadInterfaceInStream",3},
+        {"ole32","CoRegisterInitializeSpy",2},{"ole32","CoRevokeInitializeSpy",2},
+        {"ole32","CoSetProxyBlanket",8},{"ole32","CoTaskMemRealloc",2},
+        {"ole32","CoTaskMemSize",1},{"ole32","CoWaitForMultipleHandles",5},
+        {"ole32","CreateStreamOnHGlobal",3},{"ole32","GetErrorInfo",2},
+        {"ole32","GetHGlobalFromStream",2},{"ole32","IIDFromString",2},
+        {"ole32","OleFlushClipboard",0},{"ole32","OleGetClipboard",1},
+        {"ole32","OleInitialize",1},{"ole32","OleSetClipboard",1},
+        {"ole32","OleUninitialize",0},{"ole32","ProgIDFromCLSID",2},
+        {"ole32","PropVariantClear",1},{"ole32","PropVariantCopy",2},
+        {"ole32","PropVariantInit",1},{"ole32","RegisterDragDrop",2},
+        {"ole32","ReleaseStgMedium",1},{"ole32","RevokeDragDrop",1},
+        {"ole32","RoGetAgileReference",4},{"ole32","SetErrorInfo",2},
+        {"ole32","StringFromCLSID",2},{"ole32","StringFromGUID2",3},
+        // oleaut32 (named + ordinals)
+        {"oleaut32","GetErrorInfo",2},{"oleaut32","SetErrorInfo",2},
+        {"oleaut32","SafeArrayAccessData",2},{"oleaut32","SafeArrayCreateVector",3},
+        {"oleaut32","SafeArrayDestroy",1},{"oleaut32","SafeArrayGetDim",1},
+        {"oleaut32","SafeArrayGetElement",3},{"oleaut32","SafeArrayGetLBound",3},
+        {"oleaut32","SafeArrayGetUBound",3},{"oleaut32","SafeArrayGetVartype",2},
+        {"oleaut32","SafeArrayLock",1},{"oleaut32","SafeArrayPutElement",3},
+        {"oleaut32","SafeArrayUnaccessData",1},{"oleaut32","SafeArrayUnlock",1},
+        {"oleaut32","SysAllocStringByteLen",2},{"oleaut32","SysAllocStringLen",2},
+        {"oleaut32","SysReAllocString",2},{"oleaut32","SysReAllocStringLen",3},
+        {"oleaut32","SysStringByteLen",1},{"oleaut32","VariantCopy",2},
+        {"oleaut32","#2",1},{"oleaut32","#3",2},{"oleaut32","#4",2},{"oleaut32","#5",3},
+        {"oleaut32","#6",1},{"oleaut32","#7",1},{"oleaut32","#8",1},{"oleaut32","#9",1},
+        {"oleaut32","#10",2},{"oleaut32","#12",4},{"oleaut32","#15",3},{"oleaut32","#16",1},
+        {"oleaut32","#17",1},{"oleaut32","#19",3},{"oleaut32","#20",3},{"oleaut32","#21",1},
+        {"oleaut32","#22",1},{"oleaut32","#23",2},{"oleaut32","#24",1},{"oleaut32","#25",3},
+        {"oleaut32","#26",3},{"oleaut32","#77",2},{"oleaut32","#148",3},{"oleaut32","#149",1},
+        {"oleaut32","#150",2},{"oleaut32","#200",2},{"oleaut32","#201",2},{"oleaut32","#411",3},
+        // ws2_32 / wsock32 ordinals + legacy async APIs
+        {"ws2_32","#1",3},{"ws2_32","#2",3},{"ws2_32","#3",1},{"ws2_32","#4",3},
+        {"ws2_32","#5",3},{"ws2_32","#6",3},{"ws2_32","#7",5},{"ws2_32","#8",1},
+        {"ws2_32","#9",1},{"ws2_32","#10",3},{"ws2_32","#11",1},{"ws2_32","#12",1},
+        {"ws2_32","#13",2},{"ws2_32","#14",1},{"ws2_32","#15",1},{"ws2_32","#16",4},
+        {"ws2_32","#17",6},{"ws2_32","#18",5},{"ws2_32","#19",4},{"ws2_32","#20",6},
+        {"ws2_32","#21",5},{"ws2_32","#22",2},{"ws2_32","#23",3},{"ws2_32","#51",3},
+        {"ws2_32","#52",1},{"ws2_32","#53",1},{"ws2_32","#55",2},{"ws2_32","#56",2},
+        {"ws2_32","#57",2},{"ws2_32","#103",5},{"ws2_32","#108",1},{"ws2_32","#111",0},
+        {"ws2_32","#112",1},{"ws2_32","#115",2},{"ws2_32","#116",0},{"ws2_32","#151",2},
+        {"ws2_32","WSAAsyncGetHostByName",5},{"ws2_32","WSACancelAsyncRequest",1},
+        {"ws2_32","getprotobyname",1},
+        // openal32
+        {"openal32","alBufferData",5},{"openal32","alDeleteBuffers",2},
+        {"openal32","alDeleteSources",2},{"openal32","alDisable",1},
+        {"openal32","alDistanceModel",1},{"openal32","alDopplerFactor",1},
+        {"openal32","alEnable",1},{"openal32","alGenBuffers",2},
+        {"openal32","alGenSources",2},{"openal32","alGetBufferi",3},
+        {"openal32","alGetEnumValue",1},{"openal32","alGetError",0},
+        {"openal32","alGetListener3f",4},{"openal32","alGetListenerf",2},
+        {"openal32","alGetListenerfv",2},{"openal32","alGetProcAddress",1},
+        {"openal32","alGetSourcef",3},{"openal32","alGetSourcei",3},
+        {"openal32","alGetString",1},{"openal32","alIsBuffer",1},
+        {"openal32","alIsEnabled",1},{"openal32","alIsExtensionPresent",1},
+        {"openal32","alIsSource",1},{"openal32","alListener3f",4},
+        {"openal32","alListenerf",2},{"openal32","alListenerfv",2},
+        {"openal32","alSource3f",5},{"openal32","alSourcePause",1},
+        {"openal32","alSourcePausev",2},{"openal32","alSourcePlay",1},
+        {"openal32","alSourcePlayv",2},{"openal32","alSourceQueueBuffers",3},
+        {"openal32","alSourceStop",1},{"openal32","alSourceStopv",2},
+        {"openal32","alSourceUnqueueBuffers",3},{"openal32","alSourcef",3},
+        {"openal32","alSourcei",3},{"openal32","alSpeedOfSound",1},
+        {"openal32","alcCloseDevice",1},{"openal32","alcCreateContext",2},
+        {"openal32","alcDestroyContext",1},{"openal32","alcGetError",1},
+        {"openal32","alcGetIntegerv",4},{"openal32","alcGetString",2},
+        {"openal32","alcMakeContextCurrent",1},{"openal32","alcOpenDevice",1},
+        {"openal32","alcProcessContext",1},{"openal32","alcSuspendContext",1},
+        {"openal32","trt_openal_pump",1},
+        // uxtheme
+        {"uxtheme","AllowDarkModeForWindow",2},{"uxtheme","BeginBufferedPaint",5},
+        {"uxtheme","BufferedPaintInit",0},{"uxtheme","BufferedPaintSetAlpha",3},
+        {"uxtheme","BufferedPaintUnInit",0},{"uxtheme","CloseThemeData",1},
+        {"uxtheme","DrawThemeBackground",6},{"uxtheme","DrawThemeBackgroundEx",6},
+        {"uxtheme","DrawThemeText",9},{"uxtheme","EnableThemeDialogTexture",2},
+        {"uxtheme","EndBufferedPaint",2},{"uxtheme","GetCurrentThemeName",6},
+        {"uxtheme","GetThemeBool",5},{"uxtheme","GetThemeColor",5},
+        {"uxtheme","GetThemeInt",5},{"uxtheme","GetThemeMargins",7},
+        {"uxtheme","GetThemePartSize",7},{"uxtheme","GetThemeSysColor",2},
+        {"uxtheme","IsAppThemed",0},{"uxtheme","IsThemeActive",0},
+        {"uxtheme","IsThemeBackgroundPartiallyTransparent",3},{"uxtheme","IsThemePartDefined",3},
+        {"uxtheme","OpenThemeData",2},{"uxtheme","OpenThemeDataEx",3},
+        {"uxtheme","OpenThemeDataForDpi",3},{"uxtheme","SetPreferredAppMode",1},
+        {"uxtheme","SetWindowTheme",3},{"uxtheme","ShouldAppsUseDarkMode",0},
+        // d3d12 / d3d12core
+        {"d3d12","D3D12CoreCreateLayeredDevice",5},{"d3d12","D3D12CoreGetLayeredDeviceSize",2},
+        {"d3d12","D3D12CoreRegisterLayers",2},{"d3d12","D3D12CreateRootSignatureDeserializer",4},
+        {"d3d12","D3D12CreateVersionedRootSignatureDeserializer",4},{"d3d12","D3D12EnableExperimentalFeatures",4},
+        {"d3d12","D3D12GetDebugInterface",2},{"d3d12","D3D12GetInterface",3},
+        {"d3d12","D3D12PIXEventsReplaceBlock",1},{"d3d12","D3D12PIXGetThreadInfo",0},
+        {"d3d12","D3D12PIXNotifyWakeFromFenceSignal",1},{"d3d12","D3D12PIXReportCounter",4},
+        {"d3d12","D3D12SerializeRootSignature",4},{"d3d12","D3D12SerializeVersionedRootSignature",3},
+        {"d3d12","#101",0},{"d3d12","#102",0},{"d3d12","#103",0},
+        {"d3d12","#104",0},{"d3d12","#105",0},{"d3d12","#106",0},
+        // fmod / fmodL / fmodex / fmodstudio / fmodstudioL
+        {"fmod","FMOD_ChannelGroup_AddChannelGroup",2},{"fmod","FMOD_ChannelGroup_SetVolume",2},
+        {"fmod","FMOD_Channel_GetPaused",2},{"fmod","FMOD_Channel_GetVolume",2},
+        {"fmod","FMOD_Channel_IsPlaying",2},{"fmod","FMOD_Channel_SetFrequency",2},
+        {"fmod","FMOD_Channel_SetPaused",2},{"fmod","FMOD_Channel_SetPosition",3},
+        {"fmod","FMOD_Channel_SetVolume",2},{"fmod","FMOD_Channel_Stop",1},
+        {"fmod","FMOD_Debug_Initialize",3},{"fmod","FMOD_Memory_Initialize",4},
+        {"fmod","FMOD_Sound_GetLength",3},{"fmod","FMOD_Sound_GetMode",2},
+        {"fmod","FMOD_Sound_Release",1},{"fmod","FMOD_Sound_SetMode",2},
+        {"fmod","FMOD_System_Close",1},{"fmod","FMOD_System_Create",2},
+        {"fmod","FMOD_System_CreateSound",5},{"fmod","FMOD_System_CreateStream",5},
+        {"fmod","FMOD_System_GetMasterChannelGroup",2},{"fmod","FMOD_System_Init",4},
+        {"fmod","FMOD_System_PlaySound",5},{"fmod","FMOD_System_Release",1},
+        {"fmod","FMOD_System_SetDSPBufferSize",3},{"fmod","FMOD_System_SetOutput",2},
+        {"fmod","FMOD_System_SetSpeakerMode",2},{"fmod","FMOD_System_Update",1},
+        // bink / bink2w32 / bink2w64
+        {"bink","BinkAllocateFrameBuffers",2},{"bink","BinkClose",1},
+        {"bink","BinkCopyToBuffer",7},{"bink","BinkDoFrame",1},
+        {"bink","BinkFreeFrameBuffers",1},{"bink","BinkGetAudioInfo",2},
+        {"bink","BinkGetError",0},{"bink","BinkGetFrameNum",1},
+        {"bink","BinkGetKeyFrame",3},{"bink","BinkGetRealtime",3},
+        {"bink","BinkGetRects",2},{"bink","BinkGetSummary",2},
+        {"bink","BinkGetVideoInfo",2},{"bink","BinkGoto",3},
+        {"bink","BinkNextFrame",1},{"bink","BinkOpen",2},
+        {"bink","BinkOpenDirect",2},{"bink","BinkPause",2},
+        {"bink","BinkRegisterFrameBuffers",2},{"bink","BinkSetMixBinVolumes",5},
+        {"bink","BinkSetMixBins",4},{"bink","BinkSetPan",3},
+        {"bink","BinkSetSoundOnOff",2},{"bink","BinkSetSoundTrack",2},
+        {"bink","BinkSetVideoOnOff",2},{"bink","BinkSetVolume",3},
+        {"bink","BinkShouldSkip",1},{"bink","BinkWait",1},
+        // wwise (AkSoundEngine / AkSoundEngineP / AkMemoryMgr / AkStreamMgr / AkMusicEngine)
+        {"wwise","AK_MemoryMgr_Init",1},{"wwise","AK_MemoryMgr_Term",0},
+        {"wwise","AK_MemoryMgr_Malloc",1},{"wwise","AK_MemoryMgr_Free",1},
+        {"wwise","AK_StreamMgr_Create",1},{"wwise","AK_StreamMgr_Destroy",0},
+        {"wwise","AK_StreamMgr_SetCurrentLanguage",1},{"wwise","AK_StreamMgr_SetBasePath",1},
+        {"wwise","AK_StreamMgr_SetFileLocationResolver",1},
+        {"wwise","AK_SoundEngine_Init",2},{"wwise","AK_SoundEngine_Term",0},
+        {"wwise","AK_SoundEngine_IsInitialized",0},{"wwise","AK_SoundEngine_RenderAudio",1},
+        {"wwise","AK_SoundEngine_GetDefaultInitSettings",1},{"wwise","AK_SoundEngine_GetDefaultPlatformInitSettings",1},
+        {"wwise","AK_SoundEngine_RegisterGameObj",2},{"wwise","AK_SoundEngine_UnregisterGameObj",1},
+        {"wwise","AK_SoundEngine_UnregisterAllGameObj",0},{"wwise","AK_SoundEngine_SetPosition",2},
+        {"wwise","AK_SoundEngine_SetListenerPosition",2},{"wwise","AK_SoundEngine_SetDefaultListeners",2},
+        {"wwise","AK_SoundEngine_LoadBank",2},{"wwise","AK_SoundEngine_LoadBankMemory",3},
+        {"wwise","AK_SoundEngine_LoadBankMemoryView",3},{"wwise","AK_SoundEngine_LoadBankMemoryCopy",3},
+        {"wwise","AK_SoundEngine_LoadBankID",1},{"wwise","AK_SoundEngine_UnloadBank",2},
+        {"wwise","AK_SoundEngine_UnloadBankID",2},{"wwise","AK_SoundEngine_ClearBanks",0},
+        {"wwise","AK_SoundEngine_PostEvent",5},{"wwise","AK_SoundEngine_PostEventID",5},
+        {"wwise","AK_SoundEngine_ExecuteActionOnEvent",5},{"wwise","AK_SoundEngine_StopAll",1},
+        {"wwise","AK_SoundEngine_StopPlayingID",3},{"wwise","AK_SoundEngine_SetRTPCValue",5},
+        {"wwise","AK_SoundEngine_SetRTPCValueID",5},{"wwise","AK_SoundEngine_SetState",2},
+        {"wwise","AK_SoundEngine_SetStateID",2},{"wwise","AK_SoundEngine_SetSwitch",3},
+        {"wwise","AK_SoundEngine_SetSwitchID",3},{"wwise","AK_SoundEngine_GetIDFromString",1},
+        {"wwise","AK_MusicEngine_Init",1},{"wwise","AK_MusicEngine_Term",0},
+        {"wwise","AK_MusicEngine_GetDefaultInitSettings",1},
+        {"wwise","CSharp_Init",2},{"wwise","CSharp_Term",0},
+        {"wwise","CSharp_RenderAudio",1},{"wwise","CSharp_PostEvent",5},
+        {"wwise","CSharp_LoadBank",2},{"wwise","CSharp_LoadBankMemoryView",3},
+        // Epic Online Services (EOSSDK-Win64/32-Shipping.dll)
+        {"eos","EOS_Initialize",1},{"eos","EOS_Shutdown",0},{"eos","EOS_GetVersion",0},
+        {"eos","EOS_EResult_ToString",1},{"eos","EOS_EResult_IsOperationComplete",1},
+        {"eos","EOS_Logging_SetCallback",1},{"eos","EOS_Logging_SetLogLevel",2},
+        {"eos","EOS_Platform_Create",1},{"eos","EOS_Platform_Release",1},
+        {"eos","EOS_Platform_Tick",1},{"eos","EOS_Platform_CheckForLauncherAndRestart",1},
+        {"eos","EOS_Platform_SetNetworkStatus",2},{"eos","EOS_Platform_GetNetworkStatus",1},
+        {"eos","EOS_Platform_SetApplicationStatus",2},{"eos","EOS_Platform_GetApplicationStatus",1},
+        {"eos","EOS_Platform_GetActiveCountryCode",4},{"eos","EOS_Platform_GetActiveLocaleCode",4},
+        {"eos","EOS_Platform_GetAuthInterface",1},{"eos","EOS_Platform_GetConnectInterface",1},
+        {"eos","EOS_Platform_GetAchievementsInterface",1},{"eos","EOS_Platform_GetStatsInterface",1},
+        {"eos","EOS_Platform_GetFriendsInterface",1},{"eos","EOS_Platform_GetUserInfoInterface",1},
+        {"eos","EOS_Platform_GetPresenceInterface",1},{"eos","EOS_Platform_GetPlayerDataStorageInterface",1},
+        {"eos","EOS_Platform_GetTitleStorageInterface",1},{"eos","EOS_Platform_GetUIInterface",1},
+        {"eos","EOS_Platform_GetEcomInterface",1},{"eos","EOS_Platform_GetLobbyInterface",1},
+        {"eos","EOS_Platform_GetSessionsInterface",1},{"eos","EOS_Platform_GetMetricsInterface",1},
+        {"eos","EOS_Platform_GetP2PInterface",1},{"eos","EOS_Platform_GetLeaderboardsInterface",1},
+        {"eos","EOS_Platform_GetProgressionSnapshotInterface",1},{"eos","EOS_Platform_GetReportsInterface",1},
+        {"eos","EOS_Platform_GetSanctionsInterface",1},{"eos","EOS_Platform_GetRTCInterface",1},
+        {"eos","EOS_Platform_GetModsInterface",1},{"eos","EOS_Platform_GetKWSInterface",1},
+        {"eos","EOS_Platform_GetCustomInvitesInterface",1},{"eos","EOS_Platform_GetIntegratedPlatformInterface",1},
+        {"eos","EOS_Platform_GetAntiCheatClientInterface",1},
+        {"eos","EOS_Auth_Login",4},{"eos","EOS_Auth_GetLoggedInAccountsCount",1},
+        {"eos","EOS_Auth_GetLoggedInAccountByIndex",2},{"eos","EOS_Auth_GetLoginStatus",2},
+        {"eos","EOS_Auth_AddNotifyLoginStatusChanged",4},{"eos","EOS_Auth_RemoveNotifyLoginStatusChanged",2},
+        {"eos","EOS_Connect_Login",4},{"eos","EOS_Connect_GetLoggedInUsersCount",1},
+        {"eos","EOS_Connect_GetLoggedInUserByIndex",2},{"eos","EOS_Connect_GetLoginStatus",2},
+        {"eos","EOS_Connect_AddNotifyAuthExpiration",4},{"eos","EOS_Connect_RemoveNotifyAuthExpiration",2},
+        {"eos","EOS_Connect_AddNotifyLoginStatusChanged",4},{"eos","EOS_Connect_RemoveNotifyLoginStatusChanged",2},
+        {"eos","EOS_Ecom_QueryOwnership",4},{"eos","EOS_Achievements_QueryDefinitions",4},
+        {"eos","EOS_Achievements_GetAchievementDefinitionCount",2},
+        {"eos","EOS_UI_AddNotifyDisplaySettingsUpdated",4},{"eos","EOS_UI_RemoveNotifyDisplaySettingsUpdated",2},
+        {"eos","EOS_UI_SetToggleFriendsKey",2},{"eos","EOS_UI_SetDisplayPreference",2},
+        {"eos","EOS_UI_GetFriendsVisible",2},{"eos","EOS_Metrics_BeginPlayerSession",2},
+        {"eos","EOS_Metrics_EndPlayerSession",2},{"eos","EOS_EpicAccountId_IsValid",1},
+        {"eos","EOS_ProductUserId_IsValid",1},{"eos","EOS_EpicAccountId_ToString",3},
+        {"eos","EOS_ProductUserId_ToString",3},{"eos","EOS_EpicAccountId_FromString",1},
+        {"eos","EOS_ProductUserId_FromString",1},{"eos","EOS_ByteArray_ToString",4},
+        // GOG Galaxy (Galaxy64.dll / Galaxy.dll)
+        {"galaxy","Galaxy_Init",1},{"galaxy","Galaxy_Shutdown",0},
+        {"galaxy","Galaxy_ProcessData",0},{"galaxy","Galaxy_IsSignedIn",0},
+        {"galaxy","Galaxy_IsLoggedOn",0},
+        {"galaxy","?Init@api@galaxy@@YAXAEBUInitOptions@12@@Z",1},
+        {"galaxy","?Shutdown@api@galaxy@@YAXXZ",0},
+        {"galaxy","?ProcessData@api@galaxy@@YAXXZ",0},
+        {"galaxy","?User@api@galaxy@@YAPEAVIUser@12@XZ",0},
+        {"galaxy","?Friends@api@galaxy@@YAPEAVIFriends@12@XZ",0},
+        {"galaxy","?Stats@api@galaxy@@YAPEAVIStats@12@XZ",0},
+        {"galaxy","?Utils@api@galaxy@@YAPEAVIUtils@12@XZ",0},
+        {"galaxy","?Apps@api@galaxy@@YAPEAVIApps@12@XZ",0},
+        {"galaxy","?Storage@api@galaxy@@YAPEAVIStorage@12@XZ",0},
     };
     for (size_t i = 0; i < sizeof(k_args) / sizeof(k_args[0]); i++) {
         if (mod_eq(module, k_args[i].mod) && sym_eq(symbol, k_args[i].sym))
@@ -1284,7 +1587,7 @@ int trt_abi_arg_count(const char* module, const char* symbol) {
     int n = lookup_arg_count(module, symbol);
     if (n >= 0) return n;
     // The table stores module names without the extension; retry stripped.
-    char bare[32];
+    char bare[96];
     size_t len = strcspn(module, ".");
     if (len == 0 || len >= sizeof(bare)) return -1;
     memcpy(bare, module, len);

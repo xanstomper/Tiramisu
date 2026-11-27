@@ -18,6 +18,7 @@
 //    accept and record: the runtime has exactly one real output path, so
 //    accepting the configuration IS the truthful answer.
 #include "bridge_fmod.h"
+#include "audio_codecs.h"
 #include "bridge_audio.h"
 #include "thunk.h"
 #include "trt.h"
@@ -35,9 +36,10 @@ typedef struct stb_vorbis stb_vorbis;
 typedef struct {
   unsigned int sample_rate;
   int channels;
+  unsigned int setup_memory_required;
   unsigned int setup_temp_memory_required;
   unsigned int temp_memory_required;
-  unsigned int setup_memory_required;
+  int max_frame_size;
 } stb_vorbis_info;
 stb_vorbis* stb_vorbis_open_memory(const unsigned char* data, int len,
                                    int* error_ret, const void* alloc);
@@ -558,7 +560,8 @@ int TRT_GUEST_ABI fmod_System_CreateSound(void* sys, const void* name_or_data,
       s->is_float = tmp.is_float;
       s->length_ms = tmp.length_ms;
       s->loop = (mode & (FMOD_LOOP_NORMAL_ | FMOD_LOOP_BIDI_)) ? 1 : 0;
-    } else if (is_compressed(data, size)) {
+    } else if (is_compressed(data, size) ||
+               (size >= 44u && !memcmp(data, "RIFF", 4))) {
       // OGG: decode for real (stb_vorbis). The file buffer (alloc_base, when
       // we own it) feeds the decoder, then the decoded PCM replaces it.
       u8* old_base = s->alloc_base;
@@ -567,6 +570,37 @@ int TRT_GUEST_ABI fmod_System_CreateSound(void* sys, const void* name_or_data,
       if (decoded != 0 && is_mp3(data, size)) {
         decoded = mp3_decode(data, size, s);
         kind = "mp3";
+      }
+      if (decoded != 0 && size >= 60u && !memcmp(data, "FSB5", 4)) {
+        trt_decoded_pcm fsb_pcm{};
+        if (trt_fsb5_decode_first_sample(data, size, &fsb_pcm) == 0 && fsb_pcm.samples) {
+          s->alloc_base = reinterpret_cast<u8*>(fsb_pcm.samples);
+          s->pcm = s->alloc_base;
+          s->pcm_bytes = fsb_pcm.frames * fsb_pcm.channels * 2u;
+          s->rate = fsb_pcm.rate;
+          s->channels = fsb_pcm.channels;
+          s->bps = 2;
+          s->is_float = 0;
+          s->length_ms = fsb_pcm.rate ? (u32)((u64)fsb_pcm.frames * 1000ull / fsb_pcm.rate) : 0;
+          decoded = 0;
+          kind = "fsb5";
+        }
+      }
+      if (decoded != 0 && size >= 44u && !memcmp(data, "RIFF", 4)) {
+        // WAV variants wav_decode doesn't pass through directly (e.g. IMA-ADPCM 0x0011)
+        trt_decoded_pcm wav_pcm{};
+        if (trt_decode_audio_buffer(data, size, &wav_pcm) == 0 && wav_pcm.samples) {
+          s->alloc_base = reinterpret_cast<u8*>(wav_pcm.samples);
+          s->pcm = s->alloc_base;
+          s->pcm_bytes = wav_pcm.frames * wav_pcm.channels * 2u;
+          s->rate = wav_pcm.rate;
+          s->channels = wav_pcm.channels;
+          s->bps = 2;
+          s->is_float = 0;
+          s->length_ms = wav_pcm.rate ? (u32)((u64)wav_pcm.frames * 1000ull / wav_pcm.rate) : 0;
+          decoded = 0;
+          kind = "wav-adpcm";
+        }
       }
       if (old_base) free(old_base);  // data pointed inside it: free AFTER
       s->alloc_base = (decoded == 0) ? s->alloc_base : nullptr;

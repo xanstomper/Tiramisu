@@ -4723,7 +4723,7 @@ u64 TRT_STDCALL trt_CreateSemaphoreW(void* attrs, u32 initial, u32 maximum,
       char sl[256];
       snprintf(sl, sizeof(sl),
                "sync: GAP-SEM-CREATE tid=%u h=0x%llx init=%u max=%u name=%s ret=0x%llx n=%u",
-               o->creator_tid, h, initial, maximum,
+               o->creator_tid, (unsigned long long)h, initial, maximum,
                key.empty() ? "none" : key.c_str(),
                (unsigned long long)(uintptr_t)__builtin_return_address(0),
                cn);
@@ -4784,7 +4784,7 @@ int TRT_STDCALL trt_ReleaseSemaphore(u64 handle, u32 count, u32* previous) {
       char sl[256];
       snprintf(sl, sizeof(sl),
                "sync: GAP-SEM-RELEASE tid=%u h=0x%llx count=%u prev=%u n=%u",
-               trt_GetCurrentThreadId(), handle, count,
+               trt_GetCurrentThreadId(), (unsigned long long)handle, count,
                previous ? *previous : 0, rn);
       trt_core_log(sl);
     }

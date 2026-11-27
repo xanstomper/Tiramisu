@@ -51,6 +51,7 @@
 #include <winrt/Windows.System.h>  // MemoryManager::AppMemoryUsage
 #endif
 
+#include "audio_codecs.h"
 #include "bridge_audio.h"
 #include "bridge_fmod.h"
 #include "fsb_vorbis_setups.h"
@@ -83,9 +84,10 @@ typedef struct stb_vorbis stb_vorbis;
 typedef struct {
   unsigned int sample_rate;
   int channels;
+  unsigned int setup_memory_required;
   unsigned int setup_temp_memory_required;
   unsigned int temp_memory_required;
-  unsigned int setup_memory_required;
+  int max_frame_size;
 } stb_vorbis_info;
 stb_vorbis* stb_vorbis_open_memory(const unsigned char* data, int len,
                                    int* error_ret, const void* alloc);
@@ -1323,7 +1325,7 @@ bool fsb_vorbis_to_ogg(const fsb_sample& s, const u8* data, u32 data_len,
 
 // Decode one FSB sample to PCM. Returns false for unsupported codecs or
 // decode failure (the caller logs the named reason).
-bool decode_fsb_sample(bank_data* bank, const fsb_sample& s,
+bool decode_fsb_sample(bank_data* bank, u32 fsb_mode, const fsb_sample& s,
                        decoded_sample* out) {
   if (s.data_len == 0) return false;
 #ifdef _WIN32
@@ -1371,10 +1373,33 @@ bool decode_fsb_sample(bank_data* bank, const fsb_sample& s,
     std::vector<u8> compressed(s.data_len);
     if (!file_read_at(bank->f, s.file_offset, compressed.data(), s.data_len))
       return false;
+    if (s.vorbis_crc == 0 && fsb_mode != TRT_FSB5_VORBIS) {
+      trt_decoded_pcm dec_pcm{};
+      if (trt_fsb5_decode_payload(fsb_mode, compressed.data(), s.data_len,
+                                  s.frequency ? s.frequency : 44100u,
+                                  s.channels ? s.channels : 1u, s.samples,
+                                  &dec_pcm) == 0 &&
+          dec_pcm.samples && dec_pcm.frames > 0) {
+        const size_t n_samps = static_cast<size_t>(dec_pcm.frames) * dec_pcm.channels;
+        out->pcm.assign(dec_pcm.samples, dec_pcm.samples + n_samps);
+        free(dec_pcm.samples);
+        out->rate = dec_pcm.rate;
+        out->channels = dec_pcm.channels;
+        out->frames = dec_pcm.frames;
+        out->loop = s.has_loop;
+        out->loop_start_frame = s.loop_start;
+        out->loop_end_frame = s.loop_end && s.loop_end <= out->frames
+                                  ? s.loop_end
+                                  : out->frames;
+        return true;
+      }
+      logf("fmod-studio: sample '%s' codec mode=%u could not be decoded — "
+           "silent",
+           s.name.c_str(), fsb_mode);
+      return false;
+    }
     if (s.vorbis_crc == 0) {
-      // Not Vorbis (PCM/ADPCM/etc.): named-silent until a decoder lands.
-      logf("fmod-studio: sample '%s' is not Vorbis (no VORBISDATA chunk) — "
-           "decoder pending",
+      logf("fmod-studio: sample '%s' is missing VORBISDATA chunk — silent",
            s.name.c_str());
       return false;
     }
@@ -1470,7 +1495,7 @@ std::shared_ptr<decoded_sample> get_decoded(bank_data* bank, int fsb_idx,
          bank->path.c_str(), fsb_idx, subsound);
     return nullptr;
   }
-  if (!decode_fsb_sample(bank, fb.samples[(size_t)subsound], dec.get()))
+  if (!decode_fsb_sample(bank, fb.mode, fb.samples[(size_t)subsound], dec.get()))
     return nullptr;
   {
     std::lock_guard<std::mutex> lk(g_cache_mu);

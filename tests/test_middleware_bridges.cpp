@@ -2,7 +2,9 @@
 // Unit tests for expanded audio and video middleware bridges:
 // Wwise, Bink Video, Miles Sound System, and CriWare.
 #include "../src/trt/trt.h"
+#include "../src/trt/bridge_audio.h"
 #include "../src/trt/bridge_wwise.h"
+#include "../src/trt/bridge_eos.h"
 #include "../src/trt/bridge_bink.h"
 #include "../src/trt/bridge_miles.h"
 #include "../src/trt/bridge_criware.h"
@@ -34,6 +36,22 @@ void* TRT_GUEST_ABI wwise_AK_MemoryMgr_Malloc(unsigned size);
 void TRT_GUEST_ABI wwise_AK_MemoryMgr_Free(void* p);
 unsigned TRT_GUEST_ABI wwise_AK_SoundEngine_PostEvent(const char* event_name, unsigned game_obj, unsigned flags, void* cb, void* cookie);
 unsigned TRT_GUEST_ABI wwise_AK_SoundEngine_PostEventID(unsigned event_id, unsigned game_obj, unsigned flags, void* cb, void* cookie);
+int TRT_GUEST_ABI wwise_AK_SoundEngine_LoadBankMemoryView(const void* buf, unsigned size, unsigned* out_bank_id);
+int TRT_GUEST_ABI wwise_AK_SoundEngine_RenderAudio(int allow_sync);
+
+int TRT_GUEST_ABI eos_Initialize(const void* options);
+int TRT_GUEST_ABI eos_Shutdown(void);
+const char* TRT_GUEST_ABI eos_GetVersion(void);
+void* TRT_GUEST_ABI eos_Platform_Create(const void* options);
+void TRT_GUEST_ABI eos_Platform_Release(void* handle);
+void TRT_GUEST_ABI eos_Platform_Tick(void* handle);
+int TRT_GUEST_ABI eos_Platform_CheckForLauncherAndRestart(void* handle);
+void* TRT_GUEST_ABI eos_Platform_GetAuthInterface(void* handle);
+void* TRT_GUEST_ABI eos_Platform_GetAntiCheatClientInterface(void* handle);
+void TRT_GUEST_ABI eos_Auth_Login(void* handle, const void* opts, void* client_data, void* cb);
+void TRT_GUEST_ABI galaxy_Init(const void* opts);
+void TRT_GUEST_ABI galaxy_Shutdown(void);
+int TRT_GUEST_ABI galaxy_IsSignedIn(void);
 
 struct BinkHeader {
   unsigned int Width;
@@ -126,6 +144,72 @@ int main() {
 
   unsigned play_id3 = wwise_AK_SoundEngine_PostEventID(hash1, 1, 0, nullptr, nullptr);
   CHECK(play_id3 != 0, "PostEventID returns valid non-zero playing ID");
+
+  // Real binary Wwise .bnk (BKHD + DIDX + DATA + HIRC) -> PCM submission test
+  {
+    static int wwise_cap_calls = 0;
+    static u32 wwise_cap_bytes = 0, wwise_cap_rate = 0, wwise_cap_ch = 0;
+    trt_audio_set_voice_hook(
+        [](u64, const void*, u32 bytes, u32 rate, u32 ch, u32, u32, float, void*) -> int {
+          ++wwise_cap_calls;
+          wwise_cap_bytes = bytes;
+          wwise_cap_rate = rate;
+          wwise_cap_ch = ch;
+          return 0;
+        },
+        nullptr);
+
+    // Build a 16-bit mono WAV payload (128 frames @ 44100 Hz)
+    u8 wav[44 + 256] = {};
+    memcpy(wav, "RIFF", 4);
+    u32 rsz = 36 + 256; memcpy(wav + 4, &rsz, 4);
+    memcpy(wav + 8, "WAVEfmt ", 8);
+    u32 fsz = 16; memcpy(wav + 16, &fsz, 4);
+    u16 tag = 1, ch = 1, align = 2, bits = 16;
+    u32 rate = 44100, br = 88200;
+    memcpy(wav + 20, &tag, 2); memcpy(wav + 22, &ch, 2);
+    memcpy(wav + 24, &rate, 4); memcpy(wav + 28, &br, 4);
+    memcpy(wav + 32, &align, 2); memcpy(wav + 34, &bits, 2);
+    memcpy(wav + 36, "data", 4);
+    u32 dsz = 256; memcpy(wav + 40, &dsz, 4);
+    for (int i = 0; i < 128; ++i) {
+      short s = (short)(i * 120);
+      memcpy(wav + 44 + i * 2, &s, 2);
+    }
+
+    // Build .bnk: BKHD + DIDX(media=9001) + DATA(wav) + HIRC(Sound 7001->9001, Action 8001->Play 7001, Event hash("Play_WwiseTest")->[8001])
+    u8 bnk[1024] = {};
+    size_t bp = 0;
+    auto push4 = [&](const char* s) { memcpy(bnk + bp, s, 4); bp += 4; };
+    auto push_u32 = [&](u32 v) { memcpy(bnk + bp, &v, 4); bp += 4; };
+    auto push_u8 = [&](u8 v) { bnk[bp++] = v; };
+
+    push4("BKHD"); push_u32(8); push_u32(134); push_u32(4242);
+    push4("DIDX"); push_u32(12); push_u32(9001); push_u32(0); push_u32(sizeof(wav));
+    push4("DATA"); push_u32(sizeof(wav)); memcpy(bnk + bp, wav, sizeof(wav)); bp += sizeof(wav);
+
+    // HIRC chunk: 3 objects
+    // Obj 1 (Sound, type=2): obj_sz = 4(id) + 9(body) = 13
+    // Obj 2 (Action, type=3): obj_sz = 4(id) + 6(body) = 10
+    // Obj 3 (Event, type=4): obj_sz = 4(id) + 5(u8 count=1 + u32 action_id) = 9
+    const u32 hirc_sz = 4 + (5 + 13) + (5 + 10) + (5 + 9);
+    const u32 ev_id = wwise_AK_SoundEngine_GetIDFromString("Play_WwiseTest");
+    push4("HIRC"); push_u32(hirc_sz); push_u32(3);
+    push_u8(2); push_u32(13); push_u32(7001); push_u32(0x00010001u); push_u8(0); push_u32(9001);
+    push_u8(3); push_u32(10); push_u32(8001); push_u8(2); push_u8(4 /*Play*/); push_u32(7001);
+    push_u8(4); push_u32(9); push_u32(ev_id); push_u8(1); push_u32(8001);
+
+    u32 loaded_bid = 0;
+    CHECK(wwise_AK_SoundEngine_LoadBankMemoryView(bnk, (u32)bp, &loaded_bid) == 0 && loaded_bid == 4242,
+          "Wwise LoadBankMemoryView parses BKHD/DIDX/DATA/HIRC");
+    CHECK(wwise_AK_SoundEngine_PostEvent("Play_WwiseTest", 10, 0, nullptr, nullptr) != 0,
+          "Wwise PostEvent resolves HIRC Event->Action->Sound->Media");
+    CHECK(wwise_AK_SoundEngine_RenderAudio(1) == 0, "Wwise RenderAudio flushes voices");
+    CHECK(wwise_cap_calls == 1 && wwise_cap_bytes == 256 && wwise_cap_rate == 44100 && wwise_cap_ch == 1,
+          "Wwise decoded embedded .wem WAV and submitted PCM to host mixer");
+    trt_audio_set_voice_hook(nullptr, nullptr);
+  }
+
   CHECK(wwise_AK_SoundEngine_Term() == 0, "wwise Term succeeds");
 
   // 2. Bink Video tests
@@ -286,6 +370,41 @@ int main() {
   trt_D3DPERF_SetOptions(1);
   CHECK(trt_D3DPERF_QueryRepeatFrame() == 0, "D3DPERF_QueryRepeatFrame returns 0");
   CHECK(trt_D3DPERF_GetStatus(nullptr) == 0, "D3DPERF_GetStatus returns 0");
+
+  // 7. Epic Online Services (EOS) & GOG Galaxy (honest offline-safe)
+  printf("-- Epic Online Services & GOG Galaxy\n");
+  CHECK(trt_bridge_register_eos() == 0, "trt_bridge_register_eos succeeds");
+  CHECK(eos_Initialize(nullptr) == 0, "EOS_Initialize succeeds");
+  CHECK(eos_GetVersion() != nullptr && strstr(eos_GetVersion(), "tiramisu") != nullptr,
+        "EOS_GetVersion reports version string");
+  void* eos_plat = eos_Platform_Create(nullptr);
+  CHECK(eos_plat != nullptr, "EOS_Platform_Create returns handle");
+  CHECK(eos_Platform_CheckForLauncherAndRestart(eos_plat) == 24 /*EOS_NoChange*/,
+        "EOS_Platform_CheckForLauncherAndRestart returns EOS_NoChange (does not exit game)");
+  void* eos_auth = eos_Platform_GetAuthInterface(eos_plat);
+  CHECK(eos_auth != nullptr, "EOS_Platform_GetAuthInterface returns handle");
+  CHECK(eos_Platform_GetAntiCheatClientInterface(eos_plat) == nullptr,
+        "EOS_Platform_GetAntiCheatClientInterface honestly returns NULL (no AC bypass)");
+  {
+    static int eos_cb_res = -1;
+    static void* eos_cb_cd = nullptr;
+    struct cb_info { int res; int pad; void* cd; };
+    auto cb = +[](const void* p) TRT_GUEST_ABI {
+      const auto* ci = static_cast<const cb_info*>(p);
+      eos_cb_res = ci->res;
+      eos_cb_cd = ci->cd;
+    };
+    int marker = 77;
+    eos_Auth_Login(eos_auth, nullptr, &marker, (void*)cb);
+    eos_Platform_Tick(eos_plat);
+    CHECK(eos_cb_res == 1 /*EOS_NoConnection*/ && eos_cb_cd == &marker,
+          "EOS_Auth_Login + Tick delivers honest EOS_NoConnection callback");
+  }
+  eos_Platform_Release(eos_plat);
+  CHECK(eos_Shutdown() == 0, "EOS_Shutdown succeeds");
+  galaxy_Init(nullptr);
+  CHECK(galaxy_IsSignedIn() == 0, "GOG Galaxy reports offline (not signed in)");
+  galaxy_Shutdown();
 
   printf("RESULT: ALL PASS\n");
   return 0;

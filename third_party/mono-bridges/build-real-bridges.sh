@@ -49,6 +49,7 @@ if [[ "${1:-}" != "--force" ]] && [[ -f "$out/libfmod-real.so" ]] &&
    [[ -f "$here/gen/gen_steam_failvisible.inc" ]]; then
   stale=0
   for src in src/trt/bridge_fmod.cpp src/trt/bridge_fmod_studio.cpp \
+             src/trt/audio_codecs.cpp src/trt/audio_codecs.h \
              src/trt/trt_trace.cpp src/trt/trt_trace.h \
              src/trt/bridge_fmod_studio.h src/trt/bridge_steam.cpp \
              src/trt/bridge_steam.h src/trt/vendor_stb_vorbis.c \
@@ -82,6 +83,7 @@ objs="$out/objs"
 mkdir -p "$objs"
 $CXX $CXXFLAGS -c src/trt/bridge_fmod.cpp -o "$objs/bridge_fmod.o"
 $CXX $CXXFLAGS -c src/trt/bridge_fmod_studio.cpp -o "$objs/bridge_fmod_studio.o"
+$CXX $CXXFLAGS -c src/trt/audio_codecs.cpp -o "$objs/audio_codecs.o"
 $CXX $CXXFLAGS -c src/trt/trt_trace.cpp -o "$objs/trt_trace.o"
 $CXX $CXXFLAGS -c src/trt/bridge_steam.cpp -o "$objs/bridge_steam.o"
 $CXX $CXXFLAGS -c src/trt/steam_auth.cpp -o "$objs/steam_auth.o"
@@ -98,7 +100,7 @@ $CXX $CXXFLAGS -c third_party/mono-bridges/mono_steam_door.cpp \
 
 # 3. Link.
 $CXX -shared -fPIC -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -Wl,--no-undefined \
-  "$objs/bridge_fmod.o" "$objs/bridge_fmod_studio.o" \
+  "$objs/bridge_fmod.o" "$objs/bridge_fmod_studio.o" "$objs/audio_codecs.o" \
   "$objs/trt_trace.o" \
   "$objs/vendor_stb_vorbis.o" "$objs/vendor_dr_mp3.o" "$objs/mono_dllmap_shim.o" \
   "$objs/mono_fmod_door.o" -lpthread -lm \

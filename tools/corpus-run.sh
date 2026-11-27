@@ -52,7 +52,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie -Ithird_party/mono/usr/include/mono-2.0 \
   src/trt/bridge_wasapi.cpp src/trt/bridge_winrt.cpp src/trt/bridge_ws2.cpp src/trt/bridge_msvcrt.cpp src/trt/bridge_version.cpp src/trt/bridge_prng.cpp src/trt/bridge_console_pack.cpp \
   src/trt/bridge_sys_extras.cpp src/trt/bridge_mf.cpp src/trt/bridge_gameinput.cpp \
   src/trt/bridge_gdiplus.cpp src/trt/bridge_nvapi.cpp src/trt/bridge_res.cpp src/trt/bridge_fmod.cpp src/trt/bridge_wldap32.cpp src/trt/bridge_ktmw32.cpp src/trt/steam_auth.cpp src/trt/steam_library.cpp src/trt/x86_32.cpp src/trt/x86_image.cpp \
-  src/trt/bridge_dstorage.cpp src/trt/bridge_bink.cpp src/trt/bridge_oodle.cpp src/trt/bridge_wwise.cpp src/trt/bridge_criware.cpp src/trt/bridge_miles.cpp \
+  src/trt/bridge_dstorage.cpp src/trt/bridge_eos.cpp src/trt/bridge_bink.cpp src/trt/bridge_oodle.cpp src/trt/bridge_wwise.cpp src/trt/audio_codecs.cpp src/trt/bridge_criware.cpp src/trt/bridge_miles.cpp \
   "$cobj/miniz_tinfl.o" "$cobj/mojo_hlsl.o" "$cobj/vendor_stb_vorbis.o" "$cobj/vendor_dr_mp3.o" \
   -o "$out/test_corpus_run" || exit 1
 

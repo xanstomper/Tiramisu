@@ -14,24 +14,24 @@
 
 namespace {
 
-constexpr i32 S_OK_ = 0;
-constexpr i32 E_POINTER_ = (i32)0x80004003u;
-constexpr i32 E_NOINTERFACE_ = (i32)0x80004002u;
-constexpr i32 E_INVALIDARG_ = (i32)0x80070057u;
-constexpr i32 E_NOTIMPL_ = (i32)0x80004001u;
-constexpr i32 GAMEINPUT_E_READING_NOT_FOUND_ = (i32)0x838A0001u;
+[[maybe_unused]] constexpr i32 S_OK_ = 0;
+[[maybe_unused]] constexpr i32 E_POINTER_ = (i32)0x80004003u;
+[[maybe_unused]] constexpr i32 E_NOINTERFACE_ = (i32)0x80004002u;
+[[maybe_unused]] constexpr i32 E_INVALIDARG_ = (i32)0x80070057u;
+[[maybe_unused]] constexpr i32 E_NOTIMPL_ = (i32)0x80004001u;
+[[maybe_unused]] constexpr i32 GAMEINPUT_E_READING_NOT_FOUND_ = (i32)0x838A0001u;
 
 // GameInputKind enum bits
-constexpr u32 k_kind_unknown = 0x00000000u;
-constexpr u32 k_kind_raw = 0x00000001u;
-constexpr u32 k_kind_controller_axis = 0x00000002u;
-constexpr u32 k_kind_controller_button = 0x00000004u;
-constexpr u32 k_kind_controller_switch = 0x00000008u;
-constexpr u32 k_kind_controller = 0x0000000Eu;
-constexpr u32 k_kind_keyboard = 0x00000010u;
-constexpr u32 k_kind_mouse = 0x00000020u;
-constexpr u32 k_kind_gamepad = 0x00010000u;
-constexpr u32 k_kind_any = 0x0FFFFFFFu;
+[[maybe_unused]] constexpr u32 k_kind_unknown = 0x00000000u;
+[[maybe_unused]] constexpr u32 k_kind_raw = 0x00000001u;
+[[maybe_unused]] constexpr u32 k_kind_controller_axis = 0x00000002u;
+[[maybe_unused]] constexpr u32 k_kind_controller_button = 0x00000004u;
+[[maybe_unused]] constexpr u32 k_kind_controller_switch = 0x00000008u;
+[[maybe_unused]] constexpr u32 k_kind_controller = 0x0000000Eu;
+[[maybe_unused]] constexpr u32 k_kind_keyboard = 0x00000010u;
+[[maybe_unused]] constexpr u32 k_kind_mouse = 0x00000020u;
+[[maybe_unused]] constexpr u32 k_kind_gamepad = 0x00010000u;
+[[maybe_unused]] constexpr u32 k_kind_any = 0x0FFFFFFFu;
 
 u64 monotonic_us() {
   using namespace std::chrono;

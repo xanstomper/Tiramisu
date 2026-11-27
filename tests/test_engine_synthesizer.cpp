@@ -648,13 +648,12 @@ int main() {
     prof.preferred_audio = TRT_AUDIO_WASAPI;
     trt_autonomous_provision_runtime(nullptr, &prof);
 
-    for (const char* module : {"discord_game_sdk.dll", "eossdk-win64-shipping.dll",
-                               "nvngx_dlss.dll", "sentry.dll"}) {
+    for (const char* module : {"discord_game_sdk.dll", "nvngx_dlss.dll", "sentry.dll"}) {
       CHECK(trt_module_route(module) == TRT_ROUTE_MISSING,
             "unimplemented middleware does not preempt a real provider");
     }
 
-    // Verify expanded Oodle, Bink, and Wwise built-in modules
+    // Verify expanded Oodle, Bink, Wwise, EOS, and GOG Galaxy built-in modules
     CHECK(trt_module_route("oo2core_9_win64.dll") == TRT_ROUTE_BUILTIN,
           "oo2core_9_win64.dll is provisioned as BUILTIN");
     CHECK(trt_module_route("oo2core_7_win64.dll") == TRT_ROUTE_BUILTIN,
@@ -663,6 +662,10 @@ int main() {
           "binkw32.dll is provisioned as BUILTIN");
     CHECK(trt_module_route("AkSoundEngineP.dll") == TRT_ROUTE_BUILTIN,
           "AkSoundEngineP.dll is provisioned as BUILTIN");
+    CHECK(trt_module_route("eossdk-win64-shipping.dll") == TRT_ROUTE_BUILTIN,
+          "EOSSDK-Win64-Shipping.dll is provisioned as BUILTIN");
+    CHECK(trt_module_route("Galaxy64.dll") == TRT_ROUTE_BUILTIN,
+          "Galaxy64.dll is provisioned as BUILTIN");
 
     // Test image alias registration
     trt_image fake_img = {};

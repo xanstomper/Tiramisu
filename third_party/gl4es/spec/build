@@ -1,4 +1,5 @@
-#!/usr/bin/env -S bash -ux
+#!/usr/bin/env bash
+set -ux
 cd "$(dirname "$0")"
 
 base=../src/

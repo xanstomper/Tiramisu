@@ -31,6 +31,7 @@
 #include "bridge_miles.h"
 #include "bridge_oodle.h"
 #include "bridge_dstorage.h"
+#include "bridge_eos.h"
 #include "bridge_gameinput.h"
 #include "bridge_xinput.h"
 #include "bridge_hid.h"
@@ -1497,6 +1498,7 @@ int trt_autonomous_provision_runtime(const trt_backend* be, const trt_engine_pro
   trt_bridge_register_hid();
   trt_bridge_register_winrt();
   trt_bridge_register_steam();
+  trt_bridge_register_eos();
   trt_bridge_register_comctl();
   trt_bridge_register_ktmw32();
   trt_bridge_register_wldap32();

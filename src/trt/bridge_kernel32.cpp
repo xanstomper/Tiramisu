@@ -66,6 +66,7 @@ extern "C" int trt_cs_size_for_guest(void);
 #include "bridge_criware.h"
 #include "bridge_miles.h"
 #include "bridge_dstorage.h"
+#include "bridge_eos.h"
 #include "bridge_oodle.h"
 #include "bridge_wininet.h"
 #include "bridge_psapi.h"
@@ -1957,6 +1958,8 @@ void trt_bridge_boot(const trt_backend* be) {
   trt_bridge_register_d3dx();
   // Steamworks: AUTH ONLY (no DRM bypass, ever)
   trt_bridge_register_steam();
+  // Epic Online Services & GOG Galaxy: offline-safe lifecycle (no DRM/AC bypass)
+  trt_bridge_register_eos();
   // comctl32: common-controls acceptance (OrTMM imports ordinal #380)
   trt_bridge_register_comctl();
   // gdi32: the GDI object/state surface (fonts, DC-coupled state)

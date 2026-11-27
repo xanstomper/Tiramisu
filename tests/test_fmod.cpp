@@ -234,6 +234,85 @@ int main(void) {
     }
   }
 
+  // --- real FSB5 FADPCM & PCM16 containers: decoded via audio_codecs ---
+  {
+    // Build a valid 60-byte FSB5 header + 8-byte sample header + 140-byte FADPCM frame (256 samples, mono 44.1kHz)
+    static u8 fsb[60 + 8 + 140];
+    memset(fsb, 0, sizeof(fsb));
+    memcpy(fsb, "FSB5", 4);
+    u32 ver = 1, num_s = 1, shdr_sz = 8, name_sz = 0, data_sz = 140, mode_fadpcm = 14;
+    memcpy(fsb + 4, &ver, 4);
+    memcpy(fsb + 8, &num_s, 4);
+    memcpy(fsb + 12, &shdr_sz, 4);
+    memcpy(fsb + 16, &name_sz, 4);
+    memcpy(fsb + 20, &data_sz, 4);
+    memcpy(fsb + 24, &mode_fadpcm, 4);
+    // sample header: next=0, freq_idx=8 (44100Hz), ch=0 (mono), data_off=0, samples=256
+    u64 sh0 = (8ull << 1) | (256ull << 34);
+    memcpy(fsb + 60, &sh0, 8);
+    // FADPCM block: coefs=0x11111111 (idx 1 -> coef1=60), shifts=0x44444444, hist1=1200, hist2=600, alternating nibbles
+    u8* blk = fsb + 68;
+    u32 coefs = 0x11111111u, shifts = 0x44444444u;
+    short h1 = 1200, h2 = 600;
+    memcpy(blk + 0, &coefs, 4);
+    memcpy(blk + 4, &shifts, 4);
+    memcpy(blk + 8, &h1, 2);
+    memcpy(blk + 10, &h2, 2);
+    for (int i = 12; i < 140; ++i) blk[i] = (u8)((i & 1) ? 0x35 : 0xCA);
+
+    void* fsnd = nullptr;
+    u32 fex[2] = {64, (u32)sizeof(fsb)};
+    CHECK(fmod_System_CreateSound(sys, fsb, 0x800u /*OPENMEMORY*/, fex, &fsnd) == 0 &&
+              fsnd != nullptr,
+          "CreateSound(FSB5 FADPCM memory) -> handle");
+    const u32 pre_fsb = g_cap.count;
+    void* fch = nullptr;
+    CHECK(fmod_System_PlaySound(sys, fsnd, nullptr, 0, &fch) == 0 && fch,
+          "FSB5 FADPCM sound plays a real channel");
+    CHECK(g_cap.count > pre_fsb && g_cap.bytes == 256u * 2u &&
+              g_cap.rate == 44100 && g_cap.channels == 1 && g_cap.bps == 2,
+          "FSB5 FADPCM decoded to real s16 PCM (256 frames, 44.1kHz mono)");
+    fmod_Channel_Stop(fch);
+    fmod_Sound_Release(fsnd);
+
+    // Build a WAV IMA-ADPCM (format 0x0011, 36-byte mono block -> 65 samples)
+    static u8 ima_wav[44 + 36];
+    memset(ima_wav, 0, sizeof(ima_wav));
+    memcpy(ima_wav, "RIFF", 4);
+    u32 rsz = 36 + 36; memcpy(ima_wav + 4, &rsz, 4);
+    memcpy(ima_wav + 8, "WAVEfmt ", 8);
+    u32 fsz = 16; memcpy(ima_wav + 16, &fsz, 4);
+    u16 itag = 0x0011u, ich = 1, iba = 36, ibits = 4;
+    u32 irate = 22050, ibr = 11025;
+    memcpy(ima_wav + 20, &itag, 2);
+    memcpy(ima_wav + 22, &ich, 2);
+    memcpy(ima_wav + 24, &irate, 4);
+    memcpy(ima_wav + 28, &ibr, 4);
+    memcpy(ima_wav + 32, &iba, 2);
+    memcpy(ima_wav + 34, &ibits, 2);
+    memcpy(ima_wav + 36, "data", 4);
+    u32 dsz = 36; memcpy(ima_wav + 40, &dsz, 4);
+    short pred = 1000;
+    memcpy(ima_wav + 44, &pred, 2);
+    ima_wav[46] = 20;  // step index
+    for (int i = 48; i < 80; ++i) ima_wav[i] = 0x29;
+
+    void* isnd = nullptr;
+    u32 iex[2] = {64, (u32)sizeof(ima_wav)};
+    CHECK(fmod_System_CreateSound(sys, ima_wav, 0x800u /*OPENMEMORY*/, iex, &isnd) == 0 &&
+              isnd != nullptr,
+          "CreateSound(WAV IMA-ADPCM memory) -> handle");
+    const u32 pre_ima = g_cap.count;
+    void* ich_h = nullptr;
+    CHECK(fmod_System_PlaySound(sys, isnd, nullptr, 0, &ich_h) == 0 && ich_h,
+          "WAV IMA-ADPCM sound plays a real channel");
+    CHECK(g_cap.count > pre_ima && g_cap.bytes == 65u * 2u &&
+              g_cap.rate == 22050 && g_cap.channels == 1 && g_cap.bps == 2,
+          "WAV IMA-ADPCM decoded to real s16 PCM (65 frames, 22.05kHz mono)");
+    fmod_Channel_Stop(ich_h);
+    fmod_Sound_Release(isnd);
+  }
+
   // --- compressed: named-silent, handle still real ---
   static u8 ogg[8] = {'O', 'g', 'g', 'S', 0, 0, 0, 0};
   void* osnd = nullptr;

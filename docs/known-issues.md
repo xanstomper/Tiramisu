@@ -18,10 +18,14 @@ not a guess. Rows are removed only when verified fixed on-device or in the gate.
   first to fail. Treat the next step as an experiment until on-console proof exists.
   Full hardware/API mapping and the acceptance matrix:
   [docs/xbox-one-family.md](xbox-one-family.md).
-- **Celeste v1.4.0.0 — audio silent.** FSB5 Vorbis decode is disabled on console after
-  it heap-corrupted on a Series S. Gate defaults off (`fsb_decode = false`); per-game
-  override via `tiramisu.profile.ini` (`fsb_decode=1`) is available for testing but
-  unproven on-device. See `src/trt/bridge_fmod_studio.cpp`.
+- **Celeste v1.4.0.0 — audio silent (root cause fixed offline, pending on-device re-proof).**
+  FSB5 Vorbis decode was disabled on console after it corrupted stack/heap memory
+  (`AV in get_decoded`) on Series S. Root cause found and fixed: `stb_vorbis_info`
+  was forward-declared as 20 bytes (missing `int max_frame_size` at +20) in
+  `bridge_fmod_studio.cpp` and `bridge_fmod.cpp`, so `stb_vorbis_get_info()`
+  overflowed 4 bytes (`0x400`/`0x800`) past the stack local via sret into adjacent
+  pointers. Gate still defaults off (`fsb_decode = false`) until a hardware run
+  confirms `fsb_decode=1` cleanly on-device. See `src/trt/bridge_fmod_studio.cpp`.
 - **Factorio — untested on console.** Named target for 60 UPS + audio; not yet run.
   No `proof.json` exists for it.
 - **No per-run `proof.json` for legacy titles.** RACCOIN / Celeste / God of War
@@ -29,11 +33,9 @@ not a guess. Rows are removed only when verified fixed on-device or in the gate.
   structured `docs/proof/<name>/proof.json` format.
 
 ## Recently added (this session)
-- **DirectStorage (dstorage.dll)** — the offline middleware gate verifies an
-  asynchronous uncompressed file-to-memory read. Compressed requests and
-  unsupported destination types return `E_NOTIMPL`. Verify queue shutdown,
-  cancellation, and a real game's streaming requests on Xbox before claiming
-  coverage beyond the offline case.
+- **DirectStorage (dstorage.dll / dstoragecore.dll)** — real COM `IDStorageFactory` / `IDStorageFile` / `IDStorageQueue1` / `IDStorageStatusArray` async background I/O worker (`src/trt/bridge_dstorage.cpp`). The offline middleware gate verifies an asynchronous uncompressed file-to-memory read; unsupported destination types return `E_NOTIMPL`. Verify queue shutdown, cancellation, and a real game's streaming requests on Xbox before claiming coverage beyond the offline case.
+- **Audio codecs & middleware (`src/trt/audio_codecs.cpp`, `bridge_fmod.cpp`, `bridge_fmod_studio.cpp`, `bridge_wwise.cpp`)** — FMOD FADPCM (140-byte 4-bit ADPCM frames), WAV/FSB5/Wwise IMA-ADPCM, FSB5 PCM8/16/24/32/Float/MP3/FADPCM decode, and Wwise `.bnk` (`BKHD`/`DIDX`/`DATA`/`HIRC`) + `.wem` PCM submission to the host mixer are now live and unit-tested.
+- **Epic Online Services & GOG Galaxy (`src/trt/bridge_eos.cpp`)** — honest offline-safe lifecycle (`EOSSDK-Win64/32-Shipping.dll`, `Galaxy64.dll`/`Galaxy.dll`). `GetAntiCheatClientInterface` honestly returns `NULL`; online auth/ecom queries return `EOS_NoConnection`. No DRM or anti-cheat bypass.
 - **Bink 2 video (bink2w64.dll)** — the built-in fallback is a stub (null/false), so games skip video. A game-shipped native Bink DLL is preferred by the loader's native-override path; without it, cutscenes remain unavailable.
 - **Oodle (oo2core_6_win64.dll)** — stubs return -1; games fall back to standard decompression.
 - **Geo/locale (GetGeoInfoW, GetUserGeoID)** — honest stubs returning 0.

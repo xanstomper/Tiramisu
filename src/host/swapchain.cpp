@@ -770,6 +770,224 @@ void measure_surface_pair(ID3D11Texture2D* guest, ID3D11Texture2D* host) {
   }
 }
 
+namespace {
+bool formats_copy_compatible(DXGI_FORMAT a, DXGI_FORMAT b) {
+  if (a == b) return true;
+  auto fam = [](DXGI_FORMAT f) -> int {
+    switch (f) {
+      case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+      case DXGI_FORMAT_R8G8B8A8_UNORM:
+      case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return 1;
+      case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+      case DXGI_FORMAT_B8G8R8A8_UNORM:
+      case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return 2;
+      default:
+        return 0;
+    }
+  };
+  const int fa = fam(a), fb = fam(b);
+  return fa != 0 && fa == fb;
+}
+
+DXGI_FORMAT srv_format_for(DXGI_FORMAT f) {
+  switch (f) {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+    default: return f;
+  }
+}
+
+struct d3d11_blit_pipe {
+  winrt::com_ptr<ID3D11VertexShader> vs;
+  winrt::com_ptr<ID3D11PixelShader> ps;
+  winrt::com_ptr<ID3D11SamplerState> samp;
+  winrt::com_ptr<ID3D11RasterizerState> rs;
+  winrt::com_ptr<ID3D11BlendState> blend;
+  winrt::com_ptr<ID3D11DepthStencilState> dss;
+  winrt::com_ptr<ID3D11Texture2D> srv_copy;
+  unsigned srv_copy_w = 0, srv_copy_h = 0;
+  DXGI_FORMAT srv_copy_fmt = DXGI_FORMAT_UNKNOWN;
+  bool init_attempted = false;
+  bool ready = false;
+  bool logged = false;
+} g_blit_pipe;
+
+bool ensure_d3d11_blit_pipe() {
+  if (g_blit_pipe.ready) return true;
+  if (g_blit_pipe.init_attempted || !g_device) return false;
+  g_blit_pipe.init_attempted = true;
+
+  static const char* k_blit_ps =
+      "Texture2D srcTex : register(t0);\n"
+      "SamplerState srcSamp : register(s0);\n"
+      "struct VSOut { float4 p : SV_POSITION; float2 uv : UV; };\n"
+      "float4 main(VSOut i) : SV_TARGET { return float4(srcTex.Sample(srcSamp, i.uv).rgb, 1.0); }\n";
+
+  winrt::com_ptr<ID3DBlob> vsb, psb, err;
+  if (FAILED(D3DCompile(k_vs, strlen(k_vs), nullptr, nullptr, nullptr, "main",
+                        "vs_4_0", 0, 0, vsb.put(), err.put()))) return false;
+  if (FAILED(D3DCompile(k_blit_ps, strlen(k_blit_ps), nullptr, nullptr, nullptr, "main",
+                        "ps_4_0", 0, 0, psb.put(), err.put()))) return false;
+  if (FAILED(g_device->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(),
+                                          nullptr, g_blit_pipe.vs.put()))) return false;
+  if (FAILED(g_device->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(),
+                                         nullptr, g_blit_pipe.ps.put()))) return false;
+
+  D3D11_SAMPLER_DESC sd{};
+  sd.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+  sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sd.MaxLOD = D3D11_FLOAT32_MAX;
+  if (FAILED(g_device->CreateSamplerState(&sd, g_blit_pipe.samp.put()))) return false;
+
+  D3D11_RASTERIZER_DESC rd{};
+  rd.FillMode = D3D11_FILL_SOLID;
+  rd.CullMode = D3D11_CULL_NONE;
+  rd.DepthClipEnable = FALSE;
+  if (FAILED(g_device->CreateRasterizerState(&rd, g_blit_pipe.rs.put()))) return false;
+
+  D3D11_BLEND_DESC bd{};
+  bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+  if (FAILED(g_device->CreateBlendState(&bd, g_blit_pipe.blend.put()))) return false;
+
+  D3D11_DEPTH_STENCIL_DESC dsd{};
+  dsd.DepthEnable = FALSE;
+  dsd.StencilEnable = FALSE;
+  if (FAILED(g_device->CreateDepthStencilState(&dsd, g_blit_pipe.dss.put()))) return false;
+
+  g_blit_pipe.ready = true;
+  return true;
+}
+
+bool blit_texture_to_backbuffer(ID3D11Texture2D* src, ID3D11Texture2D* dst) {
+  if (!src || !dst || !g_device || !g_ctx || !ensure_d3d11_blit_pipe()) return false;
+  D3D11_TEXTURE2D_DESC sd{}, dd{};
+  src->GetDesc(&sd);
+  dst->GetDesc(&dd);
+
+  ID3D11Texture2D* sample_tex = src;
+  if (!(sd.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
+    if (!g_blit_pipe.srv_copy || g_blit_pipe.srv_copy_w != sd.Width ||
+        g_blit_pipe.srv_copy_h != sd.Height || g_blit_pipe.srv_copy_fmt != sd.Format) {
+      g_blit_pipe.srv_copy = nullptr;
+      D3D11_TEXTURE2D_DESC cd = sd;
+      cd.MipLevels = 1;
+      cd.ArraySize = 1;
+      cd.Usage = D3D11_USAGE_DEFAULT;
+      cd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+      cd.CPUAccessFlags = 0;
+      cd.MiscFlags = 0;
+      if (FAILED(g_device->CreateTexture2D(&cd, nullptr, g_blit_pipe.srv_copy.put())))
+        return false;
+      g_blit_pipe.srv_copy_w = sd.Width;
+      g_blit_pipe.srv_copy_h = sd.Height;
+      g_blit_pipe.srv_copy_fmt = sd.Format;
+    }
+    g_ctx->CopyResource(g_blit_pipe.srv_copy.get(), src);
+    sample_tex = g_blit_pipe.srv_copy.get();
+  }
+
+  D3D11_SHADER_RESOURCE_VIEW_DESC srvd{};
+  srvd.Format = srv_format_for(sd.Format);
+  srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+  srvd.Texture2D.MipLevels = 1;
+  winrt::com_ptr<ID3D11ShaderResourceView> srv;
+  if (FAILED(g_device->CreateShaderResourceView(sample_tex, &srvd, srv.put())))
+    return false;
+
+  winrt::com_ptr<ID3D11RenderTargetView> rtv;
+  if (FAILED(g_device->CreateRenderTargetView(dst, nullptr, rtv.put())))
+    return false;
+
+  // Save guest D3D11 pipeline state so presentation never mutates guest bindings.
+  ID3D11RenderTargetView* old_rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+  ID3D11DepthStencilView* old_dsv = nullptr;
+  g_ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, old_rtvs, &old_dsv);
+  ID3D11BlendState* old_bs = nullptr;
+  float old_bf[4] = {};
+  UINT old_sm = 0xFFFFFFFFu;
+  g_ctx->OMGetBlendState(&old_bs, old_bf, &old_sm);
+  ID3D11DepthStencilState* old_dss = nullptr;
+  UINT old_sref = 0;
+  g_ctx->OMGetDepthStencilState(&old_dss, &old_sref);
+  ID3D11RasterizerState* old_rs = nullptr;
+  g_ctx->RSGetState(&old_rs);
+  UINT old_vp_cnt = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+  D3D11_VIEWPORT old_vps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+  g_ctx->RSGetViewports(&old_vp_cnt, old_vps);
+  ID3D11VertexShader* old_vs = nullptr;
+  ID3D11PixelShader* old_ps = nullptr;
+  g_ctx->VSGetShader(&old_vs, nullptr, nullptr);
+  g_ctx->PSGetShader(&old_ps, nullptr, nullptr);
+  ID3D11ShaderResourceView* old_srv0 = nullptr;
+  ID3D11SamplerState* old_samp0 = nullptr;
+  g_ctx->PSGetShaderResources(0, 1, &old_srv0);
+  g_ctx->PSGetSamplers(0, 1, &old_samp0);
+  ID3D11InputLayout* old_il = nullptr;
+  g_ctx->IAGetInputLayout(&old_il);
+  D3D11_PRIMITIVE_TOPOLOGY old_topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+  g_ctx->IAGetPrimitiveTopology(&old_topo);
+
+  // Execute fullscreen scaled / format-converting blit.
+  ID3D11RenderTargetView* new_rtv = rtv.get();
+  g_ctx->OMSetRenderTargets(1, &new_rtv, nullptr);
+  const float zero_bf[4] = {0, 0, 0, 0};
+  g_ctx->OMSetBlendState(g_blit_pipe.blend.get(), zero_bf, 0xFFFFFFFFu);
+  g_ctx->OMSetDepthStencilState(g_blit_pipe.dss.get(), 0);
+  g_ctx->RSSetState(g_blit_pipe.rs.get());
+  D3D11_VIEWPORT vp{0.0f, 0.0f, (float)dd.Width, (float)dd.Height, 0.0f, 1.0f};
+  g_ctx->RSSetViewports(1, &vp);
+  g_ctx->IASetInputLayout(nullptr);
+  g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  g_ctx->VSSetShader(g_blit_pipe.vs.get(), nullptr, 0);
+  g_ctx->PSSetShader(g_blit_pipe.ps.get(), nullptr, 0);
+  ID3D11ShaderResourceView* new_srv = srv.get();
+  ID3D11SamplerState* new_samp = g_blit_pipe.samp.get();
+  g_ctx->PSSetShaderResources(0, 1, &new_srv);
+  g_ctx->PSSetSamplers(0, 1, &new_samp);
+  g_ctx->Draw(3, 0);
+
+  // Unbind our SRV and restore guest state cleanly.
+  ID3D11ShaderResourceView* null_srv = nullptr;
+  g_ctx->PSSetShaderResources(0, 1, &null_srv);
+  g_ctx->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, old_rtvs, old_dsv);
+  g_ctx->OMSetBlendState(old_bs, old_bf, old_sm);
+  g_ctx->OMSetDepthStencilState(old_dss, old_sref);
+  g_ctx->RSSetState(old_rs);
+  if (old_vp_cnt > 0) g_ctx->RSSetViewports(old_vp_cnt, old_vps);
+  g_ctx->VSSetShader(old_vs, nullptr, 0);
+  g_ctx->PSSetShader(old_ps, nullptr, 0);
+  g_ctx->PSSetShaderResources(0, 1, &old_srv0);
+  g_ctx->PSSetSamplers(0, 1, &old_samp0);
+  g_ctx->IASetInputLayout(old_il);
+  g_ctx->IASetPrimitiveTopology(old_topo);
+
+  for (auto* r : old_rtvs) if (r) r->Release();
+  if (old_dsv) old_dsv->Release();
+  if (old_bs) old_bs->Release();
+  if (old_dss) old_dss->Release();
+  if (old_rs) old_rs->Release();
+  if (old_vs) old_vs->Release();
+  if (old_ps) old_ps->Release();
+  if (old_srv0) old_srv0->Release();
+  if (old_samp0) old_samp0->Release();
+  if (old_il) old_il->Release();
+
+  if (!g_blit_pipe.logged) {
+    g_blit_pipe.logged = true;
+    char line[192];
+    snprintf(line, sizeof(line),
+             "swapchain: D3D11 present blit fallback active (src %ux%u fmt=%u -> dst %ux%u fmt=%u)",
+             sd.Width, sd.Height, (unsigned)sd.Format, dd.Width, dd.Height, (unsigned)dd.Format);
+    longan::log_line(line);
+  }
+  return true;
+}
+}  // namespace
+
 void TRT_GUEST_ABI prepare_d3d11_present() {
   if (!g_swap || !g_ctx || !g_device) return;
   end_guest_draw_sample();
@@ -783,7 +1001,16 @@ void TRT_GUEST_ABI prepare_d3d11_present() {
                                   g_guest_resolve_format);
         present_source = g_guest_resolved.get();
       }
-      g_ctx->CopyResource(back.get(), present_source);
+      D3D11_TEXTURE2D_DESC sd{}, dd{};
+      present_source->GetDesc(&sd);
+      back->GetDesc(&dd);
+      if (sd.Width == dd.Width && sd.Height == dd.Height &&
+          sd.SampleDesc.Count == dd.SampleDesc.Count &&
+          formats_copy_compatible(sd.Format, dd.Format)) {
+        g_ctx->CopyResource(back.get(), present_source);
+      } else if (!blit_texture_to_backbuffer(present_source, back.get())) {
+        g_ctx->CopyResource(back.get(), present_source);
+      }
     }
     measure_surface_pair(present_source, back.get());
   }
