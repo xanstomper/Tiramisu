@@ -636,7 +636,7 @@ i32 sample_buffer_length(const mf_attr_obj& sample, u32* len) {
   for (void* b : sample.sample_buffers) {
     u32 cur = 0;
     const void** vt = *(const void***)b;
-    const i32 hr = reinterpret_cast<getlen_fn>(vt[5])(b, &cur);
+    const i32 hr = ((getlen_fn)vt[5])(b, &cur);
     if (hr < 0) return hr;
     total += cur;
     if (total > UINT32_MAX) return E_OUTOFMEMORY_;
@@ -652,7 +652,7 @@ i32 sample_copy_buffers(const mf_attr_obj& sample, void* dest, u32 total) {
   const void** dest_vt = *(const void***)dest;
   u8* dest_data = nullptr;
   u32 capacity = 0;
-  i32 hr = reinterpret_cast<lock_fn>(dest_vt[3])(dest, &dest_data, &capacity, nullptr);
+  i32 hr = ((lock_fn)dest_vt[3])(dest, &dest_data, &capacity, nullptr);
   if (hr < 0) return hr;
 
   u32 copied = 0;
@@ -663,7 +663,7 @@ i32 sample_copy_buffers(const mf_attr_obj& sample, void* dest, u32 total) {
     const void** src_vt = *(const void***)src;
     u8* src_data = nullptr;
     u32 length = 0;
-    hr = reinterpret_cast<lock_fn>(src_vt[3])(src, &src_data, nullptr, &length);
+    hr = ((lock_fn)src_vt[3])(src, &src_data, nullptr, &length);
     if (hr < 0) break;
     if (length > capacity - copied) hr = MF_E_BUFFERTOOSMALL_;
     else if (length && (!src_data || !dest_data)) hr = E_POINTER_;
@@ -671,11 +671,11 @@ i32 sample_copy_buffers(const mf_attr_obj& sample, void* dest, u32 total) {
       memmove(dest_data + copied, src_data, length);
       copied += length;
     }
-    const i32 unlocked = reinterpret_cast<unlock_fn>(src_vt[4])(src);
+    const i32 unlocked = ((unlock_fn)src_vt[4])(src);
     if (hr >= 0) hr = unlocked;
   }
-  if (hr >= 0) hr = reinterpret_cast<setlen_fn>(dest_vt[6])(dest, copied);
-  const i32 unlocked = reinterpret_cast<unlock_fn>(dest_vt[4])(dest);
+  if (hr >= 0) hr = ((setlen_fn)dest_vt[6])(dest, copied);
+  const i32 unlocked = ((unlock_fn)dest_vt[4])(dest);
   return hr < 0 ? hr : unlocked;
 }
 
