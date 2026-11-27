@@ -1,0 +1,67 @@
+{
+  "date": "2026-11-27",
+  "console": "Xbox Series S",
+  "entry_point": "Play",
+  "verification": {
+    "offline_gate": "passed with Celeste execution disabled",
+    "load_only_pe_corpus_ok": 123,
+    "uwp_build": "passed",
+    "package_install": "passed"
+  },
+  "source_commit": "9feaa2a7b21df51ed9b30db17689a29c9f438c29",
+  "package_version": "0.2.4.62",
+  "package_sha256": "91a49b9a73c5303ebc18649356b232d80791af8dc94222c4a9000ce97d8e939e",
+  "cuphead": {
+    "render_sample_at_105_seconds": {
+      "d3d11_successful_presents": 4599,
+      "max_passing_samples": 2786232,
+      "coverage_samples": 32,
+      "d3d11_width": 320,
+      "d3d11_height": 240,
+      "shader_input_slot": 1,
+      "shader_input_format": 77,
+      "shader_input_bc3_samples": 31,
+      "shader_input_bc3_nontransparent_lit_peak": 256,
+      "guest_lit_pixels": 0,
+      "host_lit_pixels": 0,
+      "surface_other_lit_pixels": 0
+    },
+    "bound_pixel_shader_views_at_105_seconds": [
+      {
+        "dimension": 0,
+        "format": 0,
+        "width": 0,
+        "height": 0
+      },
+      {
+        "dimension": 4,
+        "format": 77,
+        "width": 1024,
+        "height": 512
+      },
+      {
+        "dimension": 4,
+        "format": 28,
+        "width": 4,
+        "height": 4
+      },
+      {
+        "dimension": 0,
+        "format": 0,
+        "width": 0,
+        "height": 0
+      }
+    ],
+    "screen_lit_pixels_out_of_129600": {
+      "38": 0,
+      "75": 0,
+      "105": 0,
+      "confirm-z": 0,
+      "confirm-enter": 0,
+      "down": 0
+    },
+    "visible_menu": false,
+    "visible_game_response": false,
+    "gameplay_verified": false
+  }
+}
