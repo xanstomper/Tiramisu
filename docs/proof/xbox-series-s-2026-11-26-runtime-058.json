@@ -1,0 +1,49 @@
+{
+  "date": "2026-11-26",
+  "console": "Xbox Series S",
+  "source_commit": "34b37519f0b6853e804bf46a2c3785f3984c279f",
+  "package_version": "0.2.4.58",
+  "package_sha256": "b9be00023500a399820611d24f5afc26f5cbe35b768a75b5318d09c6e49eb170",
+  "entry_point": "Play",
+  "verification": {
+    "offline_gate": "72 checks passed with Celeste execution disabled",
+    "load_only_pe_corpus_ok": 123,
+    "uwp_build": "passed",
+    "package_install": "passed"
+  },
+  "cuphead": {
+    "render_sample_at_55_seconds": {
+      "d3d11_device_calls": 1,
+      "d3d11_swapchains": 1,
+      "d3d11_successful_presents": 1616,
+      "d3d11_width": 320,
+      "d3d11_height": 240,
+      "surface_samples": 14,
+      "guest_lit_pixels": 0,
+      "host_lit_pixels": 0,
+      "draw_probe_nonempty_samples": 14,
+      "surface_guest_rtv_samples": 0,
+      "surface_other_rtv_samples": 14,
+      "surface_other_lit_pixels": 0,
+      "shader_input_samples": 12,
+      "shader_input_lit_pixels": 16
+    },
+    "black_screen_captures": 5,
+    "visible_menu": false,
+    "visible_game_response": false
+  },
+  "sekiro": {
+    "last_checkpoint_phase": "native entry",
+    "checkpoint_after_reopen": {
+      "available": true,
+      "phase": 4,
+      "outcome": 1,
+      "code": 0
+    },
+    "saved_worker_fault_available": false,
+    "last_live_api_call_count": 522,
+    "d3d11_initialization_observed": false,
+    "first_scheduled_dashboard_unavailable_check_seconds": 6,
+    "visible_menu": false
+  }
+}

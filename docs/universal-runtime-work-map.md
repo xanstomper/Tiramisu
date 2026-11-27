@@ -26,11 +26,13 @@ actual UWP imports, and console driver capabilities before integration.
 Use Cuphead to measure the first game frame across shader inputs, viewport and
 output merger, intermediate targets, resolve or copy, guest backbuffer, host
 backbuffer, and Present. Capture actual readback and a TV frame. Build
-0.2.4.57 reported 1,699 successful Presents with black guest and host
-backbuffers at 1920×1080. Capture the render target, depth and blend state
-and viewport for draws writing the claimed final output. Use those samples
-to identify the first pass whose output diverges from the Windows reference.
-[Series S replay](proof/xbox-series-s-2026-11-26-runtime-057.json)
+0.2.4.58 reported 1,616 successful Presents with black guest and host
+backbuffers. Every sampled Present retained an intermediate render target.
+Record the target, depth and blend state, and viewport where the draw is
+issued. Track later copies and resolves by source and destination to find
+the last operation that wrote the guest backbuffer. Compare that pass and
+its inputs with the Windows reference.
+[Series S replay](proof/xbox-series-s-2026-11-26-runtime-058.json)
 
 Ship format, sample count,
 lifetime, and resize behavior with deterministic DXGI/D3D11 conformance cases.
