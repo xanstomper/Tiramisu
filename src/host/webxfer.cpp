@@ -2298,6 +2298,15 @@ void handle_client(sock_t s) {
              static_cast<unsigned long long>(trt_mem_budget_committed() / 1048576ULL),
              trt_mem_budget_get_mb());
     std::string body(buf);
+    const auto bindings = swapchain_guest_target_bindings();
+    char target_stats[384];
+    snprintf(target_stats, sizeof(target_stats),
+             ",\"surface_tagged_buffers\":%u,\"surface_buffer_tag_failures\":%u,"
+             "\"surface_bound_active\":%u,\"surface_bound_retired\":%u,\"surface_bound_untagged\":%u,"
+             "\"surface_rgb_writes_disabled\":%u,\"surface_sample_mask_zero\":%u",
+             bindings.tagged, bindings.tag_failures, bindings.active, bindings.retired,
+             bindings.untagged, bindings.rgb_writes_disabled, bindings.sample_mask_zero);
+    body += target_stats;
     body += ",\"shader_input_views\":[";
     const auto views = swapchain_guest_shader_views();
     for (size_t i = 0; i < views.size(); ++i) {

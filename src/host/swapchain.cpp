@@ -44,6 +44,15 @@ winrt::com_ptr<IDXGISwapChain1> g_swap;
 winrt::com_ptr<IDXGISwapChain3> g_swap3;
 winrt::com_ptr<ID3D11RenderTargetView> g_rtv;
 winrt::com_ptr<ID3D11Texture2D> g_guest_backbuffer, g_guest_resolved;
+// A resource-owned serial survives while any guest view references the texture.
+// It distinguishes an old virtual backbuffer from an ordinary offscreen target.
+constexpr GUID kGuestBufferSerial{0x77349d26, 0x7fc0, 0x4acb,
+                                  {0x90, 0x42, 0x73, 0x38, 0xab, 0x22, 0x63, 0xc5}};
+uint64_t g_next_buffer_serial = 0;
+std::atomic<uint64_t> g_active_buffer_serial{0};
+std::atomic<unsigned> g_tagged_buffers{0}, g_buffer_tag_failures{0};
+std::atomic<unsigned> g_bound_active{0}, g_bound_retired{0}, g_bound_untagged{0};
+std::atomic<unsigned> g_rgb_writes_disabled{0}, g_sample_mask_zero{0};
 DXGI_FORMAT g_guest_resolve_format = DXGI_FORMAT_UNKNOWN;
 winrt::com_ptr<ID3D11Query> g_guest_draw_query;
 winrt::com_ptr<ID3D11Query> g_coverage_query;
@@ -339,6 +348,7 @@ HRESULT resize_d3d11_backbuffers(u32 width, u32 height, u32 format) {
 }
 
 void release_guest_backbuffer() {
+  g_active_buffer_serial = 0;
   if (g_guest_backbuffer && trt_esram_is_active()) {
     D3D11_TEXTURE2D_DESC desc{};
     g_guest_backbuffer->GetDesc(&desc);
@@ -410,6 +420,13 @@ int TRT_GUEST_ABI configure_d3d11_swapchain(u32 width, u32 height, u32 format,
   release_guest_backbuffer();
   if (trt_esram_is_active()) {
     trt_esram_qualify_and_alloc(texture.Width, texture.Height, texture.Format, texture.BindFlags, "CoreWindow_backbuffer");
+  }
+  const uint64_t serial = ++g_next_buffer_serial;
+  if (SUCCEEDED(target->SetPrivateData(kGuestBufferSerial, sizeof(serial), &serial))) {
+    g_active_buffer_serial = serial;
+    g_tagged_buffers.fetch_add(1);
+  } else {
+    g_buffer_tag_failures.fetch_add(1);
   }
   g_guest_backbuffer = std::move(target);
   g_guest_resolved = std::move(resolved);
@@ -696,6 +713,31 @@ void sample_guest_shader_input() {
   g_shader_views = views;
 }
 
+void sample_target_binding(ID3D11Resource* resource) {
+  if (!resource) return;
+  uint64_t serial = 0;
+  UINT size = sizeof(serial);
+  if (SUCCEEDED(resource->GetPrivateData(kGuestBufferSerial, &size, &serial)) &&
+      size == sizeof(serial) && serial) {
+    if (serial == g_active_buffer_serial) g_bound_active.fetch_add(1);
+    else g_bound_retired.fetch_add(1);
+  } else {
+    g_bound_untagged.fetch_add(1);
+  }
+
+  winrt::com_ptr<ID3D11BlendState> blend;
+  UINT mask = 0;
+  g_ctx->OMGetBlendState(blend.put(), nullptr, &mask);
+  if (!mask) g_sample_mask_zero.fetch_add(1);
+  if (blend) {
+    D3D11_BLEND_DESC desc{};
+    blend->GetDesc(&desc);
+    constexpr UINT rgb = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN |
+                         D3D11_COLOR_WRITE_ENABLE_BLUE;
+    if (!(desc.RenderTarget[0].RenderTargetWriteMask & rgb)) g_rgb_writes_disabled.fetch_add(1);
+  }
+}
+
 void measure_surface_pair(ID3D11Texture2D* guest, ID3D11Texture2D* host) {
   if (g_shader_input_surface.pending) {
     const HRESULT hr = poll_surface_sample(g_shader_input_surface);
@@ -760,6 +802,7 @@ void measure_surface_pair(ID3D11Texture2D* guest, ID3D11Texture2D* host) {
   if (view) {
     winrt::com_ptr<ID3D11Resource> resource;
     view->GetResource(resource.put());
+    sample_target_binding(resource.get());
     auto* target = g_guest_backbuffer ? g_guest_backbuffer.get() : guest;
     if (resource.get() == static_cast<ID3D11Resource*>(target)) {
       g_surface_guest_rtv.fetch_add(1);
@@ -1153,6 +1196,13 @@ void swapchain_reset_guest_draw_probe() {
   g_surface_other_rtv.store(0);
   g_other_surface_samples.store(0);
   g_other_lit_pixels.store(0);
+  g_tagged_buffers.store(0);
+  g_buffer_tag_failures.store(0);
+  g_bound_active.store(0);
+  g_bound_retired.store(0);
+  g_bound_untagged.store(0);
+  g_rgb_writes_disabled.store(0);
+  g_sample_mask_zero.store(0);
   g_other_width.store(0);
   g_other_height.store(0);
   g_other_format.store(0);
@@ -1174,6 +1224,12 @@ void swapchain_reset_guest_draw_probe() {
   g_shader_input_format.store(0);
   g_shader_input_result.store(0);
   g_surface_probe_interval = 0;
+}
+
+guest_target_binding_stats swapchain_guest_target_bindings() {
+  return {g_tagged_buffers.load(), g_buffer_tag_failures.load(), g_bound_active.load(),
+          g_bound_retired.load(), g_bound_untagged.load(), g_rgb_writes_disabled.load(),
+          g_sample_mask_zero.load()};
 }
 
 guest_shader_views swapchain_guest_shader_views() {

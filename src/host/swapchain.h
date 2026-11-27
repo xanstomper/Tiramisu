@@ -51,6 +51,11 @@ struct guest_draw_probe {
   unsigned long long max_passing_samples;
   int coverage_result;
 };
+struct guest_target_binding_stats {
+  unsigned tagged, tag_failures, active, retired, untagged;
+  unsigned rgb_writes_disabled, sample_mask_zero;
+};
+guest_target_binding_stats swapchain_guest_target_bindings();
 struct guest_shader_view {
   unsigned dimension, format, width, height;
 };
