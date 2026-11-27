@@ -1,0 +1,93 @@
+{
+  "date": "2026-11-27",
+  "console": "Xbox Series S",
+  "entry_point": "Play",
+  "package_version": "0.2.4.63",
+  "package_sha256": "87595ed7c219c6c3560f2994f5309e6359fdfdf02340226093bd014b07ba131f",
+  "diagnostics_public_commit": "1914221",
+  "verification": {
+    "offline_gate": "passed",
+    "uwp_build": "passed",
+    "package_build": "passed",
+    "on_console_run": "completed"
+  },
+  "cuphead": {
+    "samples": [
+      {
+        "seconds": 18,
+        "d3d11_width": 320,
+        "d3d11_height": 240,
+        "d3d11_successful_presents": 6,
+        "guest_lit_pixels": 0,
+        "host_lit_pixels": 0,
+        "surface_tagged_buffers": 2,
+        "surface_buffer_tag_failures": 0,
+        "surface_bound_active": 0,
+        "surface_bound_retired": 0,
+        "surface_bound_untagged": 1,
+        "surface_rgb_writes_disabled": 0,
+        "surface_sample_mask_zero": 0,
+        "capture_lit_pixels": 0,
+        "capture_pixels": 129600
+      },
+      {
+        "seconds": 38,
+        "d3d11_width": 320,
+        "d3d11_height": 240,
+        "d3d11_successful_presents": 712,
+        "guest_lit_pixels": 0,
+        "host_lit_pixels": 0,
+        "surface_tagged_buffers": 2,
+        "surface_buffer_tag_failures": 0,
+        "surface_bound_active": 0,
+        "surface_bound_retired": 0,
+        "surface_bound_untagged": 6,
+        "surface_rgb_writes_disabled": 0,
+        "surface_sample_mask_zero": 0,
+        "capture_lit_pixels": 0,
+        "capture_pixels": 129600
+      },
+      {
+        "seconds": 75,
+        "d3d11_width": 320,
+        "d3d11_height": 240,
+        "d3d11_successful_presents": 3029,
+        "guest_lit_pixels": 0,
+        "host_lit_pixels": 0,
+        "surface_tagged_buffers": 2,
+        "surface_buffer_tag_failures": 0,
+        "surface_bound_active": 0,
+        "surface_bound_retired": 0,
+        "surface_bound_untagged": 25,
+        "surface_rgb_writes_disabled": 0,
+        "surface_sample_mask_zero": 0,
+        "capture_lit_pixels": 0,
+        "capture_pixels": 129600
+      },
+      {
+        "seconds": 105,
+        "d3d11_width": 320,
+        "d3d11_height": 240,
+        "d3d11_successful_presents": 4671,
+        "guest_lit_pixels": 0,
+        "host_lit_pixels": 0,
+        "surface_tagged_buffers": 2,
+        "surface_buffer_tag_failures": 0,
+        "surface_bound_active": 0,
+        "surface_bound_retired": 0,
+        "surface_bound_untagged": 32,
+        "surface_rgb_writes_disabled": 0,
+        "surface_sample_mask_zero": 0,
+        "capture_lit_pixels": 0,
+        "capture_pixels": 129600
+      }
+    ],
+    "capture_method": "Device Portal images resized to 480x270. A pixel counts as lit when an RGB channel exceeds 25.",
+    "input_trial_lit_pixels": {
+      "confirm-z": 0,
+      "confirm-enter": 0,
+      "down": 0
+    },
+    "outcome": "Captured frames and sampled guest and host surfaces stayed black. At 105 seconds all 32 sampled target bindings were untagged. The samples showed zero retired bindings, zero disabled RGB write masks, and zero sample masks recorded as zero. Menu and gameplay remain unreached."
+  }
+}
