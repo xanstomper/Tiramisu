@@ -3116,9 +3116,8 @@ static void* load_library_impl(const u16* path, u32 flags) {
     err_ref_for_current_thread() = 126;  // ERROR_MOD_NOT_FOUND
     return nullptr;
   }
-  // already loaded? Windows returns the same handle
+  // The resolved path identifies this file. Bare-name lookup ran above.
   const char* base = path_basename(host);
-  if (trt_image* img = trt_images_find(base)) return trt_images_handle(img);
 
   // LOAD_LIBRARY_AS_DATAFILE (0x2), LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE (0x20),
   // DONT_RESOLVE_DLL_REFERENCES (0x1): map sections without executing DllMain.

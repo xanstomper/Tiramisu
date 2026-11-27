@@ -22,11 +22,13 @@ the title and device, using the gates below.
 2. Read the current title matrix, known issues, support roadmap, and
    [universal runtime work map](docs/universal-runtime-work-map.md). Verify
    assumptions against the current Play path and the latest device evidence.
-3. Reproduce the first failing stage in an authorized title. Keep Cuphead and
-   Sekiro as the active Series S repros. Cuphead reaches D3D11 and presents
-   black frames with a single-sample swap chain on 0.2.4.55. Sekiro reaches native entry and exits before any
-   observed graphics initialization. Investigate the shared mechanisms behind
-   those findings. Follow the user's current title and console test scope.
+3. Reproduce the first failing stage in an authorized title. The 0.2.4.57
+   Series S replay reached 1,699 successful D3D11 Presents for Cuphead at
+   1920×1080 and read black frames. Sekiro reached native entry before the
+   dashboard became unreachable, with zero observed D3D11 device calls.
+   Investigate the shared mechanisms behind those findings. Follow the user's
+   current title and console test scope.
+   [Series S replay](docs/proof/xbox-series-s-2026-11-26-runtime-057.json)
 4. Write a focused failing regression, implement the shared contract, run the
    relevant offline and UWP gates, and repeat through Play. Continue into the
    next confirmed blocker after a green build. Preserve a verified fallback
@@ -34,6 +36,23 @@ the title and device, using the gates below.
 5. Save code, the measured before and after, and a small reproducible launch
    report. Record the first failing operation and its status, the remaining
    unverified stages, and what evidence would distinguish the next causes.
+
+## Xbox compatibility targets
+
+Use documented Win32 behavior and conformance fixtures as the baseline for
+the guest runtime. Use the actual Xbox hardware profile as the baseline for
+presentation, device input, audio and memory. Study upstream behavior in its
+loader tests and component manifests before selecting a provider.
+[Wine loader](https://github.com/wine-mirror/wine/blob/master/dlls/ntdll/loader.c)
+[Proton component pins](https://github.com/ValveSoftware/Proton/blob/proton_10.0/.gitmodules)
+[Xbox UWP resource limits](https://learn.microsoft.com/en-us/previous-versions/windows/uwp/xbox-apps/system-resource-allocation)
+
+Compare releases on the same game builds, console model and settings. Track the
+share of authorized installs that reach a visible menu and accept a controller
+action, cold and warm time to menu, peak memory, controller reconnect, and clean
+exit followed by relaunch. Record pass, fail and untested counts for each
+architecture, engine, graphics API and console model. Use these measurements to
+evaluate improvements to the Xbox experience.
 
 ## The shared Play pipeline
 

@@ -222,6 +222,7 @@ mkdir -p "$split_dir/bin" "$split_dir/sub"
 cp "$out/guest_libload.exe" "$split_dir/bin/"
 cp "$out/guestdll.dll" "$split_dir/"
 cp "$out/guestdll.dll" "$split_dir/sub/nested.dll"
+cp "$out/guestdll.dll" "$split_dir/sub/guestdll.dll"
 "$out/test_libload" "$split_dir/bin/guest_libload.exe" "$split_dir/bin" "$split_dir" \
   "$split_dir/sub/nested.dll"
 clang++ -std=c++20 -O2 -Wall -no-pie tests/test_formatmessage_alloc.cpp "$out/libtrt.a" \

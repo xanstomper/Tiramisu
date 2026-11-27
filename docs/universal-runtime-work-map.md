@@ -25,9 +25,14 @@ actual UWP imports, and console driver capabilities before integration.
 
 Use Cuphead to measure the first game frame across shader inputs, viewport and
 output merger, intermediate targets, resolve or copy, guest backbuffer, host
-backbuffer, and Present. Capture actual readback and a TV frame. The 0.2.4.55
-trace shows D3D11, a single-sample swap chain, and black output. Verify draw-time state when the binding at
-Present cannot establish where the draws went. Ship format, sample count,
+backbuffer, and Present. Capture actual readback and a TV frame. Build
+0.2.4.57 reported 1,699 successful Presents with black guest and host
+backbuffers at 1920×1080. Capture the render target, depth and blend state
+and viewport for draws writing the claimed final output. Use those samples
+to identify the first pass whose output diverges from the Windows reference.
+[Series S replay](proof/xbox-series-s-2026-11-26-runtime-057.json)
+
+Ship format, sample count,
 lifetime, and resize behavior with deterministic DXGI/D3D11 conformance cases.
 Retest an independent affected title when authorized. Then validate actual
 D3D9-to-D3D11 rendering and D3D12 command execution across graphics families.
@@ -50,17 +55,35 @@ TLS, DLL initialization, wait and handle lifetimes, exceptions, process exit,
 and cleanup with controlled fixtures. Use Wine's API tests as behavioral
 references and verify applicable results against supported Windows contracts.
 
-A PE64 fixture with a DLL initializer that returns FALSE reproduced a loader
-failure on the 0.2.4.56 runtime. The loader returns a handle and publishes
-the rejected module. Fix this together with rollback of registered unwind
-tables, TLS, and dependent bindings. Cover a second load, circular
-dependencies, and failure followed by a successful retry.
+A PE64 fixture on 0.2.4.56 returned a module handle after its initializer
+rejected the load. Keep this fixture as the process-attach regression.
+The 0.2.4.57 protection-failure fix covers the earlier stage before the
+initializer runs.
 
 Start in [the PE loader](../src/trt/pe_loader.cpp),
 [guest image handling](../src/trt/images.cpp),
 [thread and synchronization](../src/trt/bridge_thread.cpp), and
 [the Play entry point](../src/host/main.cpp).
 [Wine ntdll conformance tests](https://github.com/wine-mirror/wine/tree/master/dlls/ntdll/tests)
+
+### Preserve module identity and complete initialization
+
+Start with two game-shipped DLLs that share a filename under different
+directories. An explicit load must select the resolved file and reuse that
+file for aliases of its path. A bare name reuses the first loaded module.
+Check exported behavior and the module filename returned to the guest.
+Then use the same identity for handles, dependency edges, and attach state.
+Keep the requesting module and search path in the launch report.
+
+Stage the dependency graph, relocate and bind it, and perform process attach
+in dependency order. Track cycles and serialize publication. Keep initializing
+modules accessible to valid reentrant dependencies, and release unwind entries,
+TLS and dependent references on failure. Require `LoadLibrary` to return
+null and set `ERROR_DLL_INIT_FAILED` for a rejected attach. Test a failed attach followed by
+a successful retry and parallel loads of the same file.
+[Windows LoadLibrary](https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-loadlibraryw)
+[Windows DllMain](https://learn.microsoft.com/en-us/windows/win32/dlls/dllmain)
+[Wine module lookup and initialization](https://github.com/wine-mirror/wine/blob/master/dlls/ntdll/loader.c)
 
 ### Make launch decisions reproducible
 

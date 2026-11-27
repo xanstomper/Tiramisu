@@ -34,7 +34,7 @@ namespace {
 
 struct guest_image {
   char name[64];      // "engine.dll"
-  char path[512];     // host path it came from
+  char path[1024];    // exact resolved host path used by the loader
   trt_image* img;
   void* handle;
   bool is_dll;
@@ -90,9 +90,11 @@ bool path_ieq(const char* a, const char* b) {
 }
 
 const char* base_name(const char* path) {
-  const char* slash = strrchr(path, '\\');
-  if (!slash) slash = strrchr(path, '/');
-  return slash ? slash + 1 : path;
+  const char* base = path;
+  for (const char* p = path; *p; ++p) {
+    if (*p == '\\' || *p == '/') base = p + 1;
+  }
+  return base;
 }
 
 u8* read_whole_file(const char* path, size_t* size) {
@@ -528,28 +530,21 @@ const trt_resolver* trt_runtime_export_resolver(void) {
 
 trt_image* trt_load_pe(const char* host_path, const char* guest_name,
                        int run_entry) {
-  if (!g_be || !host_path) return nullptr;
-  // STAGE 7 guard: re-entrant trt_load_pe (the exe's static CRT init or a
-  // DllMain loads a DLL) would run tls callbacks again for the SAME image
-  // object that already ran them — each pass burns a TEB TLS index and the
-  // exe's index slot would end up pointing at the FIRST block while later
-  // callbacks write later blocks. The load is the same file: skip the
-  // callback/entry re-run, return the already-mapped image.
-  const char* req_base = base_name(guest_name ? guest_name : host_path);
-  char req_with_ext[128] = "";
-  if (!has_dot_in_base(req_base) && !ends_with_dot(req_base)) {
-    snprintf(req_with_ext, sizeof(req_with_ext), "%s.dll", req_base);
+  if (!g_be || !host_path || !host_path[0]) return nullptr;
+  if (strlen(host_path) >= sizeof(g_images[0].path)) {
+    trt_core_log("trt: guest module path exceeds the image registry limit");
+    return nullptr;
   }
-  for (int i = 0; i < g_image_count; ++i)
-    if (path_ieq(g_images[i].path, host_path) ||
-        ieq(g_images[i].name, req_base) ||
-        (req_with_ext[0] && ieq(g_images[i].name, req_with_ext))) {
-      char line[320];
-      snprintf(line, sizeof(line), "trt: load_pe %s -> already mapped (slot %d), re-entry guard",
-               g_images[i].name, i);
-      trt_core_log(line);
-      return g_images[i].img;
+
+  // A concrete file has already won resolution. Reuse that file's image
+  // across reentrant calls so its TLS and process attach run once.
+  {
+    std::lock_guard<std::mutex> lock(g_img_mu);
+    for (int i = 0; i < g_image_count; ++i) {
+      if (path_ieq(g_images[i].path, host_path)) return g_images[i].img;
     }
+  }
+  const char* req_base = base_name(guest_name ? guest_name : host_path);
   size_t size = 0;
   u8* file = read_whole_file(host_path, &size);
   if (!file) {

@@ -272,6 +272,25 @@ int main(int argc, char** argv) {
 
   if (argc > 4) {
     trt_vfs_mount("z:", argv[3]);
+    void* original = trt_images_handle(dll);
+    const auto* qualified = (const u16*)u"Z:\\sub\\guestdll.dll";
+    void* alternate = trt_LoadLibraryW(qualified);
+    CHECK(alternate && alternate != original,
+          "a qualified DLL load selects its file despite a loaded duplicate name");
+    CHECK(trt_LoadLibraryW(qualified) == alternate &&
+              trt_LoadLibraryW((const u16*)u"z:/SUB/guestdll") == alternate,
+          "qualified aliases of the same path reuse the mapped module");
+    CHECK(trt_LoadLibraryW((const u16*)u"guestdll.dll") == original,
+          "a bare DLL name still selects the first loaded module");
+    if (alternate) {
+      u16 actual[128] = {};
+      const char16_t expected[] = u"Z:\\sub\\guestdll.dll";
+      const u32 length = trt_GetModuleFileNameW(alternate, actual, 128);
+      CHECK(length == sizeof(expected) / sizeof(expected[0]) - 1 &&
+                memcmp(actual, expected, sizeof(expected)) == 0,
+            "the alternate DLL handle reports its own mounted path");
+    }
+
     trt_image* nested = trt_load_pe(argv[4], "nested.dll", 0);
     CHECK(nested != nullptr, "nested DLL mapped");
     if (nested) {
