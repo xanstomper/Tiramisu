@@ -59,6 +59,11 @@ int main() {
             checkpoint.outcome == launch_outcome::running && checkpoint.code == 0,
         "recover the last phase if the process terminates without a handler");
   CHECK(longan::launch_checkpoint_write(local_state,
+        {launch_phase::native_sealing, launch_outcome::returned, 13}) &&
+            longan::launch_checkpoint_read(local_state, &checkpoint) &&
+            checkpoint.phase == launch_phase::native_sealing && checkpoint.code == 13,
+        "a page protection failure survives in the launch checkpoint");
+  CHECK(longan::launch_checkpoint_write(local_state,
         {launch_phase::native_entry, launch_outcome::host_fault, 0xc0000005u}),
         "replace the running checkpoint with the fault outcome");
   CHECK(longan::launch_checkpoint_read(local_state, &checkpoint) &&

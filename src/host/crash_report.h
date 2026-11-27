@@ -42,7 +42,8 @@ int crash_report_trim(const std::string& local_state, int keep);
 // Bounded, numeric Play checkpoint. This is safe to expose independently
 // of the private crash bundle and can survive a process exit.
 enum class launch_phase : uint32_t { none, preparing, mounted, native_tls,
-                                     native_entry, x86_execution, managed_runtime };
+                                     native_entry, x86_execution, managed_runtime,
+                                     native_mapping, native_sealing };
 enum class launch_outcome : uint32_t { none, running, returned, guest_exit,
                                        guest_fault, host_fault, host_abort, host_exit };
 struct launch_checkpoint {
