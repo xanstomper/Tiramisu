@@ -38,8 +38,8 @@
       "dir": "cuphead",
       "build": "Unity, D3D11",
       "machine": "PE32+ x64",
-      "boots": "guest entry and D3D11 reached on 0.2.4.62",
-      "renders": "**no visible game frame** — colored BC3 input reached the GPU, guest and host buffers black on 0.2.4.62",
+      "boots": "guest entry and D3D11 reached on 0.2.4.63",
+      "renders": "**no visible game frame** — 4,671 successful Presents and 32 sampled untagged target bindings on 0.2.4.63",
       "audio": "not measured",
       "input": "game response unverified",
       "playable": "**no** — menu unreached",
@@ -51,7 +51,8 @@
         "docs/proof/xbox-series-s-2026-11-27-runtime-059.json",
         "docs/proof/xbox-series-s-2026-11-27-runtime-060.json",
         "docs/proof/xbox-series-s-2026-11-27-runtime-061.json",
-        "docs/proof/xbox-series-s-2026-11-27-runtime-062.json"
+        "docs/proof/xbox-series-s-2026-11-27-runtime-062.json",
+        "docs/proof/xbox-series-s-2026-11-27-runtime-063.json"
       ]
     },
     {
