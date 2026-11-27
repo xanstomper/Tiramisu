@@ -5,9 +5,8 @@
 > below is reproducible with the command in its section. Nothing here is from
 > memory.
 >
-> Read `TIRAMISU-MASTER-PROMPT.md` (the contract) first. This file answers one
-> question: **what stands between "a few titles boot" and "any PC game runs"**,
-> ranked by how much of the PC library each wall covers.
+> This roadmap ranks current blockers by the portion of the PC library
+> they affect.
 
 ---
 

@@ -187,5 +187,5 @@ decision block no longer applies.
 5. Add an entry here with the measured depth
 
 ## Testing on Xbox
-Requires Dev Mode credentials (`DP_HOST`, `DP_PASS`). See `TIRAMISU-MASTER-PROMPT.md`
-for the deploy sequence. Games verified offline are Tier A candidates for M0.
+Requires Dev Mode credentials (`DP_HOST`, `DP_PASS`). Follow the
+[Xbox setup guide](docs/BEGINNER-INSTALL.md) for deployment. Games verified offline are Tier A candidates for M0.

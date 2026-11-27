@@ -8,7 +8,7 @@
   transfer paths.
 - Added requester-aware dependency reports, on-demand root DLL loading for
   disc images, PE32 module and TLS work, and expanded Windows API coverage.
-- Integrated AGY's host refactor, FMOD and Wwise codecs, EOS and Galaxy
+- Integrated the host refactor, FMOD and Wwise codecs, EOS and Galaxy
   fallback bridges, PE32 ABI additions, and state-preserving D3D11 blit.
   Added DirectStorage queues and broader rendering, input, and console
   diagnostics.

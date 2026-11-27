@@ -1,7 +1,5 @@
-# GAP-MAP — what is needed to boot real PC games (paste with TIRAMISU-MASTER-PROMPT.md)
+# Tiramisu compatibility gap map
 
-> Companion work order for AGY/Gemini sessions. Read `TIRAMISU-MASTER-PROMPT.md` (the
-> contract) first; this file is the measured map of everything left.
 > Produced 2026-11-14 ~14:15 EST from tool runs on THIS tree + the corpus +
 > donor research (links inline). Nothing here is from memory.
 >
@@ -10,7 +8,7 @@
 
 ---
 
-## 0. How to work (unchanged from the contract)
+## 0. How to verify a compatibility change
 
 - **Measure first** — reproduce with a corpus PE + the depth ladder/audit before
   writing any bridge.

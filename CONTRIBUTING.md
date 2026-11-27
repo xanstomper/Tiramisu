@@ -5,8 +5,9 @@ every doc fix helps. Here's how to contribute effectively.
 
 ## Before you start
 
-1. **Read the contract:** `TIRAMISU-MASTER-PROMPT.md` — the non-negotiable rules
-   (measure first, fail-visible stubs, land with tests, no DRM bypass ever).
+1. **Reproduce the issue.** Record the evidence, expose unsupported features
+   through explicit errors, and include a regression check for compatibility fixes.
+   Respect the game's entitlement and security boundaries.
 2. **Read the gap map:** `GAP-MAP.md` — what's done, what's open, what's blocked.
 3. **Read the evidence:** `docs/03-evidence.md` — what is proven vs. assumed.
 
