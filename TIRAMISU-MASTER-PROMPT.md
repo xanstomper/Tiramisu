@@ -126,18 +126,34 @@ Exercise missing, truncated and case-colliding assets, interrupted updates and
 save persistence. Record relative paths and outcomes in the local diagnosis.
 Publish aggregate results. Preserve the original executables and directory tree.
 
-### Resolve an API through actual execution
+### Match folder and disc-image launches
 
-Select the earliest required operation that fails after a verified mount.
-Trace the requesting image, ABI, imported or dynamically queried symbol, and
-observed failure. Compare the operation with the Windows contract and the
-applicable Wine conformance case. Exercise a minimal guest through the same
-provider selection as Play. Verify output data, errors, ownership and teardown.
-Require pinned provenance and license information before adding a provider.
-Test an unavailable required provider and an optional provider with a working
-fallback. Repeat on an independent game when its launch is authorized.
-[Wine tests and implementations](https://github.com/wine-mirror/wine/tree/master/dlls)
-[Proton component versions](https://github.com/ValveSoftware/Proton/blob/proton_10.0/.gitmodules)
+Run the same synthetic install as a folder and as an ISO9660 or UDF image
+through Play. Give it a nested executable, a sibling DLL, a DLL at the install
+root, and a large archive. Compare the selected executable, working directory,
+guest path resolution, DLL search results, and writable root. Record what is
+materialized before guest entry and what is read on demand. Measure time,
+cache bytes, and peak memory through the first guest archive read. Check
+missing and truncated files, media replacement, and a clean launch from cold
+cache. Use the first difference to select a shared mount or loader fix.
+[PE format](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format)
+[Windows DLL search order](https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-search-order)
+
+### Turn a dependency into a verified API capability
+
+Read the launch profile in startup order and select the first required
+operation that fails after a verified mount. Trace the requesting image,
+ABI, symbol or ordinal, resolved provider, initialization result, and error
+returned to the guest. Include dynamic lookups. Compare the operation with
+the Windows contract and applicable Wine conformance case. Exercise the real
+Play provider selection with minimal guest fixtures for wrong architecture,
+missing and forwarded exports, and optional delay loads. Require a pinned
+version, provenance, and license before adding a provider. Treat a bundled
+candidate as a discovery result. Mark the capability verified after guest
+checks for output, errors, ownership, and teardown pass. Repeat on an
+independent title using the same API when its launch is authorized.
+[LoadLibraryW](https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-loadlibraryw)
+[Wine loader conformance tests](https://github.com/wine-mirror/wine/blob/master/dlls/ntdll/tests/loader.c)
 
 ### Locate the first missing game pixels
 
@@ -147,6 +163,18 @@ resize. Follow sampled shader inputs, bound render targets, copies and resolves
 to the presented surface. Record texture dimensions, formats, sample counts
 and readback results. Compare game pixels before and after input with the TV
 capture. Advance the title matrix only when menu selection or gameplay responds.
+
+### Validate the first playable session within the measured budget
+
+Capture the UWP memory usage and current limit at mount, guest entry, first
+presented game frame, and the transition into gameplay. Sample peak memory and
+record the first failed allocation if one occurs. Repeat from a cold launch
+outside the debugger and label the console model and package version. Test
+menu input, entering gameplay, sustained input, audio, save and reload, and
+clean exit. Record which milestones occurred in the real game. Optimize the
+first measured bottleneck and repeat on another title using the same subsystem.
+[Xbox UWP resource allocation](https://learn.microsoft.com/en-us/previous-versions/windows/uwp/xbox-apps/system-resource-allocation)
+[MemoryManager.AppMemoryUsageLimit](https://learn.microsoft.com/en-us/uwp/api/windows.system.memorymanager.appmemoryusagelimit)
 
 ## Verification and release gates
 
