@@ -23,13 +23,13 @@ constexpr bool pointer_event_recent(uint64_t now, uint64_t event, uint64_t windo
 }
 
 constexpr cursor_owner choose_cursor(cursor_context c) {
-  if (!c.focused || c.loading || (!c.physical_input_seen && !c.virtual_pointer))
-    return cursor_owner::system;
+  if (!c.focused || c.loading) return cursor_owner::system;
   const bool guest = c.guest_running && !c.quick_menu;
   if (guest ? !c.guest_can_draw : !c.launcher_can_draw)
     return cursor_owner::system;
-  if (!guest && c.controller_active && !c.virtual_pointer)
-    return cursor_owner::hidden;
+  if (!c.physical_input_seen && !c.virtual_pointer) {
+    return !guest && c.controller_active ? cursor_owner::hidden : cursor_owner::system;
+  }
   return guest ? cursor_owner::guest : cursor_owner::launcher;
 }
 

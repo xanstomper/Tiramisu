@@ -2329,10 +2329,14 @@ bool prepare_vector_cursor() {
 void draw_vector_cursor() {
   if (!g_cursor_visible || g_ptr_x < 0 || g_ptr_y < 0 || !prepare_vector_cursor()) return;
   const float size = static_cast<float>(cursor_height(g_h)) / 18.f;
+  float dpi_x = 96.f, dpi_y = 96.f;
+  g_ctx->GetDpi(&dpi_x, &dpi_y);
+  const float dip_x = dpi_x > 0.f ? 96.f / dpi_x : 1.f;
+  const float dip_y = dpi_y > 0.f ? 96.f / dpi_y : 1.f;
   D2D1_MATRIX_3X2_F previous;
   g_ctx->GetTransform(&previous);
-  g_ctx->SetTransform(D2D1::Matrix3x2F(size, 0.f, 0.f, size,
-                                      static_cast<float>(g_ptr_x), static_cast<float>(g_ptr_y)));
+  g_ctx->SetTransform(D2D1::Matrix3x2F(size * dip_x, 0.f, 0.f, size * dip_y,
+                                      g_ptr_x * dip_x, g_ptr_y * dip_y));
   g_ctx->FillGeometry(g_cursor_shape, g_br_white);
   g_ctx->DrawGeometry(g_cursor_shape, g_br_ink, 1.15f);
   g_ctx->SetTransform(previous);

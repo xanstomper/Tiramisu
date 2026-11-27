@@ -541,6 +541,9 @@ int main() {
     CHECK(longan::choose_cursor(cursor) == cursor_owner::launcher,
           "opening the quick menu returns cursor ownership to the launcher");
     cursor.controller_active = true;
+    CHECK(longan::choose_cursor(cursor) == cursor_owner::launcher,
+          "controller buttons do not hide a confirmed physical mouse");
+    cursor.physical_input_seen = false;
     CHECK(longan::choose_cursor(cursor) == cursor_owner::hidden,
           "controller-only UI can hide the pointer");
     cursor.virtual_pointer = true;
@@ -568,8 +571,11 @@ int main() {
               route_gamepads(resolve_input_mode("controller", "kbm"), true, false) ==
                   guest_pad_route::disabled,
           "explicit keyboard and mouse modes do not double-report controller input");
-    CHECK(cursor_height(720) == 12 && cursor_height(1080) == 18 && cursor_height(2160) == 32,
+    CHECK(cursor_height(720) == 11 && cursor_height(1080) == 16 && cursor_height(2160) == 32,
           "cursor renderers share compact output-pixel sizes");
+    CHECK(cursor_height(240) == 4 && cursor_height(180) == 3 &&
+              cursor_height(240) * 1080 / 240 == 18,
+          "a low-resolution backbuffer keeps a compact arrow when upscaled");
   }
   {
     struct {

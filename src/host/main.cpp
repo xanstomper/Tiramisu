@@ -173,6 +173,7 @@ std::atomic<bool> g_physical_pointer_seen{false};
 // GetCursorPos fallback yields while this is fresh so the two absolute
 // sources never fight over the same frame.
 std::atomic<ULONGLONG> g_last_core_pointer_ms{0};
+std::atomic<ULONGLONG> g_last_core_button_ms{0};
 // Whether the OS presents a hardware pointer to this package. Xbox withholds
 // mouse input from titles that do not carry the publisher's opt-in, and the
 // shell does not expose a way for an app to request it; the launcher needs to
@@ -402,7 +403,7 @@ inline u16 disambiguate_modifier_vk(u16 vk, u16 scan, bool ext) {
 }
 
 bool relative_pointer_active(ULONGLONG now) {
-  return g_native_input.mouse_active_recent(300) ||
+  return g_native_input.mouse_motion_recent(now, 300) ||
          longan::pointer_event_recent(now, g_last_raw_mouse_ms.load(), 300);
 }
 
@@ -2373,7 +2374,12 @@ struct tiramisu_host
           if (g_native_input.keyboard_active() || g_interceptor_kbd_active.load()) return;
           trt_input_char_event((u32)a.KeyCode());
         });
-    m_pe = window.PointerEntered([](CoreWindow const&, PointerEventArgs const& a) {
+    m_pe = window.PointerEntered([](CoreWindow const& sender, PointerEventArgs const& a) {
+      const auto point = a.CurrentPoint();
+      if (point.PointerDevice().PointerDeviceType() ==
+          winrt::Windows::Devices::Input::PointerDeviceType::Mouse) {
+        feed_core_pointer(sender, point.Position());
+      }
       static bool logged = false;
       if (!logged) {
         logged = true;
@@ -2404,6 +2410,7 @@ struct tiramisu_host
       feed_core_pointer(sender, point.Position());
       const int btn = host_mouse_btn_for_press(point.Properties().PointerUpdateKind());
       if (btn >= 0) {
+        g_last_core_button_ms.store(GetTickCount64());
         static bool logged = false;
         if (!logged) {
           logged = true;
@@ -2417,9 +2424,12 @@ struct tiramisu_host
       const auto point = a.CurrentPoint();
       feed_core_pointer(sender, point.Position());
       const int btn = host_mouse_btn_for_release(point.Properties().PointerUpdateKind());
-      if (btn >= 0 && trt_input_mouse_button(btn, false) && btn == 0) launcher_click();
+      if (btn >= 0) {
+        g_last_core_button_ms.store(GetTickCount64());
+        if (trt_input_mouse_button(btn, false) && btn == 0) launcher_click();
+      }
     });
-    m_pm = window.PointerMoved([](CoreWindow const& sender,
+    m_pm = window.PointerMoved([this](CoreWindow const& sender,
                                   PointerEventArgs const& a) {
       static bool logged = false;
       if (!logged) {
@@ -2428,7 +2438,7 @@ struct tiramisu_host
       }
       const auto point = a.CurrentPoint();
       feed_core_pointer(sender, point.Position());
-      if (g_native_input.mouse_active_recent(300)) return;
+      if (g_native_input.mouse_buttons_recent(GetTickCount64(), 300)) return;
       const auto properties = point.Properties();
       const bool held[5] = {properties.IsLeftButtonPressed(),
                             properties.IsRightButtonPressed(),
@@ -2436,8 +2446,10 @@ struct tiramisu_host
                             properties.IsXButton1Pressed(),
                             properties.IsXButton2Pressed()};
       for (unsigned button = 0; button < 5; ++button) {
-        if (trt_mouse_button(button) != held[button])
-          trt_input_mouse_button(button, held[button]);
+        if (trt_mouse_button(button) == held[button]) continue;
+        g_last_core_button_ms.store(GetTickCount64());
+        if (trt_input_mouse_button(button, held[button]) && button == 0 && !held[button])
+          launcher_click();
       }
       static bool type_logged = false;
       if (!type_logged) {
@@ -2465,9 +2477,14 @@ struct tiramisu_host
       const bool focused = a.WindowActivationState() != CoreWindowActivationState::Deactivated;
       longan::log_line(focused ? "input: CoreWindow activated" : "input: CoreWindow deactivated");
       g_input_focused = focused;
-      if (!focused) {
-        trt_input_release_all();
+      if (focused) {
+        g_native_input.resume_mouse();
+      } else {
         g_native_input.suspend();
+        trt_input_release_all();
+        g_last_core_pointer_ms.store(0);
+        g_last_core_button_ms.store(0);
+        g_last_raw_mouse_ms.store(0);
       }
       if (g_guest_running.load()) {
         trt_msg_post(0x001Cu /*WM_ACTIVATEAPP*/, focused ? 1 : 0, 0);
@@ -3172,7 +3189,7 @@ struct tiramisu_host
       if (m_mouse_device) {
         m_mm = m_mouse_device.MouseMoved(
             [](wdi::MouseDevice const&, wdi::MouseEventArgs const& a) {
-          if (g_native_input.mouse_active_recent(300)) return;
+          if (g_native_input.mouse_motion_recent(GetTickCount64(), 300)) return;
           const auto d = a.MouseDelta();
           if (d.X == 0 && d.Y == 0) return;
           const ULONGLONG now = GetTickCount64();
@@ -3199,11 +3216,11 @@ struct tiramisu_host
     auto active_window = CoreWindow::GetForCurrentThread();
     active_window.Activate();
     CoreCursor system_arrow{nullptr};
-    try {
-      system_arrow = CoreCursor(CoreCursorType::Arrow, 0);
-      active_window.PointerCursor(system_arrow);
-    } catch (...) {}
     bool system_cursor_hidden = false;
+    try {
+      system_cursor_hidden = !active_window.PointerCursor();
+    } catch (...) {}
+    bool last_cursor_focus = g_input_focused;
     ULONGLONG next_cursor_update_ms = 0;
     bool cursor_error_logged = false;
     if (!g_booted) {
@@ -3276,7 +3293,7 @@ struct tiramisu_host
         if (g_input_focused) {
           if (g_native_input.mouse_active_recent(300)) record_physical_pointer(now_input_ms);
           const bool relative_active = relative_pointer_active(now_input_ms);
-          const bool native_buttons = g_native_input.mouse_active_recent(300);
+          const bool native_buttons = g_native_input.mouse_buttons_recent(now_input_ms, 300);
           bool core_pointer_recent = longan::pointer_event_recent(
               now_input_ms, g_last_core_pointer_ms.load(), 500);
           // 1) WinRT CoreWindow::PointerPosition() poll
@@ -3289,8 +3306,7 @@ struct tiramisu_host
                 const float rx = pos.X - bnd.X;
                 const float ry = pos.Y - bnd.Y;
                 if (!relative_active && !core_pointer_recent && last_cw_x > -9000.0f &&
-                    (fabsf(rx - last_cw_x) > (pad_ok ? 3.0f : 0.5f) ||
-                     fabsf(ry - last_cw_y) > (pad_ok ? 3.0f : 0.5f))) {
+                    (fabsf(rx - last_cw_x) > 0.5f || fabsf(ry - last_cw_y) > 0.5f)) {
                   int dw = 1920, dh = 1080;
                   trt_display_size(&dw, &dh);
                   const int cx = std::clamp((int)(rx * dw / bnd.Width), 0, dw - 1);
@@ -3350,7 +3366,8 @@ struct tiramisu_host
                 const bool down = (p_get_aks(k_probe_vk[i]) & 0x8000) != 0;
                 if (down == was_btn[i]) continue;
                 was_btn[i] = down;
-                if (core_pointer_recent || native_buttons) continue;
+                if (native_buttons || longan::pointer_event_recent(
+                      now_input_ms, g_last_core_button_ms.load(), 300)) continue;
                 record_physical_pointer(now_input_ms);
                 const bool transitioned = trt_input_mouse_button(i, down);
                 if (i == 0 && transitioned && !down) launcher_click();
@@ -3420,13 +3437,25 @@ struct tiramisu_host
             virtual_pointer, g_controller_active.load(),
         });
         const bool hide_system = cursor != longan::cursor_owner::system;
-        if (system_arrow && hide_system != system_cursor_hidden &&
+        if (last_cursor_focus != g_input_focused) {
+          last_cursor_focus = g_input_focused;
+          next_cursor_update_ms = 0;
+          try {
+            system_cursor_hidden = !active_window.PointerCursor();
+          } catch (...) {}
+        }
+        if (hide_system != system_cursor_hidden &&
             now_input_ms >= next_cursor_update_ms) {
           try {
+            if (!hide_system && !system_arrow) system_arrow = CoreCursor(CoreCursorType::Arrow, 0);
             active_window.PointerCursor(hide_system ? CoreCursor{nullptr} : system_arrow);
-            system_cursor_hidden = hide_system;
-            longan::log_line(hide_system ? "input: Tiramisu owns the pointer"
-                                        : "input: shell owns the pointer");
+            system_cursor_hidden = !active_window.PointerCursor();
+            if (hide_system == system_cursor_hidden) {
+              longan::log_line(hide_system ? "input: Tiramisu owns the pointer"
+                                          : "input: shell owns the pointer");
+            } else {
+              next_cursor_update_ms = now_input_ms + 2000;
+            }
           } catch (...) {
             next_cursor_update_ms = now_input_ms + 2000;
             if (!cursor_error_logged) {
