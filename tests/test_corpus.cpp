@@ -976,9 +976,10 @@ int run_corpus(int argc, char** argv) {
       printf("COVERAGE SELFTEST FAIL: kernel32!VirtualAlloc must be REAL\n");
       return 1;
     }
+    trt_module_register("test-system.dll", TRT_ROUTE_SYSTEM, nullptr, 0);
     if (classify_import("kernel32.dll", "VirtualAlloc", 0, nullptr, 0) != TRT_IMPL_REAL ||
         classify_import("kernel32.dll", "UnknownCorpFixture", 0, nullptr, 0) == TRT_IMPL_REAL ||
-        classify_import("bcrypt.dll", "BCryptGenRandom", 0, nullptr, 0) !=
+        classify_import("test-system.dll", "TestExport", 0, nullptr, 0) !=
             COVERAGE_SYSTEM_CANDIDATE ||
         classify_import("absent-corpus-fixture.dll", nullptr, 42, nullptr, 0) !=
             TRT_IMPL_UNRESOLVED) {
