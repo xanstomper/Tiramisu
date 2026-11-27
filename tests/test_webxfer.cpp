@@ -258,6 +258,58 @@ int main() {
           ".zip extraction wrote inner exe and blocked ../ zip-slip entry");
   }
 
+  // Device Portal drop folder shares the library and publishes complete ZIPs.
+  {
+    const std::string drop = root + "/" + longan::kPortalGamesFolder;
+    const std::string folder = drop + "/PortalFolder";
+    CHECK(mkdir(folder.c_str(), 0755) == 0,
+          "startup created the Device Portal drop folder");
+    FILE* exe = fopen((folder + "/PortalFolder.exe").c_str(), "wb");
+    if (exe) {
+      fputs("MZ_PORTAL_FOLDER", exe);
+      fclose(exe);
+    }
+    char found_exe[256]{};
+    std::string found_dir;
+    const std::string listed = http_req(port, "GET", "/games", "");
+    CHECK(listed.find("PortalFolder") != std::string::npos &&
+              longan::webxfer_find_game("PortalFolder", found_exe, sizeof(found_exe), &found_dir) &&
+              found_dir == folder,
+          "Device Portal folders are listed and resolved by the dashboard");
+
+    const std::string zip = drop + "/PortalZip.zip";
+    mz_zip_archive writer{};
+    const char* bytes = "MZ_PORTAL_ZIP";
+    const bool created = mz_zip_writer_init_file(&writer, zip.c_str(), 0) &&
+        mz_zip_writer_add_mem(&writer, "PortalZip/PortalZip.exe", bytes, strlen(bytes), 0) &&
+        mz_zip_writer_finalize_archive(&writer);
+    mz_zip_writer_end(&writer);
+    CHECK(created, "created a Device Portal ZIP with a wrapping folder");
+
+    std::string note;
+    const std::string installed = root + "/games/PortalZip/PortalZip.exe";
+    CHECK(longan::webxfer_import_portal_zip(root, "PortalZip.zip", &note) &&
+              read_str_file(installed) == bytes,
+          "Device Portal ZIP is extracted and published with its original bytes");
+    std::string scope = "game";
+    CHECK(longan::webxfer_poll_rescan(&scope) && scope.empty(),
+          "Device Portal ZIP publication queues a full library refresh");
+    CHECK(!longan::webxfer_import_portal_zip(root, "PortalZip.zip", &note) &&
+              read_str_file(installed) == bytes,
+          "a duplicate Portal ZIP leaves the existing game intact");
+
+    FILE* incomplete = fopen((drop + "/Partial.zip").c_str(), "wb");
+    if (incomplete) {
+      fputs("PK\3\4", incomplete);
+      fclose(incomplete);
+    }
+    CHECK(!longan::webxfer_import_portal_zip(root, "Partial.zip", &note) &&
+              !file_exists(root + "/games/Partial") && file_exists(drop + "/Partial.zip"),
+          "an incomplete Portal ZIP stays in place without publishing a game");
+    CHECK(!longan::webxfer_import_portal_zip(root, "../PortalZip.zip", &note),
+          "the Portal importer accepts only a filename in its drop folder");
+  }
+
   // 7. Config persistence + GET /games
   {
     std::string cfg =

@@ -479,6 +479,8 @@ std::vector<tagged_game_root> all_game_roots_tagged() {
     roots.push_back({p, loc, drv, fs});
   };
   add_unique(g_games_dir, "internal", "Local", "");
+  if (!g_local_state_dir.empty())
+    add_unique(g_local_state_dir + XFER_SEP + kPortalGamesFolder, "internal", "Local", "");
   add_unique(g_package_games_dir, "package", "App", "");
   {
     std::lock_guard<std::mutex> network_lock(g_network_root_mu);
@@ -1340,12 +1342,13 @@ std::string games_json() {
       return a.name < b.name;
     });
     for (const auto& d : ents) {
-      if (!d.is_dir || !seen.insert(xfer_lower(d.name)).second) continue;
+      if (!d.is_dir || seen.count(xfer_lower(d.name))) continue;
       const std::string gdir = root.path + sep + d.name;
       std::vector<std::string> exes;
       std::string exe;
       scan_game_exes(gdir, d.name, &exes, &exe);
       if (exe.empty()) continue;
+      seen.insert(xfer_lower(d.name));
       const std::string appid = read_small_text(gdir + sep + "steam_appid.txt");
       const std::string args = read_small_text(gdir + sep + "tiramisu_args.txt");
       std::string input = read_small_text(gdir + sep + "tiramisu_input.txt");
@@ -3255,6 +3258,66 @@ bool webxfer_extract_zip_to_dir(const std::string& zip_path, const std::string& 
   return ok;
 }
 
+bool webxfer_import_portal_zip(const std::string& local_state,
+                               const std::string& filename, std::string* note) {
+  std::string relative, game;
+  if (!sanitize_rel_path(filename, XFER_SEP, &relative) || relative != filename ||
+      relative.find(XFER_SEP) != std::string::npos || relative.size() <= 4 ||
+      xfer_lower(relative.substr(relative.size() - 4)) != ".zip" ||
+      !sanitize_game_name(relative.substr(0, relative.size() - 4), &game)) {
+    *note = "Choose a ZIP with a valid game name";
+    return false;
+  }
+
+  const std::string sep(1, XFER_SEP);
+  const std::string games = local_state + sep + "games";
+  const std::string drop = local_state + sep + kPortalGamesFolder;
+  const std::string dest = games + sep + game;
+  if (dir_exists(dest) || dir_exists(drop + sep + game)) {
+    *note = "A game with that name already exists";
+    return false;
+  }
+
+  // Keep the game's name at the end of the staging path for ZIP unwrapping.
+  const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+  const std::string stage = local_state + sep + "incoming" + sep +
+                            "portal-" + std::to_string(stamp);
+  const std::string source = stage + sep + game;
+  mkdirs(source);
+  std::string exe;
+  bool ok = extract_zip(drop + sep + relative, source, note, true);
+  if (ok) {
+    std::vector<std::string> exes;
+    scan_game_exes(source, game, &exes, &exe);
+    if (exe.empty()) {
+      *note = "No Windows executable found in the game ZIP";
+      ok = false;
+    }
+  }
+  if (ok) {
+    mkdirs(games);
+#ifdef _WIN32
+    ok = MoveFileExA(source.c_str(), dest.c_str(), 0) != 0;
+#else
+    ok = !dir_exists(dest) && rename(source.c_str(), dest.c_str()) == 0;
+#endif
+    if (!ok) *note = "Could not publish the game folder";
+  }
+  remove_tree(stage);
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (ok) {
+      g.last_upload = game + " from Device Portal";
+      g.last_error.clear();
+      g.rescan_game.clear();
+      g.rescan_requested = true;
+    } else {
+      g.last_error = filename + " from Device Portal: " + *note;
+    }
+  }
+  return ok;
+}
+
 bool webxfer_sanitize_game_name(const std::string& raw, std::string* out) {
   return sanitize_game_name(raw, out);
 }
@@ -3326,6 +3389,7 @@ std::string webxfer_start_port(const std::string& local_state, unsigned short po
     g_games_dir = local_state + sep + "games";
     g_incoming = local_state + sep + "incoming";
     mkdirs(g_games_dir);
+    mkdirs(local_state + sep + kPortalGamesFolder);
     mkdirs(g_incoming);
   }
 

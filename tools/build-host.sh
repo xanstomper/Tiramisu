@@ -79,7 +79,7 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   -I third_party/mono/usr/include/mono-2.0 \
   -I third_party/faudio-src/include \
   -I third_party/faudio-src/src \
-  src/host/main.cpp src/host/game_library.cpp src/host/usb_storage.cpp \
+  src/host/main.cpp src/host/game_library.cpp src/host/usb_storage.cpp src/host/portal_drop.cpp \
   src/host/host_log.cpp src/host/swapchain.cpp \
   src/host/ui.cpp src/host/webxfer.cpp src/host/audio.cpp src/host/settings.cpp \
   src/host/crash_report.cpp src/host/steam_client.cpp src/host/steam_install.cpp src/host/cover_art.cpp \

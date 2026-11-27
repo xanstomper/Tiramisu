@@ -646,8 +646,24 @@ default" is ON and pull `LocalState\tiramisu.log` through Device Portal.
 - **Over Wi-Fi / LAN:** Launch **Tiramisu** on Xbox, scan the **QR code** (or open `http://<xbox-ip>:9127` on PC/phone):
   - **On PC:** Drag & drop a game folder or `.zip`, or select an uncompressed folder.
   - **On iPhone / mobile:** Mobile browsers don't allow folder selection — compress your game folder to a **`.zip`** first and tap **Upload .zip** (or use **Pick Files** / a direct `.zip` URL).
-  - **External USB SSD or hard drive:** Use a drive Xbox Dev Mode exposes to apps as media storage. Put each game in its own folder under `Games` or `TiramisuGames` at the drive root. Tiramisu refreshes the shelf while idle when the drive appears or disappears. The LAN dashboard shows detected volumes and which game folders the runtime can access.
   - **Download directly on Xbox:** Paste a direct ZIP or disc image URL into the LAN dashboard and select **Download on Xbox**. Tiramisu downloads to temporary internal storage and adds the game to the library after it finishes. For an archive, leave room for both the ZIP and the extracted game. The Steam tab downloads games from the signed-in account.
+- **External USB SSD or hard drive:** Use a drive that Xbox Dev Mode exposes as
+  removable media. Put one folder per game, a complete game ZIP, or a disc
+  image in `Games` or `TiramisuGames` at the USB root. Tiramisu checks for
+  changes while the launcher is idle. Directly readable games can launch from
+  USB. For a ZIP or an item available only through Windows.Storage, open
+  **Transfer** in Tiramisu and choose **Download to Xbox**. A ZIP preserves all
+  the game files when Xbox limits which file types the app can see on the drive.
+  [Microsoft removable storage documentation](https://learn.microsoft.com/en-us/uwp/api/windows.storage.knownfolders.removabledevices)
+- **Xbox Device Portal:** Launch Tiramisu once to create its drop folder. Open
+  **File Explorer → LocalAppData → Tiramisu's installed package → LocalState →
+  TiramisuGames** and upload a complete game ZIP or an ISO. If you already have
+  an unpacked game directory there, leave its relative paths in place. Tiramisu
+  adds folders and disc images on its next library refresh. It extracts ZIPs
+  to `LocalState/games` after the upload settles. After a successful import,
+  the archive is kept with a `.imported` suffix so you can remove it to reclaim
+  space. Leave space for the archive and the extracted contents.
+  [Device Portal file upload](https://learn.microsoft.com/en-us/windows/uwp/debug-test-perf/device-portal-api-core)
 - **Mouse games on Xbox (normal build):** use your **Xbox controller (`pad2kbm` right stick = mouse, triggers = click)** or the **Phone Remote Trackpad (`/controls` link on the LAN dashboard)**.
 - **Keyboard & mouse (KBM) edition:** the same release ships **`Tiramisu-EdgeSpoof.msix` + `edge-dev.cer`**. It is the experimental Microsoft Edge-identity build that asks the Xbox shell for real hardware pointer input; install it *instead of* the normal package on your own Dev Mode console. It is unsupported and unverified — read [XBOX-MOUSE.md](XBOX-MOUSE.md) before installing. The Edge identity has its own package family name, so games/saves start in a fresh `LocalState`; use `tools/migrate-localstate.py --from-pfn <old> --to-pfn <new>` to move an existing library across.
 - **Back up saves before updating:** Open the LAN dashboard → **Saves & Support → Backup Saves (.zip)** before uninstalling/reinstalling Tiramisu, since Dev Mode wipes `LocalState` when a package is removed.

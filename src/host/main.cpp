@@ -16,6 +16,7 @@
 #include "cover_art.h"
 #include "game_library.h"
 #include "usb_storage.h"
+#include "portal_drop.h"
 #include "webxfer.h"
 #include "host_autopilot.h"
 #include "settings.h"
@@ -122,6 +123,7 @@ namespace {
 
 std::string g_local_state;
 std::string g_games_dir;
+std::string g_portal_games_dir;
 std::string g_package_games_dir;
 std::string g_network_games_dir;
 std::mutex g_status_mu;
@@ -685,10 +687,12 @@ void rescan_games() {
       longan::snapshot_prev_choice(g_games);
   g_games.clear();
   longan::scan_games_root(g_games, g_games_dir, 0, prev_choice);
+  longan::scan_games_root(g_games, g_portal_games_dir, 0, prev_choice);
   if (!g_package_games_dir.empty() && g_package_games_dir != g_games_dir)
     longan::scan_games_root(g_games, g_package_games_dir, 0, prev_choice);
   if (!g_network_games_dir.empty() && g_network_games_dir != g_games_dir &&
-      g_network_games_dir != g_package_games_dir)
+      g_network_games_dir != g_package_games_dir &&
+      g_network_games_dir != g_portal_games_dir)
     longan::scan_games_root(g_games, g_network_games_dir, 0, prev_choice);
 
   auto tag_external_since = [&](size_t start_idx, char drive_tag, const std::string& fs,
@@ -713,13 +717,15 @@ void rescan_games() {
       tag_external_since(before, drive_tag, volume.fs, true, "");
     }
     for (const auto& item : volume.items) {
-      if (item.kind != "folder") continue;
+      if (item.kind != "folder" && item.kind != "iso") continue;
       // Direct root game folders (e.g. E:\Celeste) or matching USB folder entries
       bool matched = false;
       for (auto& ge : g_games) {
-        if (!item.path.empty() && !_stricmp(ge.dir.c_str(), item.path.c_str())) {
+        const std::string& path = item.kind == "iso" ? ge.image : ge.dir;
+        if (!item.path.empty() && !_stricmp(path.c_str(), item.path.c_str())) {
           ge.is_external = true;
           ge.usb_id = item.id;
+          ge.win32_readable = item.win32_readable;
           matched = true;
           break;
         }
@@ -731,7 +737,8 @@ void rescan_games() {
           const std::string parent = item.path.substr(0, bs);
           const std::string leaf = item.path.substr(bs + 1);
           const size_t before = g_games.size();
-          longan::scan_game_entry(g_games, parent, leaf, true, drive_tag, prev_choice);
+          longan::scan_game_entry(g_games, parent, leaf, item.kind == "folder",
+                                  drive_tag, prev_choice);
           tag_external_since(before, drive_tag, volume.fs, true, item.id);
         }
       } else if (!item.installed_internal) {
@@ -741,9 +748,9 @@ void rescan_games() {
         ge.name = drive_tag ? (item.name + " [" + std::string(1, drive_tag) + ":]") : item.name;
         ge.dir = item.path;
         ge.exe = item.exe;
-        ge.exes = {item.exe};
+        if (!item.exe.empty()) ge.exes = {item.exe};
         ge.input_mode = "auto";
-        ge.compat = "compat: USB NTFS broker (select to Download to Xbox)";
+        ge.compat = "USB import available";
         ge.is_external = true;
         ge.win32_readable = false;
         ge.usb_id = item.id;
@@ -777,6 +784,7 @@ void rescan_games_root_only() {
   std::vector<game_entry> external_games;
   for (auto& ge : g_games) {
     if (!under_root(ge.dir, g_games_dir) &&
+        !under_root(ge.dir, g_portal_games_dir) &&
         !under_root(ge.dir, g_package_games_dir) &&
         !under_root(ge.dir, g_network_games_dir)) {
       external_games.push_back(std::move(ge));
@@ -784,10 +792,12 @@ void rescan_games_root_only() {
   }
   g_games.clear();
   longan::scan_games_root(g_games, g_games_dir, 0, prev_choice);
+  longan::scan_games_root(g_games, g_portal_games_dir, 0, prev_choice);
   if (!g_package_games_dir.empty() && g_package_games_dir != g_games_dir)
     longan::scan_games_root(g_games, g_package_games_dir, 0, prev_choice);
   if (!g_network_games_dir.empty() && g_network_games_dir != g_games_dir &&
-      g_network_games_dir != g_package_games_dir)
+      g_network_games_dir != g_package_games_dir &&
+      g_network_games_dir != g_portal_games_dir)
     longan::scan_games_root(g_games, g_network_games_dir, 0, prev_choice);
   for (auto& eg : external_games) g_games.push_back(std::move(eg));
   longan::sort_games_shelf(g_games);
@@ -2682,11 +2692,18 @@ struct tiramisu_host
       g_del_confirm_ms = 0;
       longan::ui_set_delete_confirm(-1);
       bool ok = false;
-      const std::string int_prefix = g_games_dir + "\\";
-      if (!img.empty() && !_strnicmp(img.c_str(), int_prefix.c_str(), int_prefix.size())) {
+      const auto can_delete = [&](const std::string& path) {
+        for (const auto* root : {&g_games_dir, &g_portal_games_dir}) {
+          if (root->empty()) continue;
+          const std::string prefix = *root + "\\";
+          if (path.size() > prefix.size() &&
+              !_strnicmp(path.c_str(), prefix.c_str(), prefix.size())) return true;
+        }
+        return false;
+      };
+      if (can_delete(img)) {
         ok = DeleteFileA(img.c_str()) != 0;
-      } else if (!dir.empty() && dir.size() > g_games_dir.size() &&
-                 !_strnicmp(dir.c_str(), int_prefix.c_str(), int_prefix.size())) {
+      } else if (can_delete(dir)) {
         ok = delete_dir_recursive_host(dir);
       }
       longan::ui_sfx_delete();
@@ -2887,6 +2904,8 @@ struct tiramisu_host
     trt_fna_set_storage_root(g_local_state.c_str());
     g_games_dir = g_local_state + "\\games";
     CreateDirectoryA(g_games_dir.c_str(), nullptr);
+    g_portal_games_dir = g_local_state + "\\" + longan::kPortalGamesFolder;
+    CreateDirectoryW(u82ws(g_portal_games_dir).c_str(), nullptr);
     CreateDirectoryA((g_local_state + "\\incoming").c_str(), nullptr);
     longan::cover_art_init(g_local_state);
     longan::usb_storage::init(g_local_state, g_games_dir, install);
@@ -3973,6 +3992,7 @@ struct tiramisu_host
 
       // ---- launch handoff (web + pad) ----
       if (!g_guest_running.load()) {
+        longan::portal_drop_poll(g_local_state, g_portal_games_dir);
         longan::usb_storage::poll_folder_picker();
         if (longan::usb_storage::poll()) rescan_games();
         {
