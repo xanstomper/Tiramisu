@@ -8,6 +8,7 @@
 //   4. Data markers on disk (data.win, .pck, .pak, .vpk)
 // Nothing is classified from a bare filename guess like "options.ini".
 #include "engine_synthesizer.h"
+#include "steam_appid.h"
 #include "pe.h"
 #include "trt.h"
 #include "thunk.h"
@@ -871,28 +872,7 @@ const char* trt_audio_middleware_name(trt_audio_middleware a) {
   }
 uint32_t trt_steam_read_appid(const char* game_dir) {
   if (!game_dir || !game_dir[0]) return 0;
-  std::ifstream file(path_join(game_dir, "steam_appid.txt"), std::ios::binary);
-  char bytes[64];
-  file.read(bytes, sizeof(bytes));
-  if (!file.eof() || file.bad()) return 0;
-  const auto length = static_cast<size_t>(file.gcount());
-  size_t start = 0;
-  size_t end = length;
-  while (start < end && std::isspace(static_cast<unsigned char>(bytes[start]))) ++start;
-  while (end > start && std::isspace(static_cast<unsigned char>(bytes[end - 1]))) --end;
-  if (end == start || end - start > 10) return 0;
-  uint64_t value = 0;
-  while (start < end) {
-    const char digit = bytes[start++];
-    if (digit < '0' || digit > '9') return 0;
-    value = value * 10 + static_cast<unsigned>(digit - '0');
-  }
-
-  // Older releases wrote Spacewar's AppID for unrelated games. A legacy
-  // sidecar alone cannot distinguish that placeholder from a real install.
-  constexpr uint32_t kLegacyPlaceholderAppId = 480;
-  if (value == kLegacyPlaceholderAppId || value > UINT32_MAX) return 0;
-  return static_cast<uint32_t>(value);
+  return trt_steam_read_appid_file(path_join(game_dir, "steam_appid.txt"));
 }
 
 int trt_pe_scan_import_modules(const char* path, char* out_csv, size_t cap) {

@@ -24,6 +24,7 @@
 #include "web_controls_page.h"
 #include "host_log.h"
 #include "settings.h"
+#include "../trt/steam_appid.h"
 #ifdef TIRAMISU_UWP_HOST
   #include "cover_art.h"
   #include "../trt/bridge_d3d.h"
@@ -1244,7 +1245,7 @@ std::string games_json() {
       scan_game_exes(gdir, d.name, &exes, &exe);
       if (exe.empty()) continue;
       seen.insert(xfer_lower(d.name));
-      const std::string appid = read_small_text(gdir + sep + "steam_appid.txt");
+      const uint32_t appid = trt_steam_read_appid_file(gdir + sep + "steam_appid.txt");
       const std::string args = read_small_text(gdir + sep + "tiramisu_args.txt");
       std::string input = read_small_text(gdir + sep + "tiramisu_input.txt");
       if (input.empty()) input = "auto";
@@ -1266,7 +1267,7 @@ std::string games_json() {
       if (!first) j += ",";
       first = false;
       j += "{\"name\":\"" + json_escape(d.name) + "\",\"exe\":\"" +
-           json_escape(exe) + "\",\"appid\":\"" + json_escape(appid) +
+           json_escape(exe) + "\",\"appid\":\"" + (appid ? std::to_string(appid) : "") +
            "\",\"args\":\"" + json_escape(args) + "\",\"input\":\"" +
            json_escape(input) + "\",\"arch\":\"" + json_escape(compat.arch) +
            "\",\"compat\":\"" + json_escape(compat.badge) + "\",\"compat_ok\":" +
@@ -1307,7 +1308,8 @@ std::string games_json() {
           dir_exists(item.path)) {
         scan_game_exes(item.path, item.name, &exes, &exe);
         if (!exe.empty()) compat = inspect_pe_compat(item.path, exe);
-        appid = read_small_text(item.path + sep + "steam_appid.txt");
+        const uint32_t id = trt_steam_read_appid_file(item.path + sep + "steam_appid.txt");
+        if (id) appid = std::to_string(id);
         args = read_small_text(item.path + sep + "tiramisu_args.txt");
         std::string inp = read_small_text(item.path + sep + "tiramisu_input.txt");
         if (!inp.empty()) input = inp;
@@ -3079,6 +3081,12 @@ bool handle_one_request(sock_t s, bool* out_keep_alive) {
     bool has_app = parse_json_str_field(body, "appid", &app_v);
     bool has_arg = parse_json_str_field(body, "args", &arg_v);
     bool has_inp = parse_json_str_field(body, "input", &inp_v);
+    app_v = trim_ws(app_v);
+    const uint32_t appid = trt_steam_parse_appid(app_v);
+    if (has_app && !app_v.empty() && !appid) {
+      respond(s, "400 Bad Request", "text/plain", "invalid Steam AppID");
+      return false;
+    }
     const std::string sep(1, XFER_SEP);
     if (has_exe) {
       std::string safe_exe;
@@ -3089,9 +3097,8 @@ bool handle_one_request(sock_t s, bool* out_keep_alive) {
       write_or_clear_text(gdir + sep + "tiramisu_exe.txt", safe_exe);
     }
     if (has_app) {
-      std::string digits;
-      for (char c : app_v) if (c >= '0' && c <= '9') digits.push_back(c);
-      write_or_clear_text(gdir + sep + "steam_appid.txt", digits);
+      write_or_clear_text(gdir + sep + "steam_appid.txt",
+                          appid ? std::to_string(appid) : "");
     }
     if (has_arg) {
       for (char& c : arg_v) if (c == '\r' || c == '\n') c = ' ';

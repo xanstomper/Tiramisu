@@ -334,6 +334,23 @@ int main() {
               rg.find("\"appid\":\"367520\"") != std::string::npos &&
               rg.find("\"input\":\"pad2kbm\"") != std::string::npos,
           "GET /games reflects uploaded games + persisted config");
+
+    const auto appid_path = root + "/games/HollowDemo/steam_appid.txt";
+    for (const char* bad : {"3-67520", "480", "4294967296"}) {
+      const std::string body = std::string("{\"appid\":\"") + bad +
+                               "\",\"args\":\"changed\"}";
+      const auto invalid = http_req(port, "POST", "/api/config/HollowDemo", body);
+      CHECK(invalid.find("400 Bad Request") != std::string::npos &&
+                read_str_file(appid_path) == "367520" &&
+                read_str_file(root + "/games/HollowDemo/tiramisu_args.txt") == "-windowed -dx11",
+            "Invalid AppID is rejected before any config sidecar is changed");
+    }
+    FILE* legacy = fopen(appid_path.c_str(), "wb");
+    if (legacy) { fputs("480\n", legacy); fclose(legacy); }
+    const auto legacy_games = http_req(port, "GET", "/games", "");
+    CHECK(legacy && legacy_games.find("\"appid\":\"480\"") == std::string::npos &&
+              read_str_file(appid_path) == "480\n",
+          "GET /games hides the legacy placeholder without editing its sidecar");
   }
 
   // 8. Launch, Stop, Status, Delete
