@@ -1,0 +1,120 @@
+{
+  "date_utc": "2026-11-28",
+  "console": "Xbox Series S",
+  "package_version": "0.2.5.5",
+  "source_commit": "431718238214e2f4d04d6275bf185caef9123df6",
+  "package_sha256": "fe79eb3f26270c32ebc1a552fe83a4a4bf9100340a28710284525dbb1c076100",
+  "entry_point": "Play (LAN dashboard)",
+  "gates": {
+    "uwp_host_build_and_packaging": "passed",
+    "load_only_corpus": "123 files passed on 0.2.5.4",
+    "iso_mount_fixture": "70 passed",
+    "checkpoint_fixture": "37 passed, including new failing-before checkpoint case"
+  },
+  "cuphead": {
+    "last_active_sample_ms": 105000,
+    "render": {
+      "d3d11_device_calls": 1,
+      "d3d11_swapchains": 1,
+      "d3d11_successful_presents": 4571,
+      "d3d11_width": 320,
+      "d3d11_height": 240,
+      "d3d11_resize_target_calls": 1,
+      "d3d11_resize_buffer_calls": 2,
+      "surface_samples": 32,
+      "guest_lit_pixels": 0,
+      "host_lit_pixels": 0,
+      "surface_other_width": 320,
+      "surface_other_height": 240,
+      "surface_other_format": 27,
+      "surface_other_samples": 32,
+      "surface_other_result": 0,
+      "surface_other_lit_pixels": 0,
+      "surface_bound_untagged": 32,
+      "coverage_samples": 32,
+      "shader_input_bc3_nontransparent_lit_peak": 256
+    },
+    "screen_captures": [
+      {
+        "phase": 15,
+        "capture_unavailable": true
+      },
+      {
+        "phase": 30,
+        "lit_pixels": 0,
+        "total": 129600
+      },
+      {
+        "phase": 65,
+        "lit_pixels": 0,
+        "total": 129600
+      },
+      {
+        "phase": 105,
+        "lit_pixels": 0,
+        "total": 129600
+      },
+      {
+        "phase": "key-90",
+        "lit_pixels": 0,
+        "total": 129600
+      },
+      {
+        "phase": "key-13",
+        "lit_pixels": 0,
+        "total": 129600
+      },
+      {
+        "phase": "key-40",
+        "lit_pixels": 0,
+        "total": 129600
+      }
+    ],
+    "visible_game_frame": false,
+    "visible_menu": false,
+    "visible_game_response": false
+  },
+  "sekiro": {
+    "last_active_sample": {
+      "elapsed_ms": 5500,
+      "checkpoint": {
+        "available": true,
+        "phase": 4,
+        "outcome": 1,
+        "code": 0
+      },
+      "d3d11_device_calls": 0,
+      "d3d11_swapchains": 0,
+      "d3d11_successful_presents": 0,
+      "observed_calls": 522,
+      "fallback_calls": 0,
+      "guest_commit_mib": 555
+    },
+    "process_samples_after_lan_dashboard_unavailable": [
+      {
+        "elapsed_ms": 7000,
+        "portal_reports_package_process": true
+      },
+      {
+        "elapsed_ms": 10519,
+        "portal_reports_package_process": true
+      },
+      {
+        "elapsed_ms": 16593,
+        "portal_reports_package_process": false
+      }
+    ],
+    "reopened_checkpoint": {
+      "available": true,
+      "phase": 4,
+      "outcome": 1,
+      "code": 0
+    },
+    "worker_fault_checkpoint": {
+      "available": false,
+      "phase": 0,
+      "code": 0
+    },
+    "visible_menu": false
+  }
+}
