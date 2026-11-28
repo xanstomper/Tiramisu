@@ -111,31 +111,18 @@ def safe_game_name(value):
 def preflight(dashboard, portal, package, game, *, files_verified):
     idle(dashboard)
     active_package(portal, package)
-    account = dashboard.request("/api/steam/status")
-    if not isinstance(account, dict) or account.get("signed_in") is not True:
-        raise ValidationError("steam_signed_out")
-
-    steam = [row for row in rows(dashboard, "/api/steam/library")
-             if app_id_matches(row.get("appid"))]
-    if len(steam) != 1 or steam[0].get("account_owned") is not True:
-        raise ValidationError("account_ownership_unverified")
-    item = steam[0]
-    if item.get("installed") is not True or item.get("downloading") or item.get("queued"):
-        raise ValidationError("steam_install_unready")
-    name = item.get("install_name")
-    if not safe_game_name(name) or name != game:
-        raise ValidationError("steam_install_binding_unverified")
-
+    if not safe_game_name(game):
+        raise ValidationError("invalid_game_name")
     entries = [row for row in rows(dashboard, "/games")
-               if isinstance(row.get("name"), str) and row["name"].casefold() == name.casefold()]
-    if len(entries) != 1 or not app_id_matches(entries[0].get("appid")):
-        raise ValidationError("play_entry_appid_mismatch")
+               if isinstance(row.get("name"), str) and row["name"].casefold() == game.casefold()]
+    if len(entries) != 1 or entries[0]["name"] != game:
+        raise ValidationError("play_entry_unverified")
     entry = entries[0]
     if (entry.get("location") != "internal" or entry.get("installed_internal") is not True or
             entry.get("compat_ok") is not True or
             not isinstance(entry.get("exe"), str) or entry["exe"].casefold() != "sekiro.exe"):
         raise ValidationError("play_entry_unverified")
-    parts = r"\LocalState\games" + "\\" + name
+    parts = r"\LocalState\games" + "\\" + game
     listing = portal.listing(package, parts)
     if not isinstance(listing, dict) or not listing:
         raise ValidationError("install_listing_unavailable")
@@ -144,12 +131,27 @@ def preflight(dashboard, portal, package, game, *, files_verified):
         raise ValidationError("replacement_marker_present")
     if "sekiro.exe" not in names or "steam_api64.dll" not in names:
         raise ValidationError("original_executable_or_sdk_unavailable")
+    if not app_id_matches(entry.get("appid")):
+        raise ValidationError("play_entry_appid_mismatch")
+
+    account = dashboard.request("/api/steam/status")
+    if not isinstance(account, dict) or account.get("signed_in") is not True:
+        raise ValidationError("steam_signed_out")
+    steam = [row for row in rows(dashboard, "/api/steam/library")
+             if app_id_matches(row.get("appid"))]
+    if len(steam) != 1 or steam[0].get("account_owned") is not True:
+        raise ValidationError("account_ownership_unverified")
+    item = steam[0]
+    if item.get("installed") is not True or item.get("downloading") or item.get("queued"):
+        raise ValidationError("steam_install_unready")
+    if item.get("install_name") != game:
+        raise ValidationError("steam_install_binding_unverified")
 
     # API and folder metadata bind the title and catch obvious tampering. The
     # verifier must independently establish the provenance of the installed files.
     if not files_verified:
         raise ValidationError("original_install_unverified")
-    return name
+    return game
 
 
 def probe(dashboard):

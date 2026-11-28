@@ -101,6 +101,13 @@ class Tests(unittest.TestCase):
         with self.assertRaisesRegex(validation.ValidationError, "replacement_marker_present"):
             self.check()
 
+    def test_replacement_copy_is_reported_even_if_signed_out(self):
+        self.dash.routes["/api/steam/status"]["signed_in"] = False
+        self.dash.routes["/games"][0]["appid"] = ""
+        self.portal.files["steam_emu.ini"] = {}
+        with self.assertRaisesRegex(validation.ValidationError, "replacement_marker_present"):
+            self.check()
+
     def test_probe_uses_allowlist_and_numeric_types(self):
         self.dash.routes["/api/render-status"] = {
             "d3d11_width": 800, "host_lit_pixels": "PRIVATE", "message": "PRIVATE",
