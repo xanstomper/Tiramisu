@@ -29,11 +29,7 @@ struct xinput_gamepad {
   i16 sThumbRY;
 };
 
-struct xinput_state {
-  u32 dwPacketNumber;
-  xinput_gamepad Gamepad;
-};
-static_assert(sizeof(xinput_state) == 16, "XINPUT_STATE size mismatch");
+static_assert(sizeof(trt_pad_sample) == 16, "XINPUT_STATE size mismatch");
 
 struct xinput_vibration {
   u16 wLeftMotorSpeed;
@@ -63,20 +59,7 @@ struct xinput_keystroke {
   u8 HidCode;
 };
 
-u32 g_packet_num = 1;
-bool g_enabled = true;
-
-u16 read_buttons(u32 user_index) {
-  static const u16 k_bits[] = {
-      0x0001u, 0x0002u, 0x0004u, 0x0008u, 0x0010u, 0x0020u, 0x0040u,
-      0x0080u, 0x0100u, 0x0200u, 0x1000u, 0x2000u, 0x4000u, 0x8000u,
-  };
-  u16 mask = 0;
-  for (u16 b : k_bits) {
-    if (trt_pad_down_n(user_index, b)) mask |= b;
-  }
-  return mask;
-}
+std::atomic<bool> g_enabled{true};
 
 }  // namespace
 
@@ -86,7 +69,8 @@ u32 TRT_GUEST_ABI trt_XInputGetState(u32 user_index, void* state_out) {
   gap_trace_record("XInputGetState");
   static std::atomic<unsigned> state_polls{0};
   const unsigned poll_no = state_polls.fetch_add(1, std::memory_order_relaxed);
-  if (!trt_pad_connected(user_index)) {
+  trt_pad_sample state{};
+  if (!trt_pad_read_sample(user_index, &state)) {
     if (poll_no < 16) {
       char line[96];
       snprintf(line, sizeof(line),
@@ -97,27 +81,18 @@ u32 TRT_GUEST_ABI trt_XInputGetState(u32 user_index, void* state_out) {
     return k_err_device_not_connected;
   }
   if (!state_out) return 87u;  // ERROR_INVALID_PARAMETER
-  xinput_state* s = (xinput_state*)state_out;
-  memset(s, 0, sizeof(*s));
-  s->dwPacketNumber = ++g_packet_num;
-  if (!g_enabled) return k_err_success;
-  s->Gamepad.wButtons = read_buttons(user_index);
-  s->Gamepad.bLeftTrigger = trt_pad_trigger_n(user_index, 0);
-  s->Gamepad.bRightTrigger = trt_pad_trigger_n(user_index, 1);
-  s->Gamepad.sThumbLX = trt_pad_thumb_n(user_index, 0);
-  s->Gamepad.sThumbLY = trt_pad_thumb_n(user_index, 1);
-  s->Gamepad.sThumbRX = trt_pad_thumb_n(user_index, 2);
-  s->Gamepad.sThumbRY = trt_pad_thumb_n(user_index, 3);
-  static std::atomic<u16> last_buttons{0};
-  const bool button_changed =
-      last_buttons.exchange(s->Gamepad.wButtons, std::memory_order_relaxed) !=
-      s->Gamepad.wButtons;
-  if (poll_no < 16 || button_changed || s->Gamepad.wButtons != 0) {
+  if (!g_enabled.load(std::memory_order_relaxed)) state = {};
+  memcpy(state_out, &state, sizeof(state));
+  static std::atomic<u16> last_buttons[4]{};
+  const auto& pad = state.controls;
+  const bool button_changed = last_buttons[user_index].exchange(
+      pad.buttons, std::memory_order_relaxed) != pad.buttons;
+  if (poll_no < 16 || button_changed) {
     char line[128];
     snprintf(line, sizeof(line),
              "xinput: GetState #%u user=%u buttons=%04x lx=%d ly=%d",
-             poll_no + 1, user_index, s->Gamepad.wButtons,
-             s->Gamepad.sThumbLX, s->Gamepad.sThumbLY);
+             poll_no + 1, user_index, pad.buttons,
+             pad.lx, pad.ly);
     xinputlog::line(line);
   }
   return k_err_success;

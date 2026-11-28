@@ -69,6 +69,18 @@ bool  trt_pad_down(u16 xinput_bit);
 float trt_pad_stick(int stick /*0=Lx 1=Ly 2=Rx 3=Ry*/);
 i16   trt_pad_thumb(int stick /*0=Lx 1=Ly 2=Rx 3=Ry raw XInput range*/);
 u8    trt_pad_trigger(int t /*0=L 1=R*/);
+// XINPUT_STATE layout. Copy one host sample under the input lock so polling
+// threads see buttons, axes and packet number from the same update.
+typedef struct trt_pad_controls {
+  u16 buttons;
+  u8 tl, tr;
+  i16 lx, ly, rx, ry;
+} trt_pad_controls;
+typedef struct trt_pad_sample {
+  u32 packet;
+  trt_pad_controls controls;
+} trt_pad_sample;
+bool trt_pad_read_sample(u32 index, trt_pad_sample* out);
 bool  trt_pad_connected(u32 index);
 bool  trt_pad_down_n(u32 index, u16 xinput_bit);
 i16   trt_pad_thumb_n(u32 index, int stick /*0=Lx 1=Ly 2=Rx 3=Ry*/);

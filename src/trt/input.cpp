@@ -9,6 +9,12 @@
 
 namespace {
 
+static_assert(sizeof(trt_pad_controls) == 12, "XINPUT_GAMEPAD has no padding");
+
+bool controls_changed(const trt_pad_controls& a, const trt_pad_controls& b) {
+  return memcmp(&a, &b, sizeof(a)) != 0;
+}
+
 struct input_state {
   // keyboard
   u8  down[TRT_MAX_VK];      // current
@@ -33,9 +39,7 @@ struct input_state {
   struct pad_slot {
     bool connected;
     bool conn_known;
-    i16 lx, ly, rx, ry;
-    u16 pbtn;
-    u8  tl, tr;
+    trt_pad_sample sample;
     u16 vib_left, vib_right;
     bool vib_dirty;
   } pads[4];
@@ -444,19 +448,14 @@ void trt_input_pad_state_n(u32 index, bool connected, i16 lx, i16 ly,
                            i16 rx, i16 ry, u16 buttons, u8 tl, u8 tr) {
   if (index >= 4) return;
   std::lock_guard<std::recursive_mutex> lk(g_input_mu);
-  g.pads[index].connected = connected;
-  g.pads[index].conn_known = true;
-  if (connected) {
-    g.pads[index].lx = lx; g.pads[index].ly = ly;
-    g.pads[index].rx = rx; g.pads[index].ry = ry;
-    g.pads[index].pbtn = buttons;
-    g.pads[index].tl = tl; g.pads[index].tr = tr;
-  } else {
-    g.pads[index].lx = g.pads[index].ly = 0;
-    g.pads[index].rx = g.pads[index].ry = 0;
-    g.pads[index].pbtn = 0;
-    g.pads[index].tl = g.pads[index].tr = 0;
-  }
+  auto& slot = g.pads[index];
+  const trt_pad_controls controls = connected
+      ? trt_pad_controls{buttons, tl, tr, lx, ly, rx, ry} : trt_pad_controls{};
+  if (!slot.conn_known || slot.connected != connected || controls_changed(slot.sample.controls, controls))
+    ++slot.sample.packet;
+  slot.conn_known = true;
+  slot.connected = connected;
+  slot.sample.controls = controls;
 }
 
 void trt_input_pad_state(i16 lx, i16 ly, i16 rx, i16 ry,
@@ -535,17 +534,24 @@ bool trt_pad_connected(u32 index) {
   return g.pads[index].connected;
 }
 
+bool trt_pad_read_sample(u32 index, trt_pad_sample* out) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  if (!out || !trt_pad_connected(index)) return false;
+  *out = g.pads[index].sample;
+  return true;
+}
+
 bool trt_pad_down_n(u32 index, u16 bit) {
   if (index >= 4) return false;
   std::lock_guard<std::recursive_mutex> lk(g_input_mu);
-  return trt_pad_connected(index) && (g.pads[index].pbtn & bit) != 0;
+  return trt_pad_connected(index) && (g.pads[index].sample.controls.buttons & bit) != 0;
 }
 
 bool trt_pad_down(u16 bit) { return trt_pad_down_n(0, bit); }
 
 float trt_pad_stick(int s) {
   std::lock_guard<std::recursive_mutex> lk(g_input_mu);
-  const auto& p = g.pads[0];
+  const auto& p = g.pads[0].sample.controls;
   switch (s) {
     case 0: return (float)clamp_axis(p.lx) / 100.0f;
     case 1: return (float)clamp_axis(p.ly) / 100.0f;
@@ -558,7 +564,7 @@ float trt_pad_stick(int s) {
 i16 trt_pad_thumb_n(u32 index, int s) {
   if (index >= 4) return 0;
   std::lock_guard<std::recursive_mutex> lk(g_input_mu);
-  const auto& p = g.pads[index];
+  const auto& p = g.pads[index].sample.controls;
   switch (s) {
     case 0: return p.lx;
     case 1: return p.ly;
@@ -573,7 +579,7 @@ i16 trt_pad_thumb(int s) { return trt_pad_thumb_n(0, s); }
 u8 trt_pad_trigger_n(u32 index, int t) {
   if (index >= 4) return 0;
   std::lock_guard<std::recursive_mutex> lk(g_input_mu);
-  return t == 0 ? g.pads[index].tl : g.pads[index].tr;
+  return t == 0 ? g.pads[index].sample.controls.tl : g.pads[index].sample.controls.tr;
 }
 
 u8 trt_pad_trigger(int t) { return trt_pad_trigger_n(0, t); }
@@ -700,13 +706,10 @@ void trt_input_release_all(void) {
   // look held after resume: the host re-polls the real device on the way
   // back, so clearing here is the truthful state in between.
   for (auto& p : g.pads) {
-    p.pbtn = 0;
-    p.tl = 0;
-    p.tr = 0;
-    p.lx = 0;
-    p.ly = 0;
-    p.rx = 0;
-    p.ry = 0;
+    if (controls_changed(p.sample.controls, {})) {
+      p.sample.controls = {};
+      ++p.sample.packet;
+    }
   }
   memset(g.pressed, 0, sizeof(g.pressed));
   g.mbtn = 0;

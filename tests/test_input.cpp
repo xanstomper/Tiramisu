@@ -501,6 +501,28 @@ int main() {
               r3 == 0 && xs.lx == -3333,
           "XInputGetState supports 4 independent slots and disconnected detection");
 
+    trt_XInputGetState(0, &xs);
+    const u32 held = xs.pkt;
+    trt_input_pad_state_n(0, true, 1111, -1111, 0, 0, 0x1000u, 11, 22);
+    trt_XInputGetState(3, &xs);
+    trt_XInputGetState(0, &xs);
+    CHECK(xs.pkt == held, "Repeated samples and polling another pad preserve the packet number");
+    trt_input_pad_state_n(0, true, 1111, -1111, 0, 0, 0x1010u, 11, 22);
+    trt_XInputGetState(0, &xs);
+    CHECK(xs.pkt != held && xs.btns == 0x1010u && xs.lx == 1111,
+          "Pressing Start while holding A publishes a new controller packet");
+    const u32 before_tap = xs.pkt;
+    trt_input_pad_state_n(0, true, 1111, -1111, 0, 0, 0x1000u, 11, 22);
+    trt_input_pad_state_n(0, true, 1111, -1111, 0, 0, 0x1010u, 11, 22);
+    trt_XInputGetState(0, &xs);
+    CHECK(xs.pkt != before_tap && xs.btns == 0x1010u,
+          "A release and press between guest polls advances the packet number");
+    const u32 before_suspend = xs.pkt;
+    trt_input_release_all();
+    trt_XInputGetState(0, &xs);
+    CHECK(xs.pkt != before_suspend && !xs.btns && !xs.lx && !xs.tl,
+          "Suspending publishes a neutral controller packet");
+
     u16 vib[2] = {12345u, 54321u};
     u16 got_l = 0, got_r = 0;
     CHECK(trt_XInputSetState(1, vib) == 0 &&
