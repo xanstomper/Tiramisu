@@ -1453,7 +1453,47 @@ void test_wave2g_proton_compat() {
       CHECK(*(const u32*)((const u8*)sp + 28) == 1u &&
                 d3d_get_part(sp, (size_t)sz, 5 /*DEBUG_INFO*/, 0, &spdb_after) != 0,
             "Stripped DXBC retains 1 chunk and omits SPDB");
+      // Generated independently with DirectXShaderCompiler ComputeHashRetail.
+      const u8 digest[] = {0xc1,0xe4,0x0d,0x92,0x66,0xcb,0x65,0xf8,
+                           0x6e,0x1c,0xff,0xbd,0xfc,0xb0,0x67,0x45};
+      CHECK(sz == 48 && memcmp((const u8*)sp + 4, digest, sizeof(digest)) == 0,
+            "stripping recomputes the container checksum");
       slot<u32(TRT_GUEST_ABI*)(void*)>(stripped, 2)(stripped);
+
+    // Input and output signatures are two separate chunks. The combined
+    // result must itself be a DXBC blob, with both chunks and a valid digest.
+    u8 signatures[80]{};
+    memcpy(signatures, "DXBC", 4);
+    const u32 header[] = {1, 80, 2, 40, 52};
+    memcpy(signatures + 20, header, sizeof(header));
+    const u32 input_size = 4, output_size = 20;
+    memcpy(signatures + 40, "ISGN", 4);
+    memcpy(signatures + 44, &input_size, 4);
+    memcpy(signatures + 48, "IN!!", 4);
+    memcpy(signatures + 52, "OSGN", 4);
+    memcpy(signatures + 56, &output_size, 4);
+    memcpy(signatures + 60, "OUT!", 4);
+    const u8 signature_digest[] = {0x6a,0x49,0x07,0x48,0x0c,0x27,0x29,0xbe,
+                                   0x2c,0xd1,0x5b,0x49,0xd7,0x86,0x0f,0x02};
+    void* combined = nullptr;
+    const int signature_hr = d3d_get_part(signatures, sizeof(signatures), 2, 0, &combined);
+    CHECK(signature_hr == 0 && combined, "D3DGetBlobPart combines input and output signatures");
+    if (combined) {
+      const auto* data = static_cast<const u8*>(slot<void*(TRT_GUEST_ABI*)(void*)>(combined, 3)(combined));
+      const u64 size = slot<u64(TRT_GUEST_ABI*)(void*)>(combined, 4)(combined);
+      CHECK(size == sizeof(signatures) && memcmp(data, "DXBC", 4) == 0 &&
+                memcmp(data + 4, signature_digest, sizeof(signature_digest)) == 0 &&
+                memcmp(data + 20, signatures + 20, sizeof(signatures) - 20) == 0,
+            "combined signatures retain both chunks and the retail checksum");
+      slot<u32(TRT_GUEST_ABI*)(void*)>(combined, 2)(combined);
+    }
+
+    const u32 truncated = 52;
+    memcpy(signatures + 24, &truncated, 4);
+    void* invalid = blob;
+    CHECK(d3d_strip(signatures, sizeof(signatures), 0, &invalid) < 0 && !invalid,
+          "stripping rejects a chunk outside the declared container");
+    if (invalid && invalid != blob) slot<u32(TRT_GUEST_ABI*)(void*)>(invalid, 2)(invalid);
     }
   }
 

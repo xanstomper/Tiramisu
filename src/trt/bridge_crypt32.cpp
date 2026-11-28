@@ -165,6 +165,33 @@ bcrypt_hash_slot g_bcrypt_hashes[64];
 
 extern "C" {
 
+// DXBC uses MD5's compression function with a different final block layout.
+// The layout is documented by ComputeHashRetail in DirectXShaderCompiler.
+void trt_dxbc_checksum(const u8* bytes, u32 size, u8 digest[16]) {
+  u32 state[] = {0x67452301u, 0xefcdab89u, 0x98badcfeu, 0x10325476u};
+  u32 remaining = size;
+  while (remaining >= 64) {
+    md5_block(state, bytes);
+    bytes += 64;
+    remaining -= 64;
+  }
+
+  u8 block[64]{};
+  if (remaining >= 56) {
+    memcpy(block, bytes, remaining);
+    block[remaining] = 0x80;
+    md5_block(state, block);
+    memset(block, 0, sizeof(block));
+  } else {
+    memcpy(block + 4, bytes, remaining);
+    block[4 + remaining] = 0x80;
+  }
+  store_le32(block, size << 3);
+  store_le32(block + 60, 1u | (size << 1));
+  md5_block(state, block);
+  for (unsigned i = 0; i < 4; ++i) store_le32(digest + 4 * i, state[i]);
+}
+
 void trt_csprng_fill(u8* out, u32 len) {
   if (!out || !len) return;
 #ifdef _WIN32

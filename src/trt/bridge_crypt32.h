@@ -22,6 +22,9 @@ int trt_bridge_register_crypt32(void);
 // Register bcrypt.dll as BUILTIN (also routes api-ms-win-security-basecrypt).
 int trt_bridge_register_bcrypt(void);
 
+// Retail DXBC container checksum of the bytes following the magic and digest.
+void trt_dxbc_checksum(const u8* bytes, u32 size, u8 digest[16]);
+
 // Shared CSPRNG + hash primitives reused by advapi32 (SystemFunction036 / CryptoAPI).
 enum trt_hash_alg {
   TRT_HASH_NONE = 0,

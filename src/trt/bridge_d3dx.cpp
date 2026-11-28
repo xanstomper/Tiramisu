@@ -32,6 +32,7 @@
 // loaded module).
 #include "bridge_d3dx.h"
 #include "bridge_img.h"
+#include "bridge_crypt32.h"
 #include "thunk.h"
 #include "trt.h"
 
@@ -39,6 +40,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <atomic>
+#include <new>
 
 extern "C" {
 
@@ -547,7 +549,8 @@ const void* k_d3dx_blob_vtbl[5] = {
 };
 
 d3dx_blob* alloc_d3dx_blob(const void* bytes, size_t size) {
-  auto* b = new d3dx_blob();
+  auto* b = new (std::nothrow) d3dx_blob();
+  if (!b) return nullptr;
   b->vtbl = k_d3dx_blob_vtbl;
   b->refcount.store(1u, std::memory_order_relaxed);
   b->size = size;
@@ -568,19 +571,123 @@ constexpr u32 make_fourcc(char a, char b, char c, char d) {
   return (u32)(u8)a | ((u32)(u8)b << 8) | ((u32)(u8)c << 16) | ((u32)(u8)d << 24);
 }
 
-bool match_blob_part(u32 part, u32 fourcc) {
+constexpr size_t k_dxbc_header_size = 32;
+constexpr u32 k_max_dxbc_chunks = 64;
+constexpr int k_e_outofmemory = 0x8007000e;
+
+struct dxbc_chunk {
+  const u8* header;
+  u32 tag;
+  u32 size;
+};
+
+struct dxbc_container {
+  dxbc_chunk chunks[k_max_dxbc_chunks];
+  u32 count;
+  u32 size;
+};
+
+u32 read_u32(const u8* bytes) {
+  u32 value;
+  memcpy(&value, bytes, sizeof(value));
+  return value;
+}
+
+void write_u32(u8* bytes, u32 value) {
+  memcpy(bytes, &value, sizeof(value));
+}
+
+bool read_dxbc(const void* data, size_t size, dxbc_container& container) {
+  if (!data || size < k_dxbc_header_size) return false;
+  const auto* bytes = static_cast<const u8*>(data);
+  if (memcmp(bytes, "DXBC", 4) != 0 || read_u32(bytes + 20) != 1) return false;
+  container.size = read_u32(bytes + 24);
+  container.count = read_u32(bytes + 28);
+  const size_t table_end = k_dxbc_header_size + sizeof(u32) * size_t(container.count);
+  if (container.count > k_max_dxbc_chunks ||
+      table_end > container.size || container.size > size) return false;
+  for (u32 i = 0; i < container.count; ++i) {
+    const u32 offset = read_u32(bytes + k_dxbc_header_size + 4u * i);
+    if (offset < table_end || offset > container.size - 8) return false;
+    const auto* header = bytes + offset;
+    const u32 length = read_u32(header + 4);
+    if (length > container.size - offset - 8) return false;
+    for (u32 j = 0; j < i; ++j) {
+      const auto& prior = container.chunks[j];
+      if (header < prior.header + 8 + prior.size && prior.header < header + 8 + length)
+        return false;
+    }
+    container.chunks[i] = {header, read_u32(header), length};
+  }
+  return true;
+}
+
+d3dx_blob* write_dxbc(const dxbc_chunk* chunks, u32 count) {
+  const size_t header_size = k_dxbc_header_size + sizeof(u32) * count;
+  size_t size = header_size;
+  for (u32 i = 0; i < count; ++i) {
+    size = (size + 3u) & ~size_t(3);
+    size += 8u + size_t(chunks[i].size);
+  }
+  if (size > UINT32_MAX) return nullptr;
+  auto* blob = alloc_d3dx_blob(nullptr, size);
+  if (!blob) return nullptr;
+  u8* bytes = blob->data;
+  memcpy(bytes, "DXBC", 4);
+  write_u32(bytes + 20, 1);
+  write_u32(bytes + 24, static_cast<u32>(size));
+  write_u32(bytes + 28, count);
+  size_t offset = header_size;
+  for (u32 i = 0; i < count; ++i) {
+    offset = (offset + 3u) & ~size_t(3);
+    write_u32(bytes + k_dxbc_header_size + 4u * i, static_cast<u32>(offset));
+    const size_t chunk_size = 8u + size_t(chunks[i].size);
+    memcpy(bytes + offset, chunks[i].header, chunk_size);
+    offset += chunk_size;
+  }
+  trt_dxbc_checksum(bytes + 20, static_cast<u32>(size - 20), bytes + 4);
+  return blob;
+}
+
+constexpr u32 k_input_signature = 1, k_output_signature = 2, k_patch_signature = 4;
+
+u32 signature_kind(u32 tag) {
+  switch (tag) {
+    case make_fourcc('I','S','G','N'):
+    case make_fourcc('I','S','G','1'): return k_input_signature;
+    case make_fourcc('O','S','G','N'):
+    case make_fourcc('O','S','G','1'):
+    case make_fourcc('O','S','G','5'): return k_output_signature;
+    case make_fourcc('P','C','S','G'):
+    case make_fourcc('P','S','G','1'): return k_patch_signature;
+    default: return 0;
+  }
+}
+
+bool match_raw_blob_part(u32 part, u32 fourcc) {
   switch (part) {
-    case 0: return fourcc == make_fourcc('I','S','G','N') || fourcc == make_fourcc('I','S','G','1');
-    case 1: return fourcc == make_fourcc('O','S','G','N') || fourcc == make_fourcc('O','S','G','1');
-    case 2: return fourcc == make_fourcc('I','O','S','G');
-    case 3: return fourcc == make_fourcc('P','C','S','G');
-    case 4: return fourcc == make_fourcc('O','S','G','5');
-    case 5:
+    case 5: return fourcc == make_fourcc('S','D','B','G') || fourcc == make_fourcc('S','P','D','B');
+    case 6: return fourcc == make_fourcc('A','o','n','9') ||
+                   fourcc == make_fourcc('S','H','D','R') || fourcc == make_fourcc('S','H','E','X');
+    case 7: return fourcc == make_fourcc('X','N','A','P');
+    case 8: return fourcc == make_fourcc('X','N','A','S');
     case 9: return fourcc == make_fourcc('S','P','D','B');
-    case 6: return fourcc == make_fourcc('S','H','D','R') || fourcc == make_fourcc('S','H','E','X');
     case 10: return fourcc == make_fourcc('P','R','I','V');
     case 11: return fourcc == make_fourcc('R','T','S','0');
     case 12: return fourcc == make_fourcc('I','L','D','N');
+    default: return false;
+  }
+}
+
+bool strip_chunk(u32 tag, u32 flags) {
+  switch (tag) {
+    case make_fourcc('R','D','E','F'):
+    case make_fourcc('S','T','A','T'):
+    case make_fourcc('R','D','1','1'): return (flags & 1u) != 0;
+    case make_fourcc('S','D','B','G'):
+    case make_fourcc('S','P','D','B'):
+    case make_fourcc('I','L','D','N'): return (flags & 2u) != 0;
+    case make_fourcc('P','R','I','V'): return (flags & 8u) != 0;
     default: return false;
   }
 }
@@ -598,29 +705,37 @@ int TRT_GUEST_ABI trt_D3DCreateBlob(size_t size, void** out_blob) {
 
 int TRT_GUEST_ABI trt_D3DGetBlobPart(const void* src_data, size_t src_size,
                                      u32 part, u32 flags, void** out_part) {
-  (void)flags;
   if (!out_part) return k_e_invalidarg;
   *out_part = nullptr;
-  if (!src_data || src_size < 32) return k_e_invalidarg;
-  const u8* p = (const u8*)src_data;
-  if (p[0] != 'D' || p[1] != 'X' || p[2] != 'B' || p[3] != 'C') return k_e_fail;
-  u32 chunk_count = 0;
-  memcpy(&chunk_count, p + 28, sizeof(chunk_count));
-  if (chunk_count > 64 || 32u + (size_t)chunk_count * 4u > src_size) return k_e_fail;
-  for (u32 i = 0; i < chunk_count; ++i) {
-    u32 off = 0;
-    memcpy(&off, p + 32u + (size_t)i * 4u, sizeof(off));
-    if ((size_t)off + 8u > src_size) continue;
-    u32 fourcc = 0, csize = 0;
-    memcpy(&fourcc, p + off, 4);
-    memcpy(&csize, p + off + 4u, 4);
-    if ((size_t)off + 8u + (size_t)csize > src_size) continue;
-    if (match_blob_part(part, fourcc)) {
-      d3dx_blob* b = alloc_d3dx_blob(p + off + 8u, csize);
-      if (!b) return (int)0x8007000Eu;
-      *out_part = b;
-      return 0;
+  if (!src_data || src_size < k_dxbc_header_size || flags) return k_e_invalidarg;
+  dxbc_container container{};
+  if (!read_dxbc(src_data, src_size, container)) return k_e_fail;
+
+  constexpr u32 signature_masks[] = {k_input_signature, k_output_signature,
+      k_input_signature | k_output_signature, k_patch_signature,
+      k_input_signature | k_output_signature | k_patch_signature};
+  if (part < sizeof(signature_masks) / sizeof(signature_masks[0])) {
+    const u32 requested = signature_masks[part];
+    dxbc_chunk signatures[3];
+    u32 count = 0, found = 0;
+    for (u32 i = 0; i < container.count; ++i) {
+      const auto& chunk = container.chunks[i];
+      const u32 kind = signature_kind(chunk.tag);
+      if (!(requested & kind)) continue;
+      if (found & kind) return k_e_fail;
+      found |= kind;
+      signatures[count++] = chunk;
     }
+    if (found != requested) return k_e_fail;
+    *out_part = write_dxbc(signatures, count);
+    return *out_part ? 0 : k_e_outofmemory;
+  }
+
+  for (u32 i = 0; i < container.count; ++i) {
+    const auto& chunk = container.chunks[i];
+    if (!match_raw_blob_part(part, chunk.tag)) continue;
+    *out_part = alloc_d3dx_blob(chunk.header + 8, chunk.size);
+    return *out_part ? 0 : k_e_outofmemory;
   }
   return k_e_fail;
 }
@@ -629,65 +744,18 @@ int TRT_GUEST_ABI trt_D3DStripShader(const void* bytecode, size_t length,
                                      u32 strip_flags, void** out_stripped) {
   if (!out_stripped) return k_e_invalidarg;
   *out_stripped = nullptr;
-  if (!bytecode || length < 32) return k_e_invalidarg;
-  const u8* p = (const u8*)bytecode;
-  if (p[0] != 'D' || p[1] != 'X' || p[2] != 'B' || p[3] != 'C') return k_e_fail;
-  u32 chunk_count = 0;
-  memcpy(&chunk_count, p + 28, sizeof(chunk_count));
-  if (chunk_count > 64 || 32u + (size_t)chunk_count * 4u > length) return k_e_fail;
+  if (!bytecode || length < k_dxbc_header_size) return k_e_invalidarg;
+  dxbc_container container{};
+  if (!read_dxbc(bytecode, length, container)) return k_e_fail;
 
-  // Flags (d3dcompiler.h): 1=REFLECTION(RDEF/STAT/RD11), 2=DEBUG_INFO(SPDB/ILDN),
-  // 4=TEST_BLOBS(SDBG/Aon9), 8=PRIVATE_DATA(PRIV)
-  u32 keep_idx[64];
-  u32 keep_cnt = 0;
-  size_t payload_bytes = 0;
-  for (u32 i = 0; i < chunk_count; ++i) {
-    u32 off = 0;
-    memcpy(&off, p + 32u + (size_t)i * 4u, sizeof(off));
-    if ((size_t)off + 8u > length) continue;
-    u32 fourcc = 0, csize = 0;
-    memcpy(&fourcc, p + off, 4);
-    memcpy(&csize, p + off + 4u, 4);
-    if ((size_t)off + 8u + (size_t)csize > length) continue;
-    const bool strip =
-        ((strip_flags & 1u) && (fourcc == make_fourcc('R','D','E','F') ||
-                                fourcc == make_fourcc('S','T','A','T') ||
-                                fourcc == make_fourcc('R','D','1','1'))) ||
-        ((strip_flags & 2u) && (fourcc == make_fourcc('S','P','D','B') ||
-                                fourcc == make_fourcc('I','L','D','N'))) ||
-        ((strip_flags & 4u) && (fourcc == make_fourcc('S','D','B','G'))) ||
-        ((strip_flags & 8u) && (fourcc == make_fourcc('P','R','I','V')));
-    if (!strip) {
-      keep_idx[keep_cnt++] = off;
-      payload_bytes += 8u + (size_t)csize;
-    }
+  u32 kept = 0;
+  for (u32 i = 0; i < container.count; ++i) {
+    const auto& chunk = container.chunks[i];
+    if (!strip_chunk(chunk.tag, strip_flags)) container.chunks[kept++] = chunk;
   }
-  if (keep_cnt == chunk_count) {
-    d3dx_blob* b = alloc_d3dx_blob(bytecode, length);
-    if (!b) return (int)0x8007000Eu;
-    *out_stripped = b;
-    return 0;
-  }
-  const size_t hdr_bytes = 32u + (size_t)keep_cnt * 4u;
-  const size_t total = hdr_bytes + payload_bytes;
-  d3dx_blob* b = alloc_d3dx_blob(nullptr, total);
-  if (!b) return (int)0x8007000Eu;
-  memcpy(b->data, p, 24);  // DXBC + digest + version
-  const u32 total_u32 = (u32)total;
-  memcpy(b->data + 24, &total_u32, 4);
-  memcpy(b->data + 28, &keep_cnt, 4);
-  size_t cursor = hdr_bytes;
-  for (u32 i = 0; i < keep_cnt; ++i) {
-    const u32 old_off = keep_idx[i];
-    u32 csize = 0;
-    memcpy(&csize, p + old_off + 4u, 4);
-    const u32 new_off = (u32)cursor;
-    memcpy(b->data + 32u + (size_t)i * 4u, &new_off, 4);
-    memcpy(b->data + cursor, p + old_off, 8u + (size_t)csize);
-    cursor += 8u + (size_t)csize;
-  }
-  *out_stripped = b;
-  return 0;
+  *out_stripped = kept == container.count
+      ? alloc_d3dx_blob(bytecode, container.size) : write_dxbc(container.chunks, kept);
+  return *out_stripped ? 0 : k_e_outofmemory;
 }
 
 const trt_named_fn k_d3dx_fns[] = {
