@@ -352,8 +352,23 @@ void* TRT_STDCALL trt_CreateWindowExW(u32 exstyle, const wchar_t* cls,
     const i32 ch = h > 0 ? h : 1080;
     const i64 pos = (i64)((u32)(u16)x | ((u32)(u16)y << 16));
     const i64 size = (i64)((u32)(u16)cw | ((u32)(u16)ch << 16));
-    trt_msg_post_to(hwnd, 0x0003u /*WM_MOVE*/, 0, pos);
-    trt_msg_post_to(hwnd, 0x0005u /*WM_SIZE*/, 0 /*SIZE_RESTORED*/, size);
+    // A registered window receives geometry messages during creation.
+    // Queuing them lets the old size arrive after a later SetWindowPos.
+    if (sync_create) {
+      i64 current_pos = pos, current_size = size;
+      {
+        std::lock_guard<std::mutex> lock(g_win_mu);
+        if (const auto* window = find_win_locked(hwnd)) {
+          current_pos = (u32)(u16)window->x | ((u32)(u16)window->y << 16);
+          current_size = (u32)(u16)window->cx | ((u32)(u16)window->cy << 16);
+        }
+      }
+      dispatch(hwnd, 0x0003u /*WM_MOVE*/, 0, current_pos);
+      dispatch(hwnd, 0x0005u /*WM_SIZE*/, 0 /*SIZE_RESTORED*/, current_size);
+    } else {
+      trt_msg_post_to(hwnd, 0x0003u /*WM_MOVE*/, 0, pos);
+      trt_msg_post_to(hwnd, 0x0005u /*WM_SIZE*/, 0 /*SIZE_RESTORED*/, size);
+    }
     trt_msg_post_to(hwnd, 0x0085u /*WM_NCPAINT*/, 1, 0);
     trt_msg_post_to(hwnd, 0x0014u /*WM_ERASEBKGND*/, 0, (i64)(uintptr_t)hwnd);
     trt_user32_invalidate((void*)(uintptr_t)hwnd,

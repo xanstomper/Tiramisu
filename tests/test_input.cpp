@@ -20,6 +20,7 @@ void* TRT_STDCALL trt_CreateWindowExW(u32, const wchar_t*, const wchar_t*, u32,
 void* TRT_STDCALL trt_SetFocus(void*);
 void* TRT_STDCALL trt_GetFocus(void);
 int TRT_STDCALL trt_ShowWindow(void*, int);
+int TRT_STDCALL trt_SetWindowPos(void*, void*, i32, i32, i32, i32, u32);
 int TRT_STDCALL trt_PostMessageW(void*, u32, u64, i64);
 int TRT_STDCALL trt_RegisterRawInputDevices(const void*, u32, u32);
 u32 TRT_STDCALL trt_GetRawInputData(void*, u32, void*, u32*, u32);
@@ -64,6 +65,8 @@ static unsigned focus_event_count = 0;
 static u64 created_window[8]{};
 static unsigned created_window_count = 0;
 static u32 rejected_window_message = 0;
+static i64 window_size_events[4]{};
+static unsigned window_size_count = 0;
 
 
 static i64 TRT_STDCALL focus_window_proc(u64 window, u32 message, u64 other, i64 reserved) {
@@ -72,6 +75,8 @@ static i64 TRT_STDCALL focus_window_proc(u64 window, u32 message, u64 other, i64
     if (rejected_window_message == message) return -1;
     if (created_window_count < 8) created_window[created_window_count++] = window;
   }
+  if (message == 5 && window_size_count < 4)
+    window_size_events[window_size_count++] = reserved;
   if ((message == 7 || message == 8) && focus_event_count < 8)
     focus_events[focus_event_count++] = {window, message, other, reserved};
   return message == 0x81;
@@ -670,6 +675,13 @@ int main() {
           "CreateWindowEx sends WM_CREATE synchronously even without creation data");
     CHECK(!trt_PeekMessageW(&queued, nullptr, 1, 1, 1),
           "registered windows receive no duplicate queued WM_CREATE");
+    CHECK(trt_SetWindowPos(first, nullptr, 0, 0, 1280, 720, 0x0002u) &&
+              window_size_count == 2 &&
+              window_size_events[0] == (640 | (480 << 16)) &&
+              window_size_events[1] == (1280 | (720 << 16)),
+          "Initial client dimensions arrive before the caller resizes a window");
+    CHECK(!trt_PeekMessageW(&queued, first, 5, 5, 0),
+          "No queued initial WM_SIZE survives a synchronous resize");
     rejected_window_message = 0x81u;
     CHECK(!trt_CreateWindowExW(0, cls.name, nullptr, visible, 0, 0, 640, 480,
                                nullptr, nullptr, nullptr, nullptr) && trt_GetFocus() == second,
