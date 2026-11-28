@@ -1,0 +1,92 @@
+{
+  "console": "Xbox Series S",
+  "package": "Xan.Tiramisu 0.2.5.9",
+  "source": "c76fed859a09763f16e753151dc14ff4348e5e00",
+  "package_sha256": "03da58da59a8f7dc2e4d821196a887221c991e19b178362b765b4f0da53b1622",
+  "entry": "Normal Play",
+  "cuphead": {
+    "screen_samples": [
+      {
+        "phase": "20",
+        "lit_pixels_of_129600": 0
+      },
+      {
+        "phase": "45",
+        "lit_pixels_of_129600": 0
+      },
+      {
+        "phase": "85",
+        "lit_pixels_of_129600": 0
+      },
+      {
+        "phase": "120",
+        "lit_pixels_of_129600": 0
+      },
+      {
+        "phase": "after-13",
+        "lit_pixels_of_129600": 0
+      },
+      {
+        "phase": "after-90",
+        "lit_pixels_of_129600": 0
+      },
+      {
+        "phase": "after-40",
+        "lit_pixels_of_129600": 0
+      },
+      {
+        "phase": "after-32",
+        "lit_pixels_of_129600": 0
+      },
+      {
+        "phase": "settled",
+        "lit_pixels_of_129600": 0
+      }
+    ],
+    "final_presents": 6579,
+    "offscreen_samples": 32,
+    "offscreen_lit_pixels": 0,
+    "last_resize_requested": [
+      320,
+      240
+    ],
+    "last_resize_measured_client": [
+      0,
+      0
+    ],
+    "last_resize_preceded_first_present": true,
+    "visible_menu": false,
+    "input_response": "unverified",
+    "gameplay": "unverified"
+  },
+  "xinput_fixture": {
+    "entry": "Native PE64 guest polling XInputGetState and clearing a D3D11 target. Blue requires matching consecutive packet numbers. Green latches after A or Start goes down and comes up.",
+    "source_of_input": "paired remote keyboard Z via host controller mode",
+    "center_rgb_before": [
+      0,
+      0,
+      204
+    ],
+    "center_rgb_after": [
+      0,
+      204,
+      0
+    ],
+    "physical_controller": "unverified"
+  },
+  "offline": {
+    "input_regression": "failed before, passed after",
+    "focused": [
+      "test_input",
+      "test_dinput",
+      "test_d3d",
+      "test_middleware_bridges"
+    ],
+    "load_only_corpus": {
+      "pass": 123,
+      "fail": 0,
+      "skip": 0
+    },
+    "full_gate": "test_conformance reports 64 new PE32 ABI gaps on parent e02cae7 and on this build."
+  }
+}
