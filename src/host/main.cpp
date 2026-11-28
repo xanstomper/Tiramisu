@@ -3047,7 +3047,6 @@ struct tiramisu_host
     longan::usb_storage::poll(true);
     rescan_games();
     longan::steam_client_init(g_local_state, g_games_dir);
-    trt_steam_load_account(g_local_state.c_str());
     setup_steps({L"Storage ready", graphics_step, L"Gamepads probed",
                  L"Audio ready", url_step, L"Game shelf scanned"},
                 L"Running the built-in self-test…", false);

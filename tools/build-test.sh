@@ -1074,6 +1074,10 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   -o "$out/test_engine_synthesizer"
 "$out/test_engine_synthesizer"
 
+clang++ -std=c++20 -O2 -Wall tests/test_steam_account_ownership.cpp \
+  -o "$out/test_steam_account_ownership"
+"$out/test_steam_account_ownership"
+
 # --- 48. Persistent SPIR-V->HLSL cache: codec round-trip (every field the
 #         pipeline builder reads), key sensitivity, corrupt-entry rejection,
 #         and pruning that never drops the entry the caller is using ---

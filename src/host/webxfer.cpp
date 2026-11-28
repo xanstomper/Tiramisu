@@ -2360,9 +2360,15 @@ bool handle_one_request(sock_t s, bool* out_keep_alive) {
     for (size_t i = 0; i < items.size(); ++i) {
       if (i) out += ",";
       const auto& item = items[i];
+      const auto separator = item.install_dir.find_last_of("/\\");
+      const auto install_name = item.installed
+          ? item.install_dir.substr(separator == std::string::npos ? 0 : separator + 1)
+          : std::string{};
       out += "{\"appid\":" + std::to_string(item.app_id) +
              ",\"title\":\"" + json_escape(item.title) +
              "\",\"size\":\"" + json_escape(item.size_str) +
+             "\",\"account_owned\":" + (item.account_owned ? "true" : "false") +
+             ",\"install_name\":\"" + json_escape(install_name) +
              "\",\"installed\":" + (item.installed ? "true" : "false") +
              ",\"downloading\":" + (item.downloading ? "true" : "false") +
              ",\"queued\":" + (item.queued ? "true" : "false") +

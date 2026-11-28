@@ -1333,9 +1333,10 @@ void scan_installed_into_items(const std::string& games_dir,
     else
       item.status_text = "Windows launch executable missing or invalid. Select Install to retry.";
   };
-  std::vector<uint32_t> owned_ids;
+  // Recreate the local-only rows from the current filesystem scan.
+  items->erase(std::remove_if(items->begin(), items->end(),
+      [](const auto& item) { return !item.account_owned; }), items->end());
   for (auto& it : *items) {
-    owned_ids.push_back(it.app_id);
     const auto found = local_dirs.find(it.app_id);
     if (found != local_dirs.end()) {
       assign_install(it, found->second);
@@ -1353,7 +1354,6 @@ void scan_installed_into_items(const std::string& games_dir,
   for (const auto& kv : local_dirs) {
     const auto& entry = kv.second;
     if (entry.install.state != steam_install_state::ready) continue;
-    owned_ids.push_back(kv.first);
     steam_library_item extra;
     extra.app_id = kv.first;
     const size_t sl = entry.dir.rfind('\\');
@@ -1362,6 +1362,7 @@ void scan_installed_into_items(const std::string& games_dir,
     assign_install(extra, entry);
     items->push_back(std::move(extra));
   }
+  const auto owned_ids = steam_account_owned_appids(*items);
   trt_steam_set_owned_appids(owned_ids.data(), (int)owned_ids.size());
 }
 
@@ -1460,6 +1461,7 @@ void fetch_remote_account_data(std::function<void()> on_library_updated) {
 
   // 2) Owned Games (requires valid access_token; auto-refresh & retry once if stale)
   std::vector<steam_library_item> fetched_items;
+  bool fetched_library = false;
   for (int attempt = 0; attempt < 2 && !access_tok.empty(); ++attempt) {
     std::string resp, err;
     std::string url =
@@ -1483,6 +1485,7 @@ void fetch_remote_account_data(std::function<void()> on_library_updated) {
           auto g = games.GetObjectAt(i);
           steam_library_item it;
           it.app_id = (uint32_t)g.GetNamedNumber(L"appid");
+          it.account_owned = true;
           it.title = g.HasKey(L"name")
                          ? u16to8(std::wstring(g.GetNamedString(L"name").c_str()))
                          : ("App " + std::to_string(it.app_id));
@@ -1497,13 +1500,16 @@ void fetch_remote_account_data(std::function<void()> on_library_updated) {
                   [](const steam_library_item& a, const steam_library_item& b) {
                     return a.title < b.title;
                   });
+        fetched_library = true;
         char msg[128];
         snprintf(msg, sizeof(msg),
                  "steam: loaded %zu owned games for SteamID %llu",
                  fetched_items.size(), (unsigned long long)sid);
         log_line(msg);
+      } else if (r.HasKey(L"game_count") && r.GetNamedNumber(L"game_count") == 0) {
+        fetched_library = true;
       } else {
-        log_line("steam: GetOwnedGames returned empty response.games");
+        log_line("steam: GetOwnedGames returned no ownership snapshot");
       }
     } catch (...) {
       log_line("steam: GetOwnedGames JSON parse exception");
@@ -1584,14 +1590,15 @@ void fetch_remote_account_data(std::function<void()> on_library_updated) {
   {
     std::lock_guard<std::mutex> lk(g_mu);
     if (generation != g_account_generation) return;
-    scan_installed_into_items(games_dir, &fetched_items);
-    if (!fetched_items.empty()) {
+    if (fetched_library) {
+      scan_installed_into_items(games_dir, &fetched_items);
       if (g_active_download) {
         const auto active = std::find_if(g_items.begin(), g_items.end(),
             [](const auto& item) { return item.app_id == g_active_download; });
         const auto fresh = std::find_if(fetched_items.begin(), fetched_items.end(),
             [](const auto& item) { return item.app_id == g_active_download; });
         if (active != g_items.end() && fresh != fetched_items.end()) {
+          fresh->downloading = active->downloading;
           fresh->download_pct = active->download_pct;
           fresh->status_text = active->status_text;
         }
@@ -1938,7 +1945,7 @@ bool steam_client_download_app(uint32_t app_id, std::function<void()> on_complet
       return true;  // repeat requests are idempotent
     const auto item = std::find_if(g_items.begin(), g_items.end(),
         [app_id](const auto& entry) { return entry.app_id == app_id; });
-    if (item == g_items.end() || item->installed ||
+    if (item == g_items.end() || !item->account_owned || item->installed ||
         g_download_queue.size() >= k_max_queued_downloads) return false;
     g_download_queue.push_back({app_id, std::move(on_complete)});
   }

@@ -22,6 +22,7 @@ struct steam_library_item {
   std::string title;
   uint64_t size_bytes = 0;
   std::string size_str;
+  bool account_owned = false;
   bool installed = false;
   bool downloading = false;
   bool queued = false;
@@ -30,6 +31,15 @@ struct steam_library_item {
   std::string install_dir;
   std::string main_exe;
 };
+
+inline std::vector<uint32_t> steam_account_owned_appids(
+    const std::vector<steam_library_item>& items) {
+  std::vector<uint32_t> appids;
+  for (const auto& item : items) {
+    if (item.account_owned && item.app_id) appids.push_back(item.app_id);
+  }
+  return appids;
+}
 
 struct steam_account_snapshot {
   bool signed_in = false;
