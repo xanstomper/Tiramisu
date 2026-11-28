@@ -19,6 +19,7 @@
 //   POST /api/config/<name>                     -> Save exe / appid / args / input preset
 //   DELETE /api/game/<name> | POST /api/delete/<name> -> Delete game directory
 #include "webxfer.h"
+#include "webxfer_resumable.h"
 #include "crash_report.h"
 #include "web_controls_page.h"
 #include "host_log.h"
@@ -525,6 +526,25 @@ std::string find_game_dir(const std::string& name) {
         return root + sep + entry.name;
     }
   }
+  // Direct Play-from-USB/SSD: also resolve readable game folders sitting directly
+  // at the root of an external NTFS/exFAT USB drive (e.g. E:\Cuphead).
+  {
+    std::lock_guard<std::mutex> ext_lock(g_external_storage_mu);
+    for (const auto& vol : g_external_storage) {
+      const std::string drv_tag = (vol.path.size() >= 2 && vol.path[1] == ':')
+                                      ? (" [" + vol.path.substr(0, 2) + "]")
+                                      : std::string();
+      for (const auto& item : vol.items) {
+        if (!item.win32_readable || item.kind != "folder" || item.path.empty())
+          continue;
+        if ((xfer_ieq(item.name, name) ||
+             (!drv_tag.empty() && xfer_ieq(item.name + drv_tag, name))) &&
+            dir_exists(item.path)) {
+          return item.path;
+        }
+      }
+    }
+  }
   return {};
 }
 
@@ -783,6 +803,7 @@ void collect_files_rec(const std::string& base_dir, const std::string& rel_dir,
   std::vector<dir_ent> ents;
   list_dir_entries(dir, &ents);
   for (const auto& e : ents) {
+    if (webxfer_detail::is_temp_upload_artifact(e.name)) continue;
     const std::string rel = rel_dir.empty() ? e.name : (rel_dir + sep + e.name);
     if (e.is_dir) {
       collect_files_rec(base_dir, rel, depth + 1, out);
@@ -1037,165 +1058,7 @@ void download_game_url(std::string url, std::string name, std::string extension,
 #endif
 
 // ---------- Pre-launch PE compatibility inspection ----------
-struct pe_compat_info {
-  std::string arch = "x64";
-  std::string badge = "Windows x64";
-  bool ok = true;
-};
-
-static pe_compat_info inspect_pe_compat(const std::string& gdir,
-                                        const std::string& exe_rel) {
-  pe_compat_info out;
-  const std::string sep(1, XFER_SEP);
-  const std::string full = gdir + sep + exe_rel;
-  FILE* f = fopen(full.c_str(), "rb");
-  if (!f) {
-    out.arch = "unknown";
-    out.badge = "exe unreadable";
-    out.ok = false;
-    return out;
-  }
-  uint8_t hdr[4096] = {};
-  const size_t got = fread(hdr, 1, sizeof(hdr), f);
-  if (got < 0x40 || hdr[0] != 'M' || hdr[1] != 'Z') {
-    fclose(f);
-    out.arch = "unknown";
-    out.badge = "not a Windows PE";
-    out.ok = false;
-    return out;
-  }
-  uint32_t e_lfanew = 0;
-  memcpy(&e_lfanew, hdr + 0x3C, 4);
-  if (e_lfanew + 26 > got || hdr[e_lfanew] != 'P' || hdr[e_lfanew + 1] != 'E') {
-    fclose(f);
-    out.arch = "unknown";
-    out.badge = "invalid PE header";
-    out.ok = false;
-    return out;
-  }
-  const uint16_t machine = (uint16_t)(hdr[e_lfanew + 4] | (hdr[e_lfanew + 5] << 8));
-  const uint16_t num_sec = (uint16_t)(hdr[e_lfanew + 6] | (hdr[e_lfanew + 7] << 8));
-  const uint16_t opt_size = (uint16_t)(hdr[e_lfanew + 20] | (hdr[e_lfanew + 21] << 8));
-  const uint16_t opt_magic = (uint16_t)(hdr[e_lfanew + 24] | (hdr[e_lfanew + 25] << 8));
-  if (machine == 0x8664 && opt_magic == 0x20B) {
-    out.arch = "x64";
-  } else if (machine == 0x014C) {
-    // Tiramisu routes PE32 binaries through the x86-32 interpreter/JIT (x86_run_pe32).
-    out.arch = "x86";
-    out.badge = "x86 32-bit (JIT)";
-    out.ok = true;
-    fclose(f);
-    return out;
-  } else if (machine == 0xAA64) {
-    fclose(f);
-    out.arch = "arm64";
-    out.badge = "ARM64 (Unsupported)";
-    out.ok = false;
-    return out;
-  } else {
-    fclose(f);
-    out.arch = "unknown";
-    out.badge = "Unsupported Arch";
-    out.ok = false;
-    return out;
-  }
-
-  uint32_t imp_rva = 0;
-  const uint32_t opt_off = e_lfanew + 24;
-  if (opt_off + 128 <= got) memcpy(&imp_rva, hdr + opt_off + 120, 4);
-  const uint32_t sec_off = opt_off + opt_size;
-  auto rva_to_file = [&](uint32_t rva) -> uint64_t {
-    const uint32_t secs = num_sec < 96 ? num_sec : 96;
-    for (uint32_t s = 0; s < secs; ++s) {
-      const uint32_t so = sec_off + s * 40;
-      if (so + 40 > got) break;
-      uint32_t vaddr = 0, vsize = 0, raw = 0, rawsz = 0;
-      memcpy(&vsize, hdr + so + 8, 4);
-      memcpy(&vaddr, hdr + so + 12, 4);
-      memcpy(&rawsz, hdr + so + 16, 4);
-      memcpy(&raw, hdr + so + 20, 4);
-      const uint32_t span = vsize > rawsz ? vsize : rawsz;
-      if (rva >= vaddr && rva < vaddr + span && (rva - vaddr) < rawsz) {
-        return (uint64_t)raw + (uint64_t)(rva - vaddr);
-      }
-    }
-    return 0;
-  };
-
-  bool has_d3d11 = false, has_d3d12 = false, has_vk = false;
-  bool has_gl = false, has_d3d9 = false, has_unity = false, has_ac = false;
-  bool has_gdk = false;
-  const uint64_t imp_file = imp_rva ? rva_to_file(imp_rva) : 0;
-  if (imp_file > 0) {
-    uint8_t desc[2048] = {};
-    if (xfer_fseek(f, (long long)imp_file, SEEK_SET) == 0) {
-      const size_t dgot = fread(desc, 1, sizeof(desc), f);
-      for (uint32_t d = 0; d * 20 + 20 <= dgot; ++d) {
-        uint32_t name_rva = 0;
-        memcpy(&name_rva, desc + d * 20 + 12, 4);
-        if (!name_rva) break;
-        const uint64_t nfile = rva_to_file(name_rva);
-        if (!nfile || xfer_fseek(f, (long long)nfile, SEEK_SET) != 0) break;
-        char nm[64] = {};
-        if (fread(nm, 1, sizeof(nm) - 1, f) == 0) continue;
-        const std::string low = xfer_lower(nm);
-        if (low.rfind("d3d11", 0) == 0) has_d3d11 = true;
-        else if (low.rfind("d3d12", 0) == 0) has_d3d12 = true;
-        else if (low.rfind("vulkan-1", 0) == 0) has_vk = true;
-        else if (low.rfind("opengl32", 0) == 0) has_gl = true;
-        else if (low.rfind("d3d9", 0) == 0 || low.rfind("d3d8", 0) == 0 ||
-                 low.rfind("ddraw", 0) == 0) has_d3d9 = true;
-        else if (low.rfind("unityplayer", 0) == 0) has_unity = true;
-        else if (low.find("easyanticheat") != std::string::npos ||
-                 low.find("battleye") != std::string::npos) has_ac = true;
-        else if (low.rfind("xgameruntime", 0) == 0 ||
-                 low.rfind("gamingservices", 0) == 0 ||
-                 low.rfind("gameos", 0) == 0 ||
-                 low.rfind("libhttpclient.gdk", 0) == 0) has_gdk = true;
-      }
-    }
-  }
-  fclose(f);
-
-  // Also check top-level game dir for common kernel anti-cheat launchers/DLLs
-  // and Xbox GDK / GameOS console payloads (not Win32 targets).
-  std::vector<dir_ent> top;
-  list_dir_entries(gdir, &top);
-  for (const auto& e : top) {
-    const std::string low = xfer_lower(e.name);
-    if (low.find("easyanticheat") != std::string::npos ||
-        low.find("battleye") != std::string::npos) {
-      has_ac = true;
-    }
-    if (low == "microsoftgame.config" || low == "gameos.xvd" ||
-        low.rfind("libhttpclient.gdk", 0) == 0) {
-      has_gdk = true;
-    }
-  }
-
-  if (has_ac) {
-    out.badge = "Anti-Cheat Detected (Blocked)";
-    out.ok = false;
-  } else if (has_gdk) {
-    out.badge = "Xbox GDK / GameOS build (Unsupported)";
-    out.ok = false;
-  } else if (has_d3d12 && !has_d3d11) {
-    out.badge = "x64 D3D12 (Experimental)";
-  } else if (has_vk) {
-    out.badge = "x64 Vulkan Ready";
-  } else if (has_unity) {
-    out.badge = "x64 Unity Ready";
-  } else if (has_d3d11) {
-    out.badge = "x64 D3D11 Ready";
-  } else if (has_gl && !has_d3d11) {
-    out.badge = "x64 OpenGL (Experimental)";
-  } else if (has_d3d9) {
-    out.badge = "x64 D3D9 Ready";
-  } else {
-    out.badge = "x64 Windows Ready";
-  }
-  return out;
-}
+#include "webxfer_pe_scan.h"
 
 // ---------- Backup saves / restore / debug bundle zip helpers ----------
 void zip_add_dir_capped(mz_zip_archive* zip, const std::string& dir,
@@ -1412,7 +1275,7 @@ std::string games_json() {
            ",\"fs\":\"" + json_escape(root.fs) + "\"" +
            ",\"usb_id\":\"" + json_escape(usb_id) + "\"" +
            ",\"installed_internal\":" + (is_int ? "true" : "false") +
-           ",\"win32_readable\":true,\"exes\":[";
+           ",\"win32_readable\":true,\"playable_direct\":true,\"exes\":[";
       for (size_t i = 0; i < exes.size(); ++i) {
         if (i) j += ",";
         j += "\"" + json_escape(exes[i]) + "\"";
@@ -1420,7 +1283,7 @@ std::string games_json() {
       j += "]}";
     }
   }
-  // Surface broker-only NTFS USB games so users can see & download them to Xbox.
+  // Surface root-level USB/SSD folders (direct playable!) and broker-only NTFS USB games.
   for (const auto& vol : ext_volumes) {
     std::string drv = vol.path.size() >= 2 && vol.path[1] == ':'
                           ? vol.path.substr(0, 2)
@@ -1430,20 +1293,44 @@ std::string games_json() {
       if (!seen.insert(xfer_lower(item.name)).second) continue;
       const bool is_int = item.installed_internal ||
                           (internal_names.count(xfer_lower(item.name)) > 0);
+      std::vector<std::string> exes;
+      std::string exe = item.exe;
+      pe_compat_info compat;
+      compat.arch = "x64";
+      compat.ok = item.win32_readable;
+      compat.badge = item.win32_readable
+                         ? "USB Direct Play Ready"
+                         : "USB broker — download to Xbox to play";
+      std::string appid, args, input = "auto";
+      if (item.win32_readable && item.kind == "folder" && !item.path.empty() &&
+          dir_exists(item.path)) {
+        scan_game_exes(item.path, item.name, &exes, &exe);
+        if (!exe.empty()) compat = inspect_pe_compat(item.path, exe);
+        appid = read_small_text(item.path + sep + "steam_appid.txt");
+        args = read_small_text(item.path + sep + "tiramisu_args.txt");
+        std::string inp = read_small_text(item.path + sep + "tiramisu_input.txt");
+        if (!inp.empty()) input = inp;
+      }
       if (!first) j += ",";
       first = false;
-      const std::string badge =
-          item.win32_readable ? "USB ready" : "USB broker — download to Xbox to play";
       j += "{\"name\":\"" + json_escape(item.name) + "\",\"exe\":\"" +
-           json_escape(item.exe) + "\",\"appid\":\"\",\"args\":\"\",\"input\":\"auto\","
-           "\"arch\":\"x64\",\"compat\":\"" + json_escape(badge) + "\",\"compat_ok\":" +
-           (item.win32_readable ? "true" : "false") +
+           json_escape(exe) + "\",\"appid\":\"" + json_escape(appid) +
+           "\",\"args\":\"" + json_escape(args) + "\",\"input\":\"" +
+           json_escape(input) + "\",\"arch\":\"" + json_escape(compat.arch) +
+           "\",\"compat\":\"" + json_escape(compat.badge) + "\",\"compat_ok\":" +
+           (compat.ok ? "true" : "false") +
            ",\"location\":\"usb\",\"drive\":\"" + json_escape(drv) +
            "\",\"fs\":\"" + json_escape(vol.fs.empty() ? item.fs : vol.fs) +
            "\",\"usb_id\":\"" + json_escape(item.id) +
            "\",\"installed_internal\":" + (is_int ? "true" : "false") +
            ",\"win32_readable\":" + (item.win32_readable ? "true" : "false") +
-           ",\"exes\":[]}";
+           ",\"playable_direct\":" + (item.win32_readable ? "true" : "false") +
+           ",\"exes\":[";
+      for (size_t i = 0; i < exes.size(); ++i) {
+        if (i) j += ",";
+        j += "\"" + json_escape(exes[i]) + "\"";
+      }
+      j += "]}";
     }
   }
   return j + "]";
@@ -1675,10 +1562,11 @@ bool stream_batch_upload(sock_t s, const char* pre, size_t pre_len,
   return true;
 }
 
-// ---------- Parallel striped chunk upload sessions (/api/upload-chunk-*) ----------
+// ---------- Parallel striped & resumable chunk upload sessions (/api/upload-chunk-*) ----------
 struct chunk_upload_session {
   std::string id;
   std::string staged_path;
+  std::string meta_path;
   std::string final_path;
   std::string game;
   std::string fname;
@@ -1692,7 +1580,18 @@ struct chunk_upload_session {
 
 std::mutex g_chunk_mu;
 std::unordered_map<std::string, chunk_upload_session> g_chunk_sessions;
-std::atomic<uint64_t> g_chunk_seq{1};
+
+bool file_size_exact(const std::string& path, uint64_t* out_size) {
+#if defined(_WIN32)
+  struct _stat64 st {};
+  if (_stat64(path.c_str(), &st) != 0) return false;
+#else
+  struct stat st {};
+  if (stat(path.c_str(), &st) != 0) return false;
+#endif
+  if (out_size) *out_size = static_cast<uint64_t>(st.st_size);
+  return true;
+}
 
 bool preallocate_staged_file(const std::string& path, uint64_t total_size) {
   FILE* f = fopen(path.c_str(), "wb");
@@ -1787,15 +1686,7 @@ bool stream_chunk_to_offset(sock_t s, const char* pre, size_t pre_len,
 }
 
 bool chunk_ranges_cover_total(const std::map<uint64_t, uint64_t>& ranges, uint64_t total) {
-  if (total == 0) return true;
-  uint64_t covered = 0;
-  for (const auto& kv : ranges) {
-    if (kv.first > covered) return false;
-    const uint64_t end = kv.first + kv.second;
-    if (end > covered) covered = end;
-    if (covered >= total) return true;
-  }
-  return covered >= total;
+  return webxfer_detail::chunk_ranges_cover_total(ranges, total);
 }
 
 bool stream_chunked_to_file(sock_t s, const char* pre, size_t pre_len,
@@ -3268,8 +3159,12 @@ bool handle_one_request(sock_t s, bool* out_keep_alive) {
       }
       sess.is_zip = true;
       sess.fname = fname;
-      sess.id = "c" + std::to_string(g_chunk_seq.fetch_add(1)) + "_" + std::to_string(sess.created_ms & 0xFFFFF);
-      sess.staged_path = g_incoming + sep + ".chunk-" + sess.id + "-" + fname;
+      const std::string fp = webxfer_detail::resume_fingerprint_hex(
+          "zip:" + sess.game, xfer_lower(fname), total_size);
+      sess.id = "r_" + fp;
+      mkdirs(g_incoming);
+      sess.staged_path = g_incoming + sep + ".tiramisu-resume-" + fp + ".part";
+      sess.meta_path = g_incoming + sep + ".tiramisu-resume-" + fp + ".meta";
       sess.final_path = g_games_dir + sep + sess.game;
       g_upload_total = total_size;
       g_upload_done = 0;
@@ -3283,12 +3178,15 @@ bool handle_one_request(sock_t s, bool* out_keep_alive) {
       }
       sess.is_zip = false;
       sess.fname = rel;
-      sess.id = "c" + std::to_string(g_chunk_seq.fetch_add(1)) + "_" + std::to_string(sess.created_ms & 0xFFFFF);
+      const std::string fp = webxfer_detail::resume_fingerprint_hex(
+          "file:" + sess.game, xfer_lower(rel), total_size);
+      sess.id = "r_" + fp;
       sess.final_path = g_games_dir + sep + sess.game + sep + rel;
       const size_t sl = sess.final_path.rfind(XFER_SEP);
-      if (sl != std::string::npos) mkdirs(sess.final_path.substr(0, sl));
-      sess.staged_path = (sl != std::string::npos ? sess.final_path.substr(0, sl + 1) : "") +
-                         ".tiramisu-chunk-" + sess.id;
+      const std::string parent = (sl != std::string::npos) ? sess.final_path.substr(0, sl) : g_games_dir;
+      mkdirs(parent);
+      sess.staged_path = parent + sep + ".tiramisu-resume-" + fp + ".part";
+      sess.meta_path = parent + sep + ".tiramisu-resume-" + fp + ".meta";
       set_upload_label(sess.game);
       g_upload_total += total_size;
     } else {
@@ -3296,27 +3194,53 @@ bool handle_one_request(sock_t s, bool* out_keep_alive) {
       return false;
     }
 
-    if (!preallocate_staged_file(sess.staged_path, total_size)) {
-      respond(s, "500 Server Error", "text/plain", "could not preallocate staged file");
-      return false;
-    }
+    bool resumed = false;
+    std::string completed_json = "[]";
     const std::string sid = sess.id;
     {
       std::lock_guard<std::mutex> lk(g_chunk_mu);
-      // Prune stale sessions older than 1 hour.
+      // Prune stale sessions older than 6 hours (preserve resumable work across drops).
       for (auto it = g_chunk_sessions.begin(); it != g_chunk_sessions.end(); ) {
-        if (sess.created_ms - it->second.created_ms > 3600000ll) {
+        if (it->first != sid && sess.created_ms - it->second.created_ms > 21600000ll) {
           remove(it->second.staged_path.c_str());
+          remove(it->second.meta_path.c_str());
           it = g_chunk_sessions.erase(it);
         } else {
           ++it;
         }
       }
-      g_chunk_sessions.emplace(sid, std::move(sess));
+      uint64_t existing_sz = 0;
+      const bool part_matches = file_size_exact(sess.staged_path, &existing_sz) &&
+                                existing_sz == total_size;
+      auto existing_it = g_chunk_sessions.find(sid);
+      if (existing_it != g_chunk_sessions.end() && part_matches &&
+          existing_it->second.total_size == total_size) {
+        existing_it->second.created_ms = sess.created_ms;
+        existing_it->second.is_batch = sess.is_batch;
+        resumed = !existing_it->second.ranges.empty();
+        completed_json = webxfer_detail::format_completed_ranges_json(existing_it->second.ranges);
+        if (sess.is_zip) g_upload_done = webxfer_detail::merged_range_bytes(existing_it->second.ranges);
+      } else if (part_matches &&
+                 webxfer_detail::load_resume_meta(sess.meta_path, total_size, &sess.ranges) &&
+                 !sess.ranges.empty()) {
+        resumed = true;
+        sess.unique_bytes = webxfer_detail::merged_range_bytes(sess.ranges);
+        completed_json = webxfer_detail::format_completed_ranges_json(sess.ranges);
+        if (sess.is_zip) g_upload_done = sess.unique_bytes;
+        g_chunk_sessions[sid] = std::move(sess);
+      } else {
+        if (!preallocate_staged_file(sess.staged_path, total_size)) {
+          respond(s, "500 Server Error", "text/plain", "could not preallocate staged file");
+          return false;
+        }
+        webxfer_detail::init_resume_meta(sess.meta_path, total_size);
+        g_chunk_sessions[sid] = std::move(sess);
+      }
     }
-    char outj[160];
-    snprintf(outj, sizeof(outj),
-             "{\"ok\":true,\"upload_id\":\"%s\",\"chunk_size\":16777216}", sid.c_str());
+    std::string outj = std::string("{\"ok\":true,\"upload_id\":\"") + sid +
+                       "\",\"chunk_size\":16777216,\"resumed\":" +
+                       (resumed ? "true" : "false") +
+                       ",\"completed\":" + completed_json + "}";
     *out_keep_alive = can_keep_alive;
     respond_ka(s, "200 OK", "application/json", outj, can_keep_alive);
     return can_keep_alive;
@@ -3326,6 +3250,7 @@ bool handle_one_request(sock_t s, bool* out_keep_alive) {
     const std::string sid = query_param(query, "id");
     const uint64_t offset = strtoull(query_param(query, "offset").c_str(), nullptr, 10);
     std::string staged_path;
+    std::string meta_path;
     uint64_t total_size = 0;
     {
       std::lock_guard<std::mutex> lk(g_chunk_mu);
@@ -3335,6 +3260,7 @@ bool handle_one_request(sock_t s, bool* out_keep_alive) {
         return false;
       }
       staged_path = it->second.staged_path;
+      meta_path = it->second.meta_path;
       total_size = it->second.total_size;
     }
     if (is_chunked || offset > total_size || content_len > total_size - offset) {
@@ -3356,6 +3282,7 @@ bool handle_one_request(sock_t s, bool* out_keep_alive) {
           it->second.unique_bytes += (content_len - prev);
           prev = content_len;
         }
+        webxfer_detail::append_resume_range(meta_path, offset, content_len);
       }
     }
     char outj[112];
@@ -3375,23 +3302,18 @@ bool handle_one_request(sock_t s, bool* out_keep_alive) {
         respond(s, "404 Not Found", "text/plain", "unknown upload_id");
         return false;
       }
+      if (!chunk_ranges_cover_total(it->second.ranges, it->second.total_size)) {
+        // Preserve staged file + meta so client can immediately resume missing chunks.
+        respond(s, "400 Bad Request", "text/plain", "missing upload chunks");
+        return false;
+      }
       sess = std::move(it->second);
       g_chunk_sessions.erase(it);
     }
-    if (!chunk_ranges_cover_total(sess.ranges, sess.total_size)) {
+    uint64_t staged_sz = 0;
+    if (!file_size_exact(sess.staged_path, &staged_sz) || staged_sz != sess.total_size) {
       remove(sess.staged_path.c_str());
-      respond(s, "400 Bad Request", "text/plain", "missing upload chunks");
-      return false;
-    }
-#if defined(_WIN32)
-    struct _stat64 st {};
-    const bool stat_ok = _stat64(sess.staged_path.c_str(), &st) == 0;
-#else
-    struct stat st {};
-    const bool stat_ok = stat(sess.staged_path.c_str(), &st) == 0;
-#endif
-    if (!stat_ok || static_cast<uint64_t>(st.st_size) != sess.total_size) {
-      remove(sess.staged_path.c_str());
+      remove(sess.meta_path.c_str());
       respond(s, "500 Server Error", "text/plain", "staged file size mismatch");
       return false;
     }
@@ -3400,6 +3322,7 @@ bool handle_one_request(sock_t s, bool* out_keep_alive) {
       std::string note;
       const bool ok = extract_zip(sess.staged_path, sess.final_path, &note);
       remove(sess.staged_path.c_str());
+      remove(sess.meta_path.c_str());
       g_upload_total = 0;
       g_upload_done = 0;
       set_upload_label("");
@@ -3433,6 +3356,7 @@ bool handle_one_request(sock_t s, bool* out_keep_alive) {
 #else
     moved = (rename(sess.staged_path.c_str(), sess.final_path.c_str()) == 0);
 #endif
+    remove(sess.meta_path.c_str());
     if (!moved) {
       remove(sess.staged_path.c_str());
       respond(s, "500 Server Error", "text/plain", "could not commit chunked file");

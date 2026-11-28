@@ -510,8 +510,8 @@ int trt_decode_audio_buffer(const u8* data, size_t len, trt_decoded_pcm* out) {
       return trt_fsb5_decode_payload(TRT_FSB5_PCMFLOAT, payload, payload_len,
                                      rate, channels, 0, out);
     }
-    if (fmt_tag == 0x0011u || fmt_tag == 0x0002u) {
-      // WAV IMA-ADPCM (0x0011) or Wwise ADPCM (0x0002)
+    if (fmt_tag == 0x0011u || fmt_tag == 0x0002u || fmt_tag == 0x0069u) {
+      // WAV IMA-ADPCM (0x0011), Wwise ADPCM (0x0002), or Xbox/MS IMA (0x0069)
       const u32 ba = block_align ? block_align : (36u * channels);
       int16_t* pcm = nullptr;
       u32 got = 0;
@@ -522,6 +522,31 @@ int trt_decode_audio_buffer(const u8* data, size_t len, trt_decoded_pcm* out) {
       out->rate = rate;
       out->channels = channels;
       return 0;
+    }
+    if (fmt_tag == 0xFFFFu) {
+      // Wwise Vorbis (.wem): locate embedded standard OggS stream if present.
+      for (size_t off = 0; off + 4u <= payload_len; ++off) {
+        if (memcmp(payload + off, "OggS", 4) == 0) {
+          if (decode_ogg_to_s16(payload + off, payload_len - off, out) == 0) {
+            if (!out->rate) out->rate = rate;
+            if (!out->channels) out->channels = channels;
+            return 0;
+          }
+          break;
+        }
+      }
+      // Also check full RIFF buffer in case OggS lives in a vorb/data payload boundary.
+      for (size_t off = 12u; off + 4u <= len; ++off) {
+        if (memcmp(data + off, "OggS", 4) == 0) {
+          if (decode_ogg_to_s16(data + off, len - off, out) == 0) {
+            if (!out->rate) out->rate = rate;
+            if (!out->channels) out->channels = channels;
+            return 0;
+          }
+          break;
+        }
+      }
+      return -1;
     }
   }
   return -1;

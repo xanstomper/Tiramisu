@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -42,6 +43,7 @@ struct wwise_bank {
   std::string name;
   std::unordered_map<u32, wwise_media_blob> media;       // media_id -> .wem bytes
   std::unordered_map<u32, u32> sound_to_media;           // sound_obj_id -> media_id
+  std::unordered_map<u32, std::vector<u32>> containers;  // RanSeq/Switch/ActorMixer -> child IDs
   std::unordered_map<u32, wwise_action> actions;         // action_id -> action
   std::unordered_map<u32, std::vector<u32>> events;      // event_id -> action_ids
 };
@@ -66,9 +68,11 @@ std::string g_base_path;
 std::unordered_map<u32, wwise_bank> g_banks;
 std::unordered_map<u32, std::string> g_game_objs;
 std::unordered_map<u32, float> g_rtpcs;
+std::unordered_map<u32, float> g_bus_volumes;  // game_obj -> output bus gain
 std::unordered_map<u32, u32> g_states;
 std::unordered_map<u64, u32> g_switches;  // (game_obj << 32) | group_id -> state_id
 std::vector<wwise_pending_voice> g_pending_voices;
+u32 g_container_rr = 0;
 
 inline u32 rd32(const u8* p) {
   u32 v = 0;
@@ -191,6 +195,35 @@ bool parse_wwise_bank(const u8* data, size_t size, wwise_bank* out) {
           }
         }
         if (!aids.empty()) out->events[obj_id] = std::move(aids);
+      } else if ((type == 5u || type == 6u || type == 7u) && ob_len >= 8u) {
+        // RanSeqCntr (5), SwitchCntr (6), ActorMixer (7): extract child object IDs.
+        // Supports both compact `[u32 count][u32 child_ids...]` layouts and full
+        // Wwise node-parameter-prefixed layouts (scanning u32 aligned offsets for
+        // a valid count + child IDs matching known sounds/media/containers).
+        std::vector<u32> kids;
+        const u32 c0 = rd32(ob);
+        if (c0 > 0 && c0 <= 64u && ob_len == 4u + c0 * 4u) {
+          for (u32 k = 0; k < c0; ++k) kids.push_back(rd32(ob + 4u + k * 4u));
+        } else {
+          for (size_t off = 0; off + 8u <= ob_len; off += 4u) {
+            const u32 cnt = rd32(ob + off);
+            if (cnt == 0 || cnt > 64u || off + 4u + cnt * 4u > ob_len) continue;
+            bool any_known = false;
+            for (u32 k = 0; k < cnt; ++k) {
+              const u32 cid = rd32(ob + off + 4u + k * 4u);
+              if (out->sound_to_media.count(cid) || out->media.count(cid) ||
+                  out->containers.count(cid)) {
+                any_known = true;
+                break;
+              }
+            }
+            if (any_known) {
+              for (u32 k = 0; k < cnt; ++k) kids.push_back(rd32(ob + off + 4u + k * 4u));
+              break;
+            }
+          }
+        }
+        if (!kids.empty()) out->containers[obj_id] = std::move(kids);
       }
       hp += obj_sz;
     }
@@ -232,6 +265,47 @@ bool read_file_vfs_or_host(const char* name, std::vector<u8>* out) {
   return got > 0;
 }
 
+float compute_effective_volume_locked(u32 game_obj) {
+  float gain = 1.0f;
+  auto apply_rtpc = [&](const char* name) {
+    auto it = g_rtpcs.find(wwise_fnv1(name));
+    if (it == g_rtpcs.end()) return;
+    const float v = it->second;
+    if (v <= 0.0f && v >= -96.0f) {
+      // Negative RTPC values represent dB attenuation (-96..0 dB)
+      gain *= (v <= -95.0f) ? 0.0f : powf(10.0f, v / 20.0f);
+    } else if (v > 1.0f && v <= 100.0f) {
+      // Standard 0..100 slider scale
+      gain *= (v / 100.0f);
+    } else {
+      gain *= std::clamp(v, 0.0f, 1.0f);
+    }
+  };
+  apply_rtpc("MasterVolume");
+  apply_rtpc("Volume");
+  auto bit = g_bus_volumes.find(game_obj);
+  if (bit != g_bus_volumes.end()) gain *= std::clamp(bit->second, 0.0f, 1.0f);
+  return std::clamp(gain, 0.0f, 1.0f);
+}
+
+u32 resolve_target_to_media_locked(const wwise_bank& bk, u32 target_id, int depth) {
+  if (depth > 8) return 0;
+  auto sit = bk.sound_to_media.find(target_id);
+  if (sit != bk.sound_to_media.end()) return sit->second;
+  if (bk.media.find(target_id) != bk.media.end()) return target_id;
+  auto cit = bk.containers.find(target_id);
+  if (cit != bk.containers.end() && !cit->second.empty()) {
+    const auto& kids = cit->second;
+    const u32 pick = (g_container_rr++) % static_cast<u32>(kids.size());
+    for (size_t i = 0; i < kids.size(); ++i) {
+      const u32 kid = kids[(pick + i) % kids.size()];
+      const u32 mid = resolve_target_to_media_locked(bk, kid, depth + 1);
+      if (mid != 0) return mid;
+    }
+  }
+  return 0;
+}
+
 void queue_media_playback_locked(u32 media_id, u32 game_obj, u32 playing_id) {
   const std::vector<u8>* blob = nullptr;
   std::vector<u8> external_wem;
@@ -260,7 +334,7 @@ void queue_media_playback_locked(u32 media_id, u32 game_obj, u32 playing_id) {
   v.voice_id = (0x57574953ull << 32) | static_cast<u64>(playing_id);
   v.game_obj = game_obj;
   v.media_id = media_id;
-  v.volume = 1.0f;
+  v.volume = compute_effective_volume_locked(game_obj);
   v.rate = dec.rate ? dec.rate : 44100u;
   v.channels = dec.channels ? dec.channels : 2u;
   const size_t n_samps = static_cast<size_t>(dec.frames) * v.channels;
@@ -289,25 +363,20 @@ void trigger_event_locked(u32 event_id, u32 game_obj, u32 playing_id) {
                              }),
               g_pending_voices.end());
         } else if (act.type == 4u) {
-          // Play action: target_id -> Sound -> media_id (or direct media_id)
-          u32 media_id = act.target_id;
-          auto sit = bk.sound_to_media.find(act.target_id);
-          if (sit != bk.sound_to_media.end()) media_id = sit->second;
+          // Play action: target_id -> Sound or Container (RanSeq/Switch/ActorMixer) -> media_id
+          u32 media_id = resolve_target_to_media_locked(bk, act.target_id, 0);
+          if (!media_id) media_id = act.target_id;
           queue_media_playback_locked(media_id, game_obj, playing_id);
         }
       }
     }
   }
   if (!matched) {
-    // Direct sound ID or media ID fallback
+    // Direct container / sound ID / media ID fallback
     for (const auto& kv : g_banks) {
-      auto sit = kv.second.sound_to_media.find(event_id);
-      if (sit != kv.second.sound_to_media.end()) {
-        queue_media_playback_locked(sit->second, game_obj, playing_id);
-        return;
-      }
-      if (kv.second.media.find(event_id) != kv.second.media.end()) {
-        queue_media_playback_locked(event_id, game_obj, playing_id);
+      const u32 mid = resolve_target_to_media_locked(kv.second, event_id, 0);
+      if (mid != 0) {
+        queue_media_playback_locked(mid, game_obj, playing_id);
         return;
       }
     }
@@ -568,6 +637,12 @@ int TRT_GUEST_ABI wwise_AK_SoundEngine_SetSwitchID(u32 group, u32 state, u32 gam
   g_switches[(static_cast<u64>(game_obj) << 32) | group] = state;
   return AK_Success;
 }
+int TRT_GUEST_ABI wwise_AK_SoundEngine_SetGameObjectOutputBusVolume(u32 emitter, u32 listener, float val) {
+  (void)listener;
+  std::lock_guard<std::mutex> lk(g_wwise_mu);
+  g_bus_volumes[emitter] = std::clamp(val, 0.0f, 1.0f);
+  return AK_Success;
+}
 
 // Music Engine
 int TRT_GUEST_ABI wwise_AK_MusicEngine_Init(void* settings) { (void)settings; return AK_Success; }
@@ -620,6 +695,7 @@ static const trt_named_fn k_wwise_fns[] = {
   {"AK_SoundEngine_SetStateID", (void*)&wwise_AK_SoundEngine_SetStateID},
   {"AK_SoundEngine_SetSwitch", (void*)&wwise_AK_SoundEngine_SetSwitch},
   {"AK_SoundEngine_SetSwitchID", (void*)&wwise_AK_SoundEngine_SetSwitchID},
+  {"AK_SoundEngine_SetGameObjectOutputBusVolume", (void*)&wwise_AK_SoundEngine_SetGameObjectOutputBusVolume},
   {"AK_MusicEngine_Init", (void*)&wwise_AK_MusicEngine_Init},
   {"AK_MusicEngine_Term", (void*)&wwise_AK_MusicEngine_Term},
   {"AK_MusicEngine_GetDefaultInitSettings", (void*)&wwise_AK_MusicEngine_GetDefaultInitSettings},

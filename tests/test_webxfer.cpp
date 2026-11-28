@@ -927,6 +927,127 @@ int main() {
           "OS RemovableDevices / Portable StorageDevice volume is always accepted");
   }
 
+  // ---- 19. Resumable striped chunk upload across simulated drop + re-init ----
+  {
+    const size_t total_sz = 192 * 1024;
+    std::string payload(total_sz, '\0');
+    for (size_t i = 0; i < total_sz; ++i)
+      payload[i] = static_cast<char>((i * 41 + 13) & 0xFF);
+    const size_t split = 96 * 1024;
+
+    const std::string init1 = http_req(
+        port, "POST",
+        "/api/upload-chunk-init?game=ResumeGame&rel=data/big.pak&size=" +
+            std::to_string(total_sz),
+        "");
+    CHECK(init1.find("200 OK") != std::string::npos &&
+              init1.find("\"resumed\":false") != std::string::npos,
+          "initial resumable chunk init returns resumed=false");
+    std::string uid1;
+    const size_t k1 = init1.find("\"upload_id\":\"");
+    if (k1 != std::string::npos) {
+      const size_t e1 = init1.find('"', k1 + 13);
+      uid1 = init1.substr(k1 + 13, e1 - (k1 + 13));
+    }
+    CHECK(!uid1.empty(), "resumable chunk init yields deterministic upload_id");
+
+    // Upload only first half, then simulate drop/premature commit (must preserve partial!)
+    const std::string c0 = http_req(port, "PUT", "/api/upload-chunk?id=" + uid1 + "&offset=0",
+                                    payload.substr(0, split));
+    CHECK(c0.find("200 OK") != std::string::npos, "resumable chunk 0 uploaded");
+    const std::string bad_commit = http_req(port, "POST", "/api/upload-chunk-commit?id=" + uid1, "");
+    CHECK(bad_commit.find("400") != std::string::npos,
+          "premature commit returns 400 and preserves partial chunks for resume");
+
+    // Re-init after simulated browser refresh: must report resumed:true with [0, 98304]!
+    const std::string init2 = http_req(
+        port, "POST",
+        "/api/upload-chunk-init?game=ResumeGame&rel=data/big.pak&size=" +
+            std::to_string(total_sz),
+        "");
+    CHECK(init2.find("200 OK") != std::string::npos &&
+              init2.find("\"resumed\":true") != std::string::npos &&
+              init2.find("[0,98304]") != std::string::npos,
+          "re-init after drop reports resumed=true and exact completed range [0,98304]");
+
+    // /api/list-files must NOT leak temp .tiramisu-resume-* staging artifacts
+    const std::string lf = http_req(port, "GET", "/api/list-files?game=ResumeGame", "");
+    CHECK(lf.find("200 OK") != std::string::npos &&
+              lf.find(".tiramisu-resume-") == std::string::npos,
+          "/api/list-files filters out temporary .tiramisu-resume-* staging files");
+
+    // Upload remaining half and commit
+    const std::string c1 = http_req(port, "PUT",
+                                    "/api/upload-chunk?id=" + uid1 + "&offset=" + std::to_string(split),
+                                    payload.substr(split));
+    CHECK(c1.find("200 OK") != std::string::npos, "resumable chunk 1 uploaded");
+    const std::string commit = http_req(port, "POST", "/api/upload-chunk-commit?id=" + uid1, "");
+    CHECK(commit.find("200 OK") != std::string::npos, "resumed upload commits cleanly");
+    CHECK(read_str_file(root + "/games/ResumeGame/data/big.pak") == payload,
+          "resumed multi-chunk file matches original payload byte-for-byte");
+  }
+
+  // ---- 20. Direct Play-from-USB root folder discovery & launch ----
+  {
+    const std::string usb_root = root + "/fake_usb_e";
+    const std::string usb_game = usb_root + "/UsbDirectTitle";
+    mkdir(usb_root.c_str(), 0755);
+    mkdir(usb_game.c_str(), 0755);
+    {
+      FILE* ef = fopen((usb_game + "/UsbDirectTitle.exe").c_str(), "wb");
+      if (ef) {
+        std::string mz(512, '\0');
+        mz[0] = 'M'; mz[1] = 'Z';
+        uint32_t lfa = 0x80; memcpy(&mz[0x3C], &lfa, 4);
+        mz[0x80] = 'P'; mz[0x81] = 'E';
+        uint16_t mach = 0x8664; memcpy(&mz[0x84], &mach, 2);
+        uint16_t opt = 0x20B; memcpy(&mz[0x98], &opt, 2);
+        fwrite(mz.data(), 1, mz.size(), ef);
+        fclose(ef);
+      }
+    }
+    longan::webxfer_storage_volume vol;
+    vol.name = "Samsung T7";
+    vol.path = "E:";
+    vol.fs = "NTFS";
+    vol.win32_readable = true;
+    longan::webxfer_usb_item it;
+    it.id = "usb_direct_1";
+    it.name = "UsbDirectTitle";
+    it.volume_path = "E:";
+    it.fs = "NTFS";
+    it.path = usb_game;
+    it.kind = "folder";
+    it.exe = "UsbDirectTitle.exe";
+    it.win32_readable = true;
+    vol.items.push_back(it);
+    longan::webxfer_set_external_storage({vol}, "ready");
+
+    const std::string gj = http_req(port, "GET", "/games", "");
+    CHECK(gj.find("200 OK") != std::string::npos &&
+              gj.find("\"name\":\"UsbDirectTitle\"") != std::string::npos &&
+              gj.find("\"playable_direct\":true") != std::string::npos &&
+              gj.find("UsbDirectTitle.exe") != std::string::npos,
+          "GET /games surfaces readable root USB folder with playable_direct=true and scanned exe");
+
+    // Clear any prior launch state and launch directly from USB without copying!
+    std::string dummy_l;
+    while (longan::webxfer_poll_launch(&dummy_l)) {}
+    longan::webxfer_set_running_game("");
+    const std::string rl = http_req(port, "POST", "/launch/UsbDirectTitle", "");
+    CHECK(rl.find("202 Accepted") != std::string::npos,
+          "POST /launch/<usb-root-game> queues direct Play-from-USB (202)");
+    std::string queued_name;
+    CHECK(longan::webxfer_poll_launch(&queued_name) && queued_name == "UsbDirectTitle",
+          "direct USB game launch delivered to host loop");
+    char found_exe[256] = {};
+    std::string found_dir;
+    CHECK(longan::webxfer_find_game("UsbDirectTitle", found_exe, sizeof(found_exe), &found_dir) &&
+              found_dir == usb_game,
+          "webxfer_find_game resolves direct root USB folder path");
+    longan::webxfer_set_external_storage({}, "ready");
+  }
+
   longan::webxfer_shutdown();
   std::string cmd = "rm -rf " + root;
   (void)system(cmd.c_str());

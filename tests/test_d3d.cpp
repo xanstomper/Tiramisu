@@ -782,12 +782,17 @@ int main(int argc, char** argv) {
         i32 client[4]{};
         CHECK(((resize_target_fn)window_vt[14])(window_chain, empty_mode) == 0 &&
                   trt_GetClientRect(window, client) &&
-                  client[2] == 0 && client[3] == 0 &&
+                  client[2] == 640 && client[3] == 360 &&
                   g_requested_width == 640 && g_requested_height == 360,
-              "windowed ResizeTarget accepts an empty mode without replacing buffers");
+              "windowed ResizeTarget with 0x0 preserves client rect without collapsing to 0x0");
         CHECK(((rb_t)window_vt[13])(window_chain, 0, 0, 0, 0, 0) == 0 &&
                   g_requested_width == 640 && g_requested_height == 360,
-              "an empty guest window retains the last usable swap-chain size");
+              "zero-sized ResizeBuffers after empty ResizeTarget retains 640x360");
+        const u32 partial_mode[7]{1280, 0, 60, 1, 87, 0, 0};
+        CHECK(((resize_target_fn)window_vt[14])(window_chain, partial_mode) == 0 &&
+                  trt_GetClientRect(window, client) &&
+                  client[2] == 1280 && client[3] == 360,
+              "ResizeTarget with one zero dimension preserves the other client dimension");
       }
       hooks.configure_d3d11_swapchain = nullptr;
       hooks.get_d3d11_backbuffer = nullptr;

@@ -38,6 +38,7 @@ unsigned TRT_GUEST_ABI wwise_AK_SoundEngine_PostEvent(const char* event_name, un
 unsigned TRT_GUEST_ABI wwise_AK_SoundEngine_PostEventID(unsigned event_id, unsigned game_obj, unsigned flags, void* cb, void* cookie);
 int TRT_GUEST_ABI wwise_AK_SoundEngine_LoadBankMemoryView(const void* buf, unsigned size, unsigned* out_bank_id);
 int TRT_GUEST_ABI wwise_AK_SoundEngine_RenderAudio(int allow_sync);
+int TRT_GUEST_ABI wwise_AK_SoundEngine_SetRTPCValue(const char* name, float val, unsigned game_obj, int dur, int curve);
 
 int TRT_GUEST_ABI eos_Initialize(const void* options);
 int TRT_GUEST_ABI eos_Shutdown(void);
@@ -77,6 +78,8 @@ int TRT_GUEST_ABI bink_BinkNextFrame(void* bnk);
 int TRT_GUEST_ABI bink_BinkWait(void* bnk);
 int TRT_GUEST_ABI bink_BinkShouldSkip(void* bnk);
 unsigned TRT_GUEST_ABI bink_BinkGetFrameNum(void* bnk);
+int TRT_GUEST_ABI bink_BinkGoto(void* bnk, unsigned frame, int flags);
+int TRT_GUEST_ABI bink_BinkCopyToBuffer(void* bnk, void* buf, int pitch, int desth, int destx, int desty, unsigned flags);
 
 int TRT_GUEST_ABI miles_AIL_startup(void);
 int TRT_GUEST_ABI miles_AIL_shutdown(void);
@@ -84,6 +87,8 @@ void* TRT_GUEST_ABI miles_AIL_allocate_sample_handle(void* dig);
 int TRT_GUEST_ABI miles_AIL_free_sample_handle(void* sam);
 void* TRT_GUEST_ABI miles_AIL_open_stream(void* dig, const char* filename, int stream_flags);
 int TRT_GUEST_ABI miles_AIL_sample_status(void* sam);
+int TRT_GUEST_ABI miles_AIL_load_sample_buffer(void* sam, unsigned index, const void* data, unsigned len);
+int TRT_GUEST_ABI miles_AIL_start_sample(void* sam);
 
 int TRT_GUEST_ABI cri_CriAtom_Initialize(const void* config);
 int TRT_GUEST_ABI cri_CriAtom_Finalize(void);
@@ -207,6 +212,43 @@ int main() {
     CHECK(wwise_AK_SoundEngine_RenderAudio(1) == 0, "Wwise RenderAudio flushes voices");
     CHECK(wwise_cap_calls == 1 && wwise_cap_bytes == 256 && wwise_cap_rate == 44100 && wwise_cap_ch == 1,
           "Wwise decoded embedded .wem WAV and submitted PCM to host mixer");
+
+    // HIRC RanSeqCntr (type=5) container + RTPC MasterVolume scaling check
+    static float wwise_cap_vol = 0.0f;
+    trt_audio_set_voice_hook(
+        [](u64, const void*, u32 bytes, u32, u32, u32, u32, float vol, void*) -> int {
+          ++wwise_cap_calls;
+          wwise_cap_bytes = bytes;
+          wwise_cap_vol = vol;
+          return 0;
+        },
+        nullptr);
+    u8 bnk2[1024] = {};
+    size_t bp2 = 0;
+    auto p4 = [&](const char* s) { memcpy(bnk2 + bp2, s, 4); bp2 += 4; };
+    auto p32 = [&](u32 v) { memcpy(bnk2 + bp2, &v, 4); bp2 += 4; };
+    auto p8 = [&](u8 v) { bnk2[bp2++] = v; };
+    p4("BKHD"); p32(8); p32(134); p32(4243);
+    p4("DIDX"); p32(12); p32(9002); p32(0); p32(sizeof(wav));
+    p4("DATA"); p32(sizeof(wav)); memcpy(bnk2 + bp2, wav, sizeof(wav)); bp2 += sizeof(wav);
+    // HIRC: Sound 7002->9002, RanSeqCntr 6001->[7002], Action 8002->Play 6001, Event Play_Cntr->[8002]
+    const u32 ev2 = wwise_AK_SoundEngine_GetIDFromString("Play_Cntr");
+    const u32 hsz2 = 4 + (5 + 13) + (5 + 12) + (5 + 10) + (5 + 9);
+    p4("HIRC"); p32(hsz2); p32(4);
+    p8(2); p32(13); p32(7002); p32(0x00010001u); p8(0); p32(9002);
+    p8(5); p32(12); p32(6001); p32(1); p32(7002);
+    p8(3); p32(10); p32(8002); p8(2); p8(4); p32(6001);
+    p8(4); p32(9); p32(ev2); p8(1); p32(8002);
+    u32 bid2 = 0;
+    CHECK(wwise_AK_SoundEngine_LoadBankMemoryView(bnk2, (u32)bp2, &bid2) == 0 && bid2 == 4243,
+          "Wwise parses HIRC RanSeqCntr container bank");
+    wwise_AK_SoundEngine_SetRTPCValue("MasterVolume", 50.0f, 0, 0, 0);
+    wwise_AK_SoundEngine_PostEvent("Play_Cntr", 10, 0, nullptr, nullptr);
+    wwise_AK_SoundEngine_RenderAudio(1);
+    CHECK(wwise_cap_calls == 2 && wwise_cap_bytes == 256 &&
+              wwise_cap_vol > 0.49f && wwise_cap_vol < 0.51f,
+          "Wwise resolves Event->Action->RanSeqCntr->Sound->Media and applies MasterVolume RTPC (50% -> 0.5)");
+    wwise_AK_SoundEngine_SetRTPCValue("MasterVolume", 100.0f, 0, 0, 0);
     trt_audio_set_voice_hook(nullptr, nullptr);
   }
 
@@ -226,6 +268,15 @@ int main() {
   CHECK(bink_BinkNextFrame(bnk) == 0, "BinkNextFrame succeeds");
   CHECK(bink_BinkWait(bnk) == 0, "BinkWait returns ready (0)");
   CHECK(bink_BinkGetFrameNum(bnk) == 1, "BinkGetFrameNum returns 1");
+  // Verify BinkGoto + BinkNextFrame anti-softlock progression & buffer zeroing
+  bink_BinkGoto(bnk, 0, 0);
+  CHECK(bink_BinkGetFrameNum(bnk) == 0, "BinkGoto(0) resets FrameNum to 0");
+  bink_BinkNextFrame(bnk);
+  CHECK(bink_BinkGetFrameNum(bnk) == 1, "BinkNextFrame advances 0 -> 1 so cutscene loops never hang");
+  unsigned char bink_fb[64];
+  memset(bink_fb, 0xAA, sizeof(bink_fb));
+  bink_BinkCopyToBuffer(bnk, bink_fb, 16, 4, 0, 0, 0);
+  CHECK(bink_fb[0] == 0 && bink_fb[63] == 0, "BinkCopyToBuffer clears target buffer cleanly to black");
   CHECK(bink_BinkClose(bnk) == 0, "BinkClose succeeds");
 
   void* bnk_dir = bink_BinkOpenDirect("intro.bik", 0);
@@ -239,6 +290,24 @@ int main() {
   void* sample = miles_AIL_allocate_sample_handle(nullptr);
   CHECK(sample != nullptr, "AIL_allocate_sample_handle returns valid non-null handle");
   CHECK(miles_AIL_sample_status(sample) == 0, "AIL_sample_status returns done (0)");
+  {
+    static int miles_calls = 0;
+    static u32 miles_bytes = 0;
+    trt_audio_set_voice_hook(
+        [](u64, const void*, u32 bytes, u32, u32, u32, u32, float, void*) -> int {
+          ++miles_calls;
+          miles_bytes = bytes;
+          return 0;
+        },
+        nullptr);
+    short pcm[64];
+    for (int i = 0; i < 64; ++i) pcm[i] = (short)(i * 100);
+    miles_AIL_load_sample_buffer(sample, 0, pcm, sizeof(pcm));
+    miles_AIL_start_sample(sample);
+    CHECK(miles_calls == 1 && miles_bytes == sizeof(pcm) && miles_AIL_sample_status(sample) == 0,
+          "Miles AIL_load_sample_buffer + AIL_start_sample submits PCM and marks SMP_DONE");
+    trt_audio_set_voice_hook(nullptr, nullptr);
+  }
   CHECK(miles_AIL_free_sample_handle(sample) == 1, "AIL_free_sample_handle succeeds");
 
   void* stream = miles_AIL_open_stream(nullptr, "music.wav", 0);

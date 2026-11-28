@@ -272,9 +272,14 @@ int TRT_GUEST_ABI host_d3d12_exp(u32 n, const void* iids, void* cfg,
 
 DXGI_FORMAT sanitize_flip_fmt(u32 fmt) {
   switch (fmt) {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
     case DXGI_FORMAT_R8G8B8A8_UNORM:
     case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
       return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+      return DXGI_FORMAT_B8G8R8A8_UNORM;
     case DXGI_FORMAT_R10G10B10A2_UNORM:
       return DXGI_FORMAT_R10G10B10A2_UNORM;
     case DXGI_FORMAT_R16G16B16A16_FLOAT:
@@ -410,7 +415,7 @@ int TRT_GUEST_ABI configure_d3d11_swapchain(u32 width, u32 height, u32 format,
     // then transfer the bits to the corresponding UNORM CoreWindow texture.
     auto resolve_desc = texture;
     resolve_desc.SampleDesc = {1, 0};
-    resolve_desc.BindFlags = 0;
+    resolve_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     const HRESULT resolve_created =
         g_device->CreateTexture2D(&resolve_desc, nullptr, resolved.put());
     if (FAILED(resolve_created)) return resolve_created;
@@ -969,7 +974,18 @@ bool blit_texture_to_backbuffer(ID3D11Texture2D* src, ID3D11Texture2D* dst) {
     return false;
 
   winrt::com_ptr<ID3D11RenderTargetView> rtv;
-  if (FAILED(g_device->CreateRenderTargetView(dst, nullptr, rtv.put())))
+  const bool src_is_srgb = (sd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+                            sd.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+  if (src_is_srgb && (dd.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                      dd.Format == DXGI_FORMAT_R8G8B8A8_UNORM)) {
+    D3D11_RENDER_TARGET_VIEW_DESC rtvd{};
+    rtvd.Format = (dd.Format == DXGI_FORMAT_B8G8R8A8_UNORM)
+                      ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+                      : DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    rtvd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    g_device->CreateRenderTargetView(dst, &rtvd, rtv.put());
+  }
+  if (!rtv && FAILED(g_device->CreateRenderTargetView(dst, nullptr, rtv.put())))
     return false;
 
   // The immediate context also holds guest UAVs, predicates and shader class

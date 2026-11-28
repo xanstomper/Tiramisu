@@ -163,7 +163,7 @@ int configure_guest_swapchain(u32 width, u32 height, u32 fmt, u32 count,
   if (sampling.count > 1 && !g_hooks.configure_d3d11_swapchain) return TRT_E_NOTIMPL;
   const u32 requested_width = width, requested_height = height;
   i32 client_width = 0, client_height = 0;
-  if (hwnd && (!width || !height))
+  if (hwnd)
     trt_user32_client_size(hwnd, &client_width, &client_height);
   if (!width) {
     width = client_width > 0 ? static_cast<u32>(client_width) :
@@ -472,12 +472,27 @@ int TRT_GUEST_ABI fake_sc_ResizeTarget(void*, const void* mode) {
   if (dimensions && width <= INT32_MAX && height <= INT32_MAX) {
     result = unavailable;
     if (!g_sc_is_d3d12 && g_d3d11_hwnd) {
-      // Desktop windowed ResizeTarget changes the client rectangle. A later
-      // ResizeBuffers (including one from WM_SIZE) re-creates the buffers.
-      constexpr u32 flags = 0x0002u | 0x0004u | 0x0010u;  // NOMOVE | NOZORDER | NOACTIVATE
-      result = trt_SetWindowPos(g_d3d11_hwnd, nullptr, 0, 0,
-                               static_cast<i32>(width), static_cast<i32>(height), flags)
-                   ? 0 : invalid_call;
+      // Per DXGI spec, Width==0 or Height==0 in ResizeTarget means "preserve
+      // the current client dimension" — NEVER collapse the guest HWND to 0x0
+      // (which fires WM_SIZE(0,0) and drops Unity/Cuphead to 320x240 / black).
+      i32 cur_w = 0, cur_h = 0;
+      trt_user32_client_size(g_d3d11_hwnd, &cur_w, &cur_h);
+      if (width == 0 && height == 0) {
+        result = 0;
+      } else {
+        const u32 eff_w = width ? width :
+            (cur_w > 0 ? static_cast<u32>(cur_w)
+                       : (g_d3d11_width.load() ? g_d3d11_width.load()
+                                               : (g_hooks.width ? g_hooks.width : 1280u)));
+        const u32 eff_h = height ? height :
+            (cur_h > 0 ? static_cast<u32>(cur_h)
+                       : (g_d3d11_height.load() ? g_d3d11_height.load()
+                                                : (g_hooks.height ? g_hooks.height : 720u)));
+        constexpr u32 flags = 0x0002u | 0x0004u | 0x0010u;  // NOMOVE | NOZORDER | NOACTIVATE
+        result = trt_SetWindowPos(g_d3d11_hwnd, nullptr, 0, 0,
+                                 static_cast<i32>(eff_w), static_cast<i32>(eff_h), flags)
+                     ? 0 : invalid_call;
+      }
     }
   }
   std::lock_guard<std::mutex> lock(g_resize_stats_mutex);

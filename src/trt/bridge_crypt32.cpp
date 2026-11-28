@@ -18,8 +18,8 @@
 #include <time.h>
 
 namespace {
-constexpr u32 k_err_invalid_parameter = 87;
-constexpr u32 k_err_no_data = 232;
+[[maybe_unused]] constexpr u32 k_err_invalid_parameter = 87;
+[[maybe_unused]] constexpr u32 k_err_no_data = 232;
 
 namespace cryptlog {
 static void line(const char* s) { trt_core_log(s); }

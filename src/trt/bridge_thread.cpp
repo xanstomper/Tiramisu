@@ -1800,7 +1800,7 @@ bool drain_apcs_locked(std::unique_lock<std::mutex>& lk, u32 tid) {
 }
 
 // Uncapped generation-safe Win32 TlsAlloc/TlsGetValue/TlsSetValue
-std::mutex g_tls_mu;
+[[maybe_unused]] std::mutex g_tls_mu;
 std::vector<bool> g_tls_used;
 std::vector<u32> g_tls_gen;
 thread_local std::vector<std::pair<u32, void*>> t_tls_vals;

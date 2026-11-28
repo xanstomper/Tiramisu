@@ -314,7 +314,7 @@ bool file_view_mode_enabled() {
   return enabled;
 }
 
-bool file_view_readahead_enabled() {
+[[maybe_unused]] bool file_view_readahead_enabled() {
   static const bool enabled = [] {
     const char* env = std::getenv("TRT_MAP_READAHEAD");
     return !(env && strcmp(env, "0") == 0);
@@ -322,7 +322,7 @@ bool file_view_readahead_enabled() {
   return enabled;
 }
 
-void log_file_view_once() {
+[[maybe_unused]] void log_file_view_once() {
   static bool done = false;
   if (done) return;
   done = true;

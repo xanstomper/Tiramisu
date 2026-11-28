@@ -26,7 +26,7 @@
 #endif
 
 namespace {
-constexpr int k_s_ok = 0;
+[[maybe_unused]] constexpr int k_s_ok = 0;
 
 namespace dbglog {
 static void line(const char* s) { trt_core_log(s); }
@@ -34,7 +34,7 @@ static void line(const char* s) { trt_core_log(s); }
 #define log_line(s_) dbglog::line(s_)
 
 // utf16 helper
-void w2a(const u16* in, char* out, u32 cap) {
+[[maybe_unused]] void w2a(const u16* in, char* out, u32 cap) {
   u32 o = 0;
   if (in)
     for (; in[o] && o + 1 < cap; ++o) out[o] = (char)in[o];
@@ -55,7 +55,7 @@ void* sym_alloc(void* base) {
   }
   return nullptr;
 }
-bool sym_valid(void* h) {
+[[maybe_unused]] bool sym_valid(void* h) {
   const u32 v = (u32)(uintptr_t)h;
   return (v >> 16) == 0x5359u && (v & 0xFFFFu) < 16 && g_sym[v & 0xFFFFu].tag;
 }

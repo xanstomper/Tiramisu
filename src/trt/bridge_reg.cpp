@@ -397,7 +397,7 @@ void load_hive() {
 
 // ------------------------------------------------------------- the functions
 
-u32 reg_strlen(const u16* s) {
+[[maybe_unused]] u32 reg_strlen(const u16* s) {
   u32 n = 0;
   while (s && s[n]) ++n;
   return n;

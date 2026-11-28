@@ -445,7 +445,7 @@ u32 TRT_GUEST_ABI base_release(void* self) {
   return r;
 }
 
-int TRT_GUEST_ABI base_qi_self(void* self, const void* riid, void** ppv) {
+[[maybe_unused]] int TRT_GUEST_ABI base_qi_self(void* self, const void* riid, void** ppv) {
   if (!ppv) return k_e_invalidarg;
   (void)riid;
   *ppv = self;
@@ -2502,8 +2502,8 @@ int TRT_GUEST_ABI queue_qi(void* self, const void* riid, void** ppv) {
   return d3d12_qi_chain(self, riid, ppv, chain, "ID3D12CommandQueue");
 }
 
-void TRT_GUEST_ABI queue_update_tile(void*, void*, u32, const void*, const void*, void*, u32, const void*, const void*, const void*, u32) {}
-void TRT_GUEST_ABI queue_copy_tile(void*, void*, const void*, const void*, void*, u64, u32) {}
+[[maybe_unused]] void TRT_GUEST_ABI queue_update_tile(void*, void*, u32, const void*, const void*, void*, u32, const void*, const void*, const void*, u32) {}
+[[maybe_unused]] void TRT_GUEST_ABI queue_copy_tile(void*, void*, const void*, const void*, void*, u64, u32) {}
 
 void TRT_GUEST_ABI queue_exec_lists(void* self, u32 count, void* const* lists) {
   auto* q = (d3d12_queue*)self;
@@ -2552,8 +2552,8 @@ void TRT_GUEST_ABI queue_exec_lists(void* self, u32 count, void* const* lists) {
   }
 }
 
-void TRT_GUEST_ABI queue_marker_evt(void*, u32, const void*, u32) {}
-void TRT_GUEST_ABI queue_end_evt(void*) {}
+[[maybe_unused]] void TRT_GUEST_ABI queue_marker_evt(void*, u32, const void*, u32) {}
+[[maybe_unused]] void TRT_GUEST_ABI queue_end_evt(void*) {}
 
 int TRT_GUEST_ABI queue_signal(void*, void* fence, u64 value) {
   if (!fence) return k_e_invalidarg;
@@ -2579,7 +2579,7 @@ int TRT_GUEST_ABI queue_clock_cal(void*, u64* gpu_ts, u64* cpu_ts) {
   return k_s_ok;
 }
 
-d3d12_queue_desc_t* TRT_GUEST_ABI queue_get_desc(void* self, d3d12_queue_desc_t* ret) {
+[[maybe_unused]] d3d12_queue_desc_t* TRT_GUEST_ABI queue_get_desc(void* self, d3d12_queue_desc_t* ret) {
   if (ret) *ret = ((d3d12_queue*)self)->desc;
   return ret;
 }

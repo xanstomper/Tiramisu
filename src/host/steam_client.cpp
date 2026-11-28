@@ -326,7 +326,7 @@ bool http_post_protobuf_steam(const std::string& endpoint,
   }
 }
 
-bool http_post_form_steam(const std::string& endpoint,
+[[maybe_unused]] bool http_post_form_steam(const std::string& endpoint,
                           const std::string& input_json, std::string* out,
                           std::string* err) {
   try {
