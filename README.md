@@ -9,16 +9,19 @@
 **A Windows PE64 application runtime for Xbox Dev Mode.**
 Wine's job, targeting UWP instead of POSIX.
 
-![Status](https://img.shields.io/badge/status-Cuphead%20playable%20%7C%20RACCOIN%20playable%20%7C%20Celeste%20playable%20%7C%20God%20of%20War%20renders-brightgreen)
+[![Cuphead playable](https://img.shields.io/badge/Cuphead-playable-brightgreen)](#cuphead--native-xbox-gameplay)
+[![Celeste playable](https://img.shields.io/badge/Celeste-playable-brightgreen)](#celeste--playable)
+[![RACCOIN playable](https://img.shields.io/badge/RACCOIN-playable-brightgreen)](#raccoin--playable)
+[![God of War renders](https://img.shields.io/badge/God%20of%20War-renders-blue)](#god-of-war--boots-and-renders-the-forest)
 ![Suites](https://img.shields.io/badge/offline%20suites-78-blue)
 ![Coverage](https://img.shields.io/badge/corpus%20imports-100%25%20real-brightgreen)
 ![Platform](https://img.shields.io/badge/platform-Xbox%20One%20%7C%20One%20S%20%7C%20One%20X%20%7C%20Series%20X%7CS-107C10?logo=xbox&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![DRM](https://img.shields.io/badge/DRM%20bypass-none%2C%20ever-red)
 
-[Install](#-quick-start-xbox-dev-mode) · [What Works](#-before-you-download-what-works-today) · [Console proof](#console-proof-2026-11-19) · [What boots](#-what-boots-today) · [Build](#-build-from-source-linux) · [Issues](https://github.com/xanstomper/Tiramisu/issues/new/choose)
+[Install](#-quick-start-xbox-dev-mode) · [What Works](#-before-you-download-what-works-today) · [Console proof](#console-proof) · [What boots](#-what-boots-today) · [Build](#-build-from-source-linux) · [Issues](https://github.com/xanstomper/Tiramisu/issues/new/choose)
 
-**[⬇ Download Latest Release](https://github.com/xanstomper/Tiramisu/releases)** · **[🎮 Compatibility Matrix](docs/title-matrix.md)**
+**[⬇ Download Latest Release](https://github.com/xanstomper/Tiramisu/releases)** · **[🎮 Compatibility Matrix](docs/title-matrix.md)** · **[▶ Cuphead Gameplay MP4](docs/proof/cuphead-gameplay.mp4)**
 
 </div>
 
@@ -91,9 +94,9 @@ shooting during encounters with enemies.
 
 ![Cuphead main menu on Xbox Series S](docs/proof/cuphead-main-menu.jpg)
 
-[![Cuphead Forest Follies gameplay on Xbox Series S](docs/proof/cuphead-gameplay.gif)](docs/proof/cuphead-gameplay.mp4)
+[▶ Watch Cuphead’s Forest Follies gameplay (MP4)](docs/proof/cuphead-gameplay.mp4)
 
-The silent 15-second clip uses 25 Xbox Device Portal display captures. [Runtime evidence](docs/proof/xbox-series-s-2026-11-28-cuphead-720p-02512.json)
+The silent 17-second MP4 uses 43 Xbox Device Portal captures at about 2.4 frames per second. During the take, the median game presentation rate was 47.9 D3D11 Presents per second. [Runtime evidence](docs/proof/xbox-series-s-2026-11-28-cuphead-720p-02512.json)
 
 ### RACCOIN — playable
 
@@ -803,7 +806,7 @@ failure is a red gate, never a skipped test.
 - **M0 console PoC — done (2026-11-19).** Signed MSIX deploys; RACCOIN
   reaches its menu, starts a run and plays; God of War boots and renders the
   forest; Celeste boots and renders its title screen. Evidence:
-  [Console proof](#console-proof-2026-11-19).
+  [Console proof](#console-proof).
 - **M1b — Celeste gameplay — done (2026-11-21).** Menu navigation, level
   entry and Chapter 1 gameplay verified on console. Console audio still to
   restore (FSB/Vorbis decode currently disabled due to a heap-corruption

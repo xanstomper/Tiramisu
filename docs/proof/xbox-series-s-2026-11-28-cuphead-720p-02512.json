@@ -100,25 +100,28 @@
     ],
     "input_source": "paired remote keyboard controls",
     "capture_source": "Xbox Device Portal display screenshots",
-    "screenshots": 25,
+    "screenshots": 43,
     "screenshot_errors": 0,
-    "sampled_seconds": 14.33,
-    "mean_screenshots_per_second": 1.68,
-    "mp4_duration_seconds": 15.0,
+    "sampled_seconds": 17.57,
+    "mean_screenshots_per_second": 2.39,
+    "mp4_duration_seconds": 17.36,
     "audio_captured": false,
     "full_level_completion_verified": false,
     "render_status_after_capture": {
-      "d3d11_successful_presents": 203632,
+      "d3d11_successful_presents": 302972,
       "d3d11_width": 1280,
-      "d3d11_height": 720,
-      "guest_lit_pixels": 16,
-      "host_lit_pixels": 16,
-      "guest_commit_mib": 438
+      "d3d11_height": 720
     },
     "files": [
       "docs/proof/cuphead-main-menu.jpg",
-      "docs/proof/cuphead-gameplay.mp4",
-      "docs/proof/cuphead-gameplay.gif"
-    ]
+      "docs/proof/cuphead-gameplay.mp4"
+    ],
+    "successful_presents_per_second_during_recording": {
+      "metric": "D3D11 successful Present deltas during capture after the first 2 seconds",
+      "intervals": 15,
+      "minimum": 25.48,
+      "median": 47.85,
+      "maximum": 55.11
+    }
   }
 }
