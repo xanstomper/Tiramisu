@@ -1,0 +1,3 @@
+# Sekiro rendering
+
+The latest historical evidence shows an 800×452 WARP frame with missing title artwork and block-shaped text. The native path previously terminated inside the system shader converter. The seven rejected 3D input layouts sampled by the earlier session also failed on Wine and DXVK. The focused Xbox test verified padded R8 and A8 uploads and pixel readback of a synthetic glyph atlas. A fresh title run must verify the actual texture and shader path used by the game.
