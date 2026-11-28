@@ -21,7 +21,7 @@ Wine's job, targeting UWP instead of POSIX.
 
 [Install](#-quick-start-xbox-dev-mode) · [What Works](#-before-you-download-what-works-today) · [Console proof](#console-proof) · [What boots](#-what-boots-today) · [Build](#-build-from-source-linux) · [Issues](https://github.com/xanstomper/Tiramisu/issues/new/choose)
 
-**[⬇ Download Latest Release](https://github.com/xanstomper/Tiramisu/releases)** · **[🎮 Compatibility Matrix](docs/title-matrix.md)** · **[▶ Cuphead Gameplay MP4](docs/proof/cuphead-gameplay.mp4)**
+**[⬇ Download Latest Release](https://github.com/xanstomper/Tiramisu/releases)** · **[🎮 Compatibility Matrix](docs/title-matrix.md)** · **[▶ Cuphead Gameplay](#cuphead--native-xbox-gameplay)**
 
 </div>
 
@@ -94,7 +94,7 @@ shooting during encounters with enemies.
 
 ![Cuphead main menu on Xbox Series S](docs/proof/cuphead-main-menu.jpg)
 
-[▶ Watch Cuphead’s Forest Follies gameplay (MP4)](docs/proof/cuphead-gameplay.mp4)
+https://github.com/user-attachments/assets/fbe63bd8-fe84-4508-bf5d-50ba74d2c953
 
 The silent 17-second MP4 uses 43 Xbox Device Portal captures at about 2.4 frames per second. During the take, the median game presentation rate was 47.9 D3D11 Presents per second. [Runtime evidence](docs/proof/xbox-series-s-2026-11-28-cuphead-720p-02512.json)
 
