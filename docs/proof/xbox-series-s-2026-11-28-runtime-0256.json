@@ -1,0 +1,83 @@
+{
+  "date_utc": "2026-11-28",
+  "console": "Xbox Series S",
+  "package_version": "0.2.5.6",
+  "base_commit": "431718238214e2f4d04d6275bf185caef9123df6",
+  "package_sha256": "b990c4ce7c3f801acd953923d9554fd1021337747706721bf8d6bc98c0da4061",
+  "entry_point": "Play (LAN dashboard)",
+  "experiment": "When D3D11 uses a stable guest backbuffer and the host display extent is available, use that extent for creation and subsequent resizes.",
+  "historical_observation": "A separate diagnostic package showed the Cuphead title screen in color on November 25. Its public source revision and game executable hash were unverified.",
+  "render_sample": {
+    "elapsed_ms": 72000,
+    "d3d11_resize_target_width": 0,
+    "d3d11_resize_target_height": 0,
+    "d3d11_resize_buffer_requested_width": 320,
+    "d3d11_resize_buffer_requested_height": 240,
+    "d3d11_resize_buffer_client_width": 0,
+    "d3d11_resize_buffer_client_height": 0,
+    "d3d11_resize_buffer_present_count": 0,
+    "surface_other_samples": 22,
+    "surface_other_width": 320,
+    "surface_other_height": 240,
+    "surface_other_format": 27,
+    "surface_other_result": 0,
+    "surface_other_rtv_samples": 22,
+    "surface_samples": 22,
+    "surface_probe_result": 0,
+    "surface_guest_rtv_samples": 0,
+    "d3d11_width": 1920,
+    "d3d11_height": 1080,
+    "d3d11_resize_target_calls": 1,
+    "d3d11_resize_buffer_calls": 2,
+    "d3d11_resize_buffer_result": 0,
+    "d3d11_device_calls": 1,
+    "d3d11_swapchains": 1,
+    "d3d11_successful_presents": 2632,
+    "guest_lit_pixels": 0,
+    "host_lit_pixels": 0,
+    "surface_other_lit_pixels": 0,
+    "surface_bound_retired": 0,
+    "surface_bound_untagged": 22,
+    "coverage_samples": 22,
+    "shader_input_bc3_nontransparent_lit_peak": 256
+  },
+  "screen_captures": [
+    {
+      "phase": 16,
+      "capture_unavailable": true
+    },
+    {
+      "phase": 26,
+      "lit_pixels": 0,
+      "total": 129600
+    },
+    {
+      "phase": 44,
+      "lit_pixels": 0,
+      "total": 129600
+    },
+    {
+      "phase": 72,
+      "lit_pixels": 0,
+      "total": 129600
+    },
+    {
+      "phase": "key-90",
+      "lit_pixels": 0,
+      "total": 129600
+    },
+    {
+      "phase": "key-13",
+      "lit_pixels": 0,
+      "total": 129600
+    },
+    {
+      "phase": "key-40",
+      "lit_pixels": 0,
+      "total": 129600
+    }
+  ],
+  "visible_game_frame": false,
+  "visible_menu": false,
+  "visible_game_response": false
+}

@@ -126,3 +126,11 @@ On 0.2.4.43 and newer, the `shader_input_*` fields in `GET /api/render-status`
 include a bounded sample of a 2D texture bound to the pixel shader at
 Present. They describe state at that moment and report no pixel data.
 The sampled texture may differ from inputs used by earlier draw calls.
+
+## November 28 Series S D3D11 playback checks
+
+Cuphead on 0.2.5.5 reached native entry, created a D3D11 device and swap chain, and completed 4,571 Presents in the 105-second sample. All 32 sampled offscreen readbacks finished successfully and stayed dark, along with the guest and host presentation samples. Colored BC3 shader input was present. The sampled output does not establish which draw or transfer first lost color. [0.2.5.5 data](proof/xbox-series-s-2026-11-28-runtime-0255.json)
+
+A local November 25 capture from a separate diagnostic package showed the Cuphead title screen in color. Its log recorded a single stable texture over a 1920×1080 CoreWindow chain. The 0.2.5.6 experiment kept that extent even when the guest requested a 320×240 resize. Offscreen, guest and host samples stayed dark through 2,632 Presents. The input sequence produced no visible response. This comparison isolates the extent change within the current runtime. The older executable and full build identity remain unverified. [Geometry experiment](proof/xbox-series-s-2026-11-28-runtime-0256.json)
+
+On 0.2.5.5, Sekiro reached native entry at the 5.5-second sample. The dashboard then stopped responding. Device Portal last saw the package process at 10.5 seconds and reported it absent at 16.6 seconds. The persisted checkpoint still reported native entry in progress. No worker-fault record or D3D11 activity identified the terminating operation. [Sekiro data](proof/xbox-series-s-2026-11-28-runtime-0255.json)
