@@ -4,6 +4,7 @@
 // path traversal rejection, per-game config persistence, launch/stop/rescan/delete,
 // Expect: 100-continue handling, and live log tailing.
 #include "../src/host/webxfer.h"
+#include "../src/host/usb_volume_filter.h"
 #include "../src/host/host_log.h"
 #include "../src/host/vendor/miniz.h"
 
@@ -100,10 +101,15 @@ std::string http_req(unsigned short port, const std::string& method,
 std::string read_str_file(const std::string& p) {
   FILE* f = fopen(p.c_str(), "rb");
   if (!f) return {};
-  char buf[4096];
-  size_t n = fread(buf, 1, sizeof(buf), f);
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (sz <= 0) { fclose(f); return {}; }
+  std::string out((size_t)sz, '\0');
+  size_t n = fread(out.data(), 1, (size_t)sz, f);
   fclose(f);
-  return std::string(buf, n);
+  out.resize(n);
+  return out;
 }
 
 bool file_exists(const std::string& p) {
@@ -691,6 +697,234 @@ int main() {
           "/api/status surfaces live USB install progress");
     longan::webxfer_set_usb_install_status(false, "", 1024, 1024, "", "USB -> ExfatPacked");
     longan::webxfer_set_external_storage({}, "ready");
+  }
+
+  // 14. Turbo LAN binary batch upload (/api/upload-batch) + path traversal guard
+  {
+    std::string batch;
+    auto add_rec = [&](const std::string& rel, const std::string& data) {
+      uint32_t plen = (uint32_t)rel.size();
+      uint64_t dlen = (uint64_t)data.size();
+      batch.append(reinterpret_cast<const char*>(&plen), 4);
+      batch.append(rel);
+      batch.append(reinterpret_cast<const char*>(&dlen), 8);
+      batch.append(data);
+    };
+    add_rec("TurboGame.exe", "MZ_TURBO_BIN");
+    add_rec("assets/level1/map.dat", std::string(4096, 'M'));
+    add_rec("assets/level2/audio.ogg", "OggS_TEST_DATA");
+
+    const std::string resp = http_req(
+        port, "POST", "/api/upload-batch?game=TurboBatch&batch=1", batch);
+    CHECK(resp.find("200 OK") != std::string::npos &&
+              resp.find("\"files\":3") != std::string::npos,
+          "POST /api/upload-batch streams multiple nested files in one request");
+    CHECK(read_str_file(root + "/games/TurboBatch/TurboGame.exe") == "MZ_TURBO_BIN" &&
+              read_str_file(root + "/games/TurboBatch/assets/level1/map.dat").size() == 4096 &&
+              read_str_file(root + "/games/TurboBatch/assets/level2/audio.ogg") == "OggS_TEST_DATA",
+          "batch uploaded files match exact bytes on disk");
+
+    // Path traversal inside binary batch must be rejected
+    std::string evil;
+    uint32_t plen = 12;
+    uint64_t dlen = 4;
+    evil.append(reinterpret_cast<const char*>(&plen), 4);
+    evil.append("../evil.txt!");
+    evil.append(reinterpret_cast<const char*>(&dlen), 8);
+    evil.append("NOPE");
+    const std::string eresp = http_req(
+        port, "POST", "/api/upload-batch?game=TurboBatch&batch=1", evil);
+    CHECK(eresp.find("500") != std::string::npos || eresp.find("400") != std::string::npos,
+          "POST /api/upload-batch rejects path traversal inside binary frame");
+  }
+
+  // 15. Parallel striped chunk upload (init -> out-of-order chunks + retry -> commit)
+  {
+    std::string big(300000, '\0');
+    for (size_t i = 0; i < big.size(); ++i) big[i] = (char)('A' + (i % 26));
+    const std::string init_r = http_req(
+        port, "POST",
+        "/api/upload-chunk-init?game=TurboBatch&rel=data/pak0.pak&size=" +
+            std::to_string(big.size()) + "&batch=1",
+        "");
+    CHECK(init_r.find("200 OK") != std::string::npos &&
+              init_r.find("\"upload_id\":\"") != std::string::npos,
+          "POST /api/upload-chunk-init creates striped upload session");
+    std::string sid;
+    const size_t pos = init_r.find("\"upload_id\":\"");
+    if (pos != std::string::npos) {
+      const size_t st = pos + 13;
+      const size_t en = init_r.find('"', st);
+      if (en != std::string::npos) sid = init_r.substr(st, en - st);
+    }
+    // Upload chunks out-of-order + retry chunk 1
+    const std::string c2 = http_req(port, "PUT", "/api/upload-chunk?id=" + sid + "&offset=200000",
+                                    big.substr(200000, 100000));
+    const std::string c0 = http_req(port, "PUT", "/api/upload-chunk?id=" + sid + "&offset=0",
+                                    big.substr(0, 100000));
+    const std::string c1 = http_req(port, "PUT", "/api/upload-chunk?id=" + sid + "&offset=100000",
+                                    big.substr(100000, 100000));
+    const std::string c1_retry = http_req(port, "PUT", "/api/upload-chunk?id=" + sid + "&offset=100000",
+                                          big.substr(100000, 100000));
+    CHECK(c0.find("200 OK") != std::string::npos && c1.find("200 OK") != std::string::npos &&
+              c2.find("200 OK") != std::string::npos && c1_retry.find("200 OK") != std::string::npos,
+          "PUT /api/upload-chunk accepts out-of-order and retried chunks");
+    const std::string com = http_req(port, "POST", "/api/upload-chunk-commit?id=" + sid, "");
+    CHECK(com.find("200 OK") != std::string::npos &&
+              read_str_file(root + "/games/TurboBatch/data/pak0.pak") == big,
+          "POST /api/upload-chunk-commit verifies and publishes exact reassembled file");
+  }
+
+  // 16. Striped chunked .zip upload -> extract_zip with buffered callback writer
+  {
+    std::string zpath = root + "/chunked_src.zip";
+    mz_zip_archive zw{};
+    mz_zip_writer_init_file(&zw, zpath.c_str(), 0);
+    const std::string exe_data(120000, 'Z');
+    mz_zip_writer_add_mem(&zw, "ChunkZipGame/ChunkZipGame.exe", exe_data.data(), exe_data.size(), 0);
+    mz_zip_writer_finalize_archive(&zw);
+    mz_zip_writer_end(&zw);
+    const std::string zbytes = read_str_file(zpath);
+    const size_t half = zbytes.size() / 2;
+
+    const std::string zir = http_req(
+        port, "POST",
+        "/api/upload-chunk-init?name=ChunkZipGame.zip&size=" + std::to_string(zbytes.size()), "");
+    std::string zsid;
+    const size_t zp = zir.find("\"upload_id\":\"");
+    if (zp != std::string::npos) zsid = zir.substr(zp + 13, zir.find('"', zp + 13) - (zp + 13));
+    const std::string zc1 = http_req(port, "PUT", "/api/upload-chunk?id=" + zsid + "&offset=" + std::to_string(half),
+                                     zbytes.substr(half));
+    const std::string zc0 = http_req(port, "PUT", "/api/upload-chunk?id=" + zsid + "&offset=0",
+                                     zbytes.substr(0, half));
+    const std::string zcom = http_req(port, "POST", "/api/upload-chunk-commit?id=" + zsid, "");
+    CHECK(zc0.find("200 OK") != std::string::npos && zc1.find("200 OK") != std::string::npos &&
+              zcom.find("200 OK") != std::string::npos &&
+              read_str_file(root + "/games/ChunkZipGame/ChunkZipGame.exe") == exe_data,
+          "striped chunked .zip upload reassembles and extracts cleanly");
+  }
+
+  // 17. HTTP/1.1 Keep-Alive connection reuse across multiple upload requests
+  {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    bool ka_ok = (fd >= 0 && connect(fd, (sockaddr*)&sa, sizeof(sa)) == 0);
+    if (ka_ok) {
+      for (int i = 0; i < 3 && ka_ok; ++i) {
+        std::string payload = "KA_FILE_" + std::to_string(i);
+        char hdr[512];
+        int hl = snprintf(hdr, sizeof(hdr),
+                          "PUT /api/upload-file?game=KeepAliveGame&rel=f%d.txt&batch=1 HTTP/1.1\r\n"
+                          "Host: 127.0.0.1:%u\r\nContent-Length: %zu\r\nConnection: keep-alive\r\n\r\n",
+                          i, (unsigned)port, payload.size());
+        std::string req(hdr, (size_t)hl);
+        req += payload;
+        if (send(fd, req.data(), req.size(), 0) != (ssize_t)req.size()) { ka_ok = false; break; }
+        std::string resp;
+        char buf[1024];
+        size_t hdr_end = std::string::npos;
+        size_t clen = 0;
+        while (true) {
+          ssize_t n = recv(fd, buf, sizeof(buf), 0);
+          if (n <= 0) { ka_ok = false; break; }
+          resp.append(buf, (size_t)n);
+          if (hdr_end == std::string::npos) {
+            size_t p = resp.find("\r\n\r\n");
+            if (p != std::string::npos) {
+              hdr_end = p + 4;
+              size_t cl = resp.find("Content-Length: ");
+              if (cl != std::string::npos) clen = (size_t)strtoull(resp.c_str() + cl + 16, nullptr, 10);
+            }
+          }
+          if (hdr_end != std::string::npos && resp.size() >= hdr_end + clen) break;
+        }
+        if (resp.find("200 OK") == std::string::npos ||
+            resp.find("Connection: keep-alive") == std::string::npos) {
+          ka_ok = false;
+        }
+      }
+      close(fd);
+    }
+    CHECK(ka_ok &&
+              read_str_file(root + "/games/KeepAliveGame/f0.txt") == "KA_FILE_0" &&
+              read_str_file(root + "/games/KeepAliveGame/f2.txt") == "KA_FILE_2",
+          "HTTP/1.1 Keep-Alive reuses single TCP socket across multiple upload PUTs");
+  }
+
+  // 18. Xbox internal D: exclusion & external USB stick / SSD classification
+  {
+    std::string why;
+    // Regression: Xbox Dev Mode internal D:\ NTFS partition with no USB plugged in
+    longan::usb_drive_probe_info xbox_d{};
+    xbox_d.letter = 'D';
+    xbox_d.is_fixed = true;
+    xbox_d.fs = "NTFS";
+    xbox_d.label = "DevelopmentFiles";
+    xbox_d.total_bytes = 512ULL << 30;
+    xbox_d.win32_readable = true;
+    xbox_d.os_drive = 'C';
+    xbox_d.local_drive = 'Q';
+    xbox_d.pkg_drive = 'S';
+    CHECK(!longan::classify_external_usb_volume(xbox_d, &why),
+          "Xbox internal D: (DRIVE_FIXED NTFS) is NEVER false-positived as USB");
+
+    // Regression: Xbox internal D: even with empty label
+    xbox_d.label.clear();
+    CHECK(!longan::classify_external_usb_volume(xbox_d, &why),
+          "Xbox internal D: (DRIVE_FIXED, blank label) is NEVER false-positived as USB");
+
+    // Ghost inaccessible internal Xbox partitions (S:/T:/U:/X:)
+    longan::usb_drive_probe_info ghost_x{};
+    ghost_x.letter = 'X';
+    ghost_x.is_fixed = true;
+    ghost_x.os_drive = 'C';
+    CHECK(!longan::classify_external_usb_volume(ghost_x, &why),
+          "inaccessible internal Xbox fixed partition X: is skipped");
+
+    // Fixed drive with internal Windows/Xbox directory markers
+    longan::usb_drive_probe_info internal_e{};
+    internal_e.letter = 'E';
+    internal_e.is_fixed = true;
+    internal_e.fs = "NTFS";
+    internal_e.total_bytes = 1000ULL << 30;
+    internal_e.win32_readable = true;
+    internal_e.has_internal_os_dirs = true;
+    CHECK(!longan::classify_external_usb_volume(internal_e, &why),
+          "fixed drive containing internal OS/DevelopmentFiles directories is skipped");
+
+    // Genuine external USB SSD on E: (DRIVE_FIXED NTFS, no internal markers)
+    longan::usb_drive_probe_info ext_ssd{};
+    ext_ssd.letter = 'E';
+    ext_ssd.is_fixed = true;
+    ext_ssd.fs = "NTFS";
+    ext_ssd.label = "Samsung T7";
+    ext_ssd.total_bytes = 931ULL << 30;
+    ext_ssd.win32_readable = true;
+    ext_ssd.os_drive = 'C';
+    ext_ssd.local_drive = 'Q';
+    ext_ssd.pkg_drive = 'S';
+    CHECK(longan::classify_external_usb_volume(ext_ssd, &why),
+          "real external NTFS USB SSD on E: (DRIVE_FIXED) IS detected");
+
+    // Genuine external exFAT USB flash stick on F: (DRIVE_REMOVABLE)
+    longan::usb_drive_probe_info ext_stick{};
+    ext_stick.letter = 'F';
+    ext_stick.is_removable = true;
+    ext_stick.fs = "exFAT";
+    CHECK(longan::classify_external_usb_volume(ext_stick, &why),
+          "real external exFAT USB stick on F: (DRIVE_REMOVABLE) IS detected");
+
+    // Authoritative WinRT RemovableDevices / StorageDevice volume (even on D:)
+    longan::usb_drive_probe_info os_usb{};
+    os_usb.letter = 'D';
+    os_usb.is_fixed = true;
+    os_usb.from_os_usb_api = true;
+    os_usb.fs = "NTFS";
+    CHECK(longan::classify_external_usb_volume(os_usb, &why),
+          "OS RemovableDevices / Portable StorageDevice volume is always accepted");
   }
 
   longan::webxfer_shutdown();

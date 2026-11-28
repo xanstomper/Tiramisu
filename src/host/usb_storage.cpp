@@ -2,15 +2,19 @@
 // NTFS / exFAT / FAT32 USB & external drive auto-detection, WinRT broker
 // fallback, Xbox FolderPicker integration, and background copy/extract installer.
 #include "usb_storage.h"
+#include "usb_volume_filter.h"
 
 #include "game_library.h"
 #include "host_log.h"
 #include "ui.h"
 
 #include <winrt/base.h>
+#include <winrt/Windows.Devices.Enumeration.h>
+#include <winrt/windows.devices.portable.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Storage.h>
+#include <winrt/windows.storage.accesscache.h>
 #include <winrt/Windows.Storage.Pickers.h>
 #include <winrt/Windows.Storage.Streams.h>
 
@@ -233,6 +237,28 @@ std::string sanitize_usb_item_name(const std::string& raw, const std::string& ki
   return "USBGame";
 }
 
+bool win32_dir_has_internal_os_markers(const std::string& path) {
+  if (path.empty()) return false;
+  std::wstring w = host_u82ws(path);
+  while (!w.empty() && (w.back() == L'\\' || w.back() == L'/')) w.pop_back();
+  w += L"\\*";
+  WIN32_FIND_DATAW fd{};
+  HANDLE h = FindFirstFileW(w.c_str(), &fd);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  bool found_internal = false;
+  do {
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+      const std::string fn = host_ws2u8(fd.cFileName);
+      if (is_internal_xbox_dir_name(fn)) {
+        found_internal = true;
+        break;
+      }
+    }
+  } while (FindNextFileW(h, &fd));
+  FindClose(h);
+  return found_internal;
+}
+
 void run_external_storage_scan_worker() {
   struct guard_flag { ~guard_flag() { g_usb_scan_running.store(false); } } gf;
   try { winrt::init_apartment(winrt::apartment_type::multi_threaded); } catch (...) {}
@@ -242,13 +268,30 @@ void run_external_storage_scan_worker() {
     std::string path;
     winrt::Windows::Storage::StorageFolder folder{nullptr};
     bool is_removable = false;
+    bool is_external_ssd = false;
     bool from_broker = false;
   };
   std::vector<raw_vol> candidates;
   std::string broker_status = "unavailable";
 
-  // 1. The Windows.Storage broker exposes removable media and declared file
-  // types when the console grants access to the package.
+  auto upsert_candidate = [&](const std::string& name, const std::string& path,
+                              winrt::Windows::Storage::StorageFolder folder,
+                              bool is_rem, bool is_ssd, bool from_brk) {
+    const auto key = path.empty() ? std::string() : volume_key(path);
+    for (auto& c : candidates) {
+      if (!key.empty() && !c.path.empty() && volume_key(c.path) == key) {
+        if (!c.folder && folder) c.folder = folder;
+        c.is_removable = c.is_removable || is_rem;
+        c.is_external_ssd = c.is_external_ssd || is_ssd;
+        c.from_broker = c.from_broker || from_brk;
+        return;
+      }
+    }
+    candidates.push_back({name, path, folder, is_rem, is_ssd, from_brk});
+  };
+
+  // 1. WinRT RemovableDevices broker (authoritative Xbox OS list of external
+  //    NTFS / exFAT / FAT32 USB sticks & USB SSDs — NEVER includes internal D:).
   try {
     using winrt::Windows::Storage::KnownFolders;
     auto folders = KnownFolders::RemovableDevices().GetFoldersAsync().get();
@@ -256,7 +299,7 @@ void run_external_storage_scan_worker() {
       std::string name = host_ws2u8(folder.Name().c_str());
       std::string path;
       try { path = host_ws2u8(folder.Path().c_str()); } catch (...) {}
-      candidates.push_back({std::move(name), std::move(path), folder, true, true});
+      upsert_candidate(name, path, folder, true, false, true);
     }
     broker_status = "ready";
   } catch (const winrt::hresult_error& error) {
@@ -267,7 +310,40 @@ void run_external_storage_scan_worker() {
     broker_status = "unavailable";
   }
 
-  // 2. Include user-picked USB folders (from Xbox FolderPicker).
+  // 2. Windows.Devices.Portable StorageDevice enumeration (catches external USB
+  //    SSDs & enclosures exposed as portable storage devices on Xbox Dev Mode).
+  try {
+    using winrt::Windows::Devices::Enumeration::DeviceInformation;
+    using winrt::Windows::Devices::Portable::StorageDevice;
+    auto devs = DeviceInformation::FindAllAsync(StorageDevice::GetDeviceSelector()).get();
+    for (const auto& dev : devs) {
+      try {
+        auto folder = StorageDevice::FromId(dev.Id());
+        if (!folder) continue;
+        std::string name = host_ws2u8(folder.Name().c_str());
+        std::string path;
+        try { path = host_ws2u8(folder.Path().c_str()); } catch (...) {}
+        upsert_candidate(name, path, folder, true, true, true);
+        if (broker_status != "ready") broker_status = "ready";
+      } catch (...) {}
+    }
+  } catch (...) {}
+
+  // 3. Persisted FutureAccessList + in-session user-picked USB/SSD folders.
+  try {
+    using winrt::Windows::Storage::AccessCache::StorageApplicationPermissions;
+    auto fal = StorageApplicationPermissions::FutureAccessList();
+    for (const auto& entry : fal.Entries()) {
+      try {
+        auto item = fal.GetFolderAsync(entry.Token).get();
+        if (!item) continue;
+        std::string name = host_ws2u8(item.Name().c_str());
+        std::string path;
+        try { path = host_ws2u8(item.Path().c_str()); } catch (...) {}
+        upsert_candidate(name, path, item, true, false, true);
+      } catch (...) {}
+    }
+  } catch (...) {}
   {
     std::lock_guard<std::mutex> lk(g_usb_broker_mu);
     for (const auto& pf : g_user_picked_folders) {
@@ -275,22 +351,14 @@ void run_external_storage_scan_worker() {
       std::string name = host_ws2u8(pf.Name().c_str());
       std::string path;
       try { path = host_ws2u8(pf.Path().c_str()); } catch (...) {}
-      const auto key = path.empty() ? std::string() : volume_key(path);
-      bool dup = false;
-      for (auto& c : candidates) {
-        if (!key.empty() && !c.path.empty() && volume_key(c.path) == key) {
-          if (!c.folder) c.folder = pf;
-          c.from_broker = true;
-          dup = true;
-          break;
-        }
-      }
-      if (!dup) candidates.push_back({std::move(name), std::move(path), pf, true, true});
+      upsert_candidate(name, path, pf, true, false, true);
     }
   }
 
-  // 3. Probe logical drive letters D..Z (catches external USB SSDs/sticks that
-  //    enumerate as DRIVE_REMOVABLE or external DRIVE_FIXED with NTFS/exFAT).
+  // 4. Probe logical drive letters D..Z with strict Xbox internal-partition
+  //    exclusion (never false-positives internal D:\ DevelopmentFiles or
+  //    C:/Q:/S:/T:/U:/X: partitions, while catching external NTFS/exFAT USB
+  //    SSDs on E:, F:, G:... even when reported as DRIVE_FIXED).
   wchar_t sys_dir[MAX_PATH] = {};
   GetSystemDirectoryW(sys_dir, MAX_PATH);
   const char os_drive = sys_dir[0] ? (char)std::toupper((unsigned char)sys_dir[0]) : 'C';
@@ -299,6 +367,8 @@ void run_external_storage_scan_worker() {
   const char pkg_drive = g_package_dir.size() > 1 && g_package_dir[1] == ':'
                              ? (char)std::toupper((unsigned char)g_package_dir[0]) : 0;
 
+  static std::string s_last_probe_diag;
+  std::string probe_diag;
   const DWORD mask = GetLogicalDrives();
   for (char letter = 'D'; letter <= 'Z'; ++letter) {
     if (mask != 0 && !(mask & (1u << (letter - 'A')))) continue;
@@ -307,20 +377,62 @@ void run_external_storage_scan_worker() {
     if (dtype != DRIVE_REMOVABLE && dtype != DRIVE_FIXED) continue;
     const std::string root = std::string(1, letter) + ":\\";
     const auto key = volume_key(root);
-    bool exists = false;
+
+    bool already_os_usb = false;
     for (auto& c : candidates) {
       if (!c.path.empty() && volume_key(c.path) == key) {
         c.is_removable = c.is_removable || (dtype == DRIVE_REMOVABLE);
-        exists = true;
+        c.is_external_ssd = c.is_external_ssd || (dtype == DRIVE_FIXED);
+        already_os_usb = true;
         break;
       }
     }
-    if (exists) continue;
-    if (dtype == DRIVE_FIXED && (letter == os_drive || letter == local_drive || letter == pkg_drive)) {
-      continue;
+    if (already_os_usb) continue;
+
+    usb_drive_probe_info pi;
+    pi.letter = letter;
+    pi.is_removable = (dtype == DRIVE_REMOVABLE);
+    pi.is_fixed = (dtype == DRIVE_FIXED);
+    pi.from_os_usb_api = false;
+    pi.os_drive = os_drive;
+    pi.local_drive = local_drive;
+    pi.pkg_drive = pkg_drive;
+
+    wchar_t vlabel[128] = {}, fsname[32] = {};
+    if (GetVolumeInformationW(wroot, vlabel, 128, nullptr, nullptr, nullptr, fsname, 32)) {
+      pi.label = host_ws2u8(vlabel);
+      pi.fs = host_ws2u8(fsname);
     }
-    candidates.push_back({std::string(1, letter) + ":", root, nullptr,
-                          dtype == DRIVE_REMOVABLE, false});
+    ULARGE_INTEGER avail{}, total{}, free_b{};
+    if (GetDiskFreeSpaceExW(wroot, &avail, &total, &free_b)) {
+      pi.total_bytes = total.QuadPart;
+    }
+    pi.win32_readable = win32_dir_readable_w(root);
+    if (pi.win32_readable && pi.is_fixed) {
+      pi.has_internal_os_dirs = win32_dir_has_internal_os_markers(root);
+    }
+
+    std::string reason;
+    const bool accept = classify_external_usb_volume(pi, &reason);
+    probe_diag += std::string(1, letter) + ":(" + (pi.is_removable ? "REM" : "FIX") +
+                  "," + (pi.fs.empty() ? "?" : pi.fs) +
+                  (pi.label.empty() ? "" : ("," + pi.label)) + "->" + reason + ") ";
+    if (!accept) continue;
+
+    // With broadFileSystemAccess declared in AppxManifest.xml, also try opening
+    // the external USB/SSD root via WinRT StorageFolder so NTFS drives without
+    // ALL APPLICATION PACKAGES ACLs still get full broker browsing + copy!
+    winrt::Windows::Storage::StorageFolder bfolder{nullptr};
+    try {
+      bfolder = winrt::Windows::Storage::StorageFolder::GetFolderFromPathAsync(wroot).get();
+    } catch (...) {}
+
+    upsert_candidate(std::string(1, letter) + ":", root, bfolder,
+                     pi.is_removable, pi.is_fixed, bfolder != nullptr);
+  }
+  if (!probe_diag.empty() && probe_diag != s_last_probe_diag) {
+    s_last_probe_diag = probe_diag;
+    longan::log_line(("storage: probe " + probe_diag).c_str());
   }
 
   std::set<std::string> internal_names;
@@ -559,11 +671,12 @@ void run_external_storage_scan_worker() {
       } catch (...) {}
     }
 
-    if (cand.is_removable || cand.from_broker || !vol.game_roots.empty() || !vol.items.empty()) {
+    if (cand.is_removable || cand.is_external_ssd || cand.from_broker ||
+        !vol.game_roots.empty() || !vol.items.empty()) {
       std::sort(vol.items.begin(), vol.items.end(), [](const auto& a, const auto& b) {
         return a.id < b.id;
       });
-      if (vol.fs.empty() && cand.from_broker) vol.fs = "USB";
+      if (vol.fs.empty() && cand.from_broker) vol.fs = cand.is_external_ssd ? "USB SSD" : "USB";
       out_vols.push_back(std::move(vol));
     }
   }
@@ -598,7 +711,9 @@ bool win32_copy_file_progress(const std::string& src, const std::string& dst,
     if (err) *err = "Write error on Xbox storage: " + item_label;
     return false;
   }
-  std::vector<char> buf(262144);
+  std::vector<char> buf(4 * 1024 * 1024);
+  std::vector<char> out_io(1024 * 1024);
+  setvbuf(out, out_io.data(), _IOFBF, out_io.size());
   bool ok = true;
   while (true) {
     const size_t rd = fread(buf.data(), 1, buf.size(), in);
@@ -664,13 +779,15 @@ bool broker_copy_file_stream(const winrt::Windows::Storage::StorageFile& file,
   try {
     using namespace winrt::Windows::Storage::Streams;
     auto stream = file.OpenReadAsync().get();
-    Buffer rbuf(262144);
-    std::vector<uint8_t> bytes(262144);
+    Buffer rbuf(1024 * 1024);
+    std::vector<uint8_t> bytes(1024 * 1024);
     FILE* out = _wfopen(host_u82ws(dst_path).c_str(), L"wb");
     if (!out) {
       if (err) *err = "Cannot create Xbox destination file";
       return false;
     }
+    std::vector<char> out_io(1024 * 1024);
+    setvbuf(out, out_io.data(), _IOFBF, out_io.size());
     bool ok = true;
     while (true) {
       auto chunk = stream.ReadAsync(rbuf, rbuf.Capacity(), InputStreamOptions::Partial).get();
@@ -905,6 +1022,10 @@ void poll_folder_picker() {
           std::lock_guard<std::mutex> lk(g_usb_broker_mu);
           g_user_picked_folders.push_back(folder);
         }
+        try {
+          using winrt::Windows::Storage::AccessCache::StorageApplicationPermissions;
+          StorageApplicationPermissions::FutureAccessList().Add(folder);
+        } catch (...) {}
         log_line(("storage: user picked USB folder: " + pname +
                   (ppath.empty() ? "" : (" (" + ppath + ")"))).c_str());
         ui_toast(host_u82ws("Attached USB folder: " + pname), 3.0f);

@@ -43,6 +43,7 @@
     <Capability Name="privateNetworkClientServer" />
     <Capability Name="codeGeneration" />
     <uap:Capability Name="removableStorage" />
+    <rescap:Capability Name="broadFileSystemAccess" />
     <rescap:Capability Name="inputForegroundObservation" />
     <rescap:Capability Name="expandedResources" />
   </Capabilities>

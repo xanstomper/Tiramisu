@@ -47,6 +47,8 @@
   #include <ws2tcpip.h>
   #include <windows.h>
   #include <bcrypt.h>    // brown-line paired-LAN control pairing RNG
+  #include <io.h>        // _chsize_s / _fileno for striped range uploads
+  #include <share.h>     // _fsopen(..., _SH_DENYNO) for concurrent range writes
   #include <sys/stat.h>  // _stat64 for upload verification
   #pragma comment(lib, "bcrypt.lib")
   #pragma comment(lib, "ws2_32.lib")
@@ -56,8 +58,10 @@
 #else
   #include <arpa/inet.h>
   #include <dirent.h>
+  #include <fcntl.h>
   #include <netdb.h>
   #include <netinet/in.h>
+  #include <netinet/tcp.h>
   #include <sys/socket.h>
   #include <sys/stat.h>
   #include <unistd.h>
@@ -90,10 +94,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace longan {
@@ -844,6 +851,9 @@ bool extract_zip(const std::string& zip_path, const std::string& dest,
 
   int extracted = 0;
   int failed = 0;
+  std::unordered_set<std::string> created_dirs;
+  created_dirs.reserve(256);
+  std::vector<char> zip_io_buf(512 * 1024);
   for (int i = 0; i < n; ++i) {
     mz_zip_archive_file_stat st{};
     if (!mz_zip_reader_file_stat(&zip, i, &st)) { ++failed; continue; }
@@ -863,10 +873,31 @@ bool extract_zip(const std::string& zip_path, const std::string& dest,
     if (!sanitize_rel_path(rel_raw, XFER_SEP, &rel)) { ++failed; continue; }
     const std::string out_path = dest + std::string(1, XFER_SEP) + rel;
     const size_t slash = out_path.rfind(XFER_SEP);
-    if (slash != std::string::npos) mkdirs(out_path.substr(0, slash));
-    if (mz_zip_reader_extract_to_file(&zip, i, out_path.c_str(), 0)) {
+    if (slash != std::string::npos) {
+      const std::string parent = out_path.substr(0, slash);
+      if (created_dirs.insert(parent).second) mkdirs(parent);
+    }
+    FILE* outf = fopen(out_path.c_str(), "wb");
+    if (!outf) {
+      ++failed;
+      if (require_complete) break;
+      continue;
+    }
+    setvbuf(outf, zip_io_buf.data(), _IOFBF, zip_io_buf.size());
+    struct zip_write_ctx { FILE* f; bool err; } wctx{outf, false};
+    auto write_cb = [](void* opaque, mz_uint64 /*ofs*/, const void* buf, size_t len) -> size_t {
+      auto* ctx = static_cast<zip_write_ctx*>(opaque);
+      if (ctx->err) return 0;
+      const size_t wr = fwrite(buf, 1, len, ctx->f);
+      if (wr != len) ctx->err = true;
+      return wr;
+    };
+    const mz_bool ok = mz_zip_reader_extract_to_callback(&zip, i, write_cb, &wctx, 0);
+    const bool closed = (fclose(outf) == 0);
+    if (ok && !wctx.err && closed) {
       ++extracted;
     } else {
+      remove(out_path.c_str());
       ++failed;
     }
     if (require_complete && failed) break;
@@ -1439,11 +1470,28 @@ bool recv_exact_all(sock_t s, const char* pre, size_t pre_len, uint64_t len,
   return got == len;
 }
 
+// Tune TCP socket buffers & disable Nagle for high-throughput LAN transfers.
+// SO_RCVBUF must also be set on the listening socket BEFORE bind/listen so TCP
+// window scaling advertises the full 4 MiB receive window during the handshake.
+void tune_transfer_socket(sock_t s, bool is_listener) {
+  int rcv = 4 * 1024 * 1024;
+  int snd = 1 * 1024 * 1024;
+  setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char*)&rcv, sizeof(rcv));
+  setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char*)&snd, sizeof(snd));
+  if (!is_listener) {
+    int nd = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&nd, sizeof(nd));
+  }
+}
+
 bool stream_to_file(sock_t s, const char* pre, size_t pre_len,
                         const char* path, uint64_t len) {
   FILE* f = fopen(path, "wb");
   if (!f) return false;
+  std::vector<char> io_buf(1024 * 1024);
+  setvbuf(f, io_buf.data(), _IOFBF, io_buf.size());
   uint64_t got = 0;
+  uint64_t pending_progress = 0;
   bool write_ok = true;
   if (pre && pre_len) {
     size_t wr = std::min<size_t>(pre_len, (size_t)std::min<uint64_t>(len, pre_len));
@@ -1452,22 +1500,27 @@ bool stream_to_file(sock_t s, const char* pre, size_t pre_len,
         write_ok = false;  // short write (disk full): never count it
       } else {
         got += wr;
-        g_upload_done += wr;
+        pending_progress += wr;
       }
     }
   }
-  char buf[65536];
+  std::vector<char> buf(512 * 1024);
   while (write_ok && got < len && !g_stop) {
-    const int want = (int)std::min<uint64_t>(len - got, sizeof(buf));
-    const int n = recv(s, buf, want, 0);
+    const int want = (int)std::min<uint64_t>(len - got, buf.size());
+    const int n = recv(s, buf.data(), want, 0);
     if (n <= 0) break;
-    if (fwrite(buf, 1, (size_t)n, f) != (size_t)n) {
+    if (fwrite(buf.data(), 1, (size_t)n, f) != (size_t)n) {
       write_ok = false;
       break;
     }
     got += (uint64_t)n;
-    g_upload_done += (uint64_t)n;
+    pending_progress += (uint64_t)n;
+    if (pending_progress >= 512 * 1024) {
+      g_upload_done += pending_progress;
+      pending_progress = 0;
+    }
   }
+  if (pending_progress) g_upload_done += pending_progress;
   if (fclose(f) != 0) write_ok = false;  // buffered data lost on flush
   if (!write_ok) {
     char line[320];
@@ -1500,6 +1553,249 @@ bool stream_to_file(sock_t s, const char* pre, size_t pre_len,
     return false;
   }
   return true;
+}
+
+// ---------- High-speed binary multi-file batch uploader (/api/upload-batch) ----------
+// Wire format repeated until Content-Length bytes consumed:
+//   [u32 path_len LE (1..1024)][path_utf8][u64 file_len LE][raw_file_bytes]
+bool stream_batch_upload(sock_t s, const char* pre, size_t pre_len,
+                         uint64_t content_len, const std::string& gdir,
+                         int* out_files, uint64_t* out_bytes,
+                         std::string* out_err) {
+  std::vector<uint8_t> rbuf(512 * 1024);
+  size_t rpos = 0, rlen = 0;
+  uint64_t rem_total = content_len;
+  size_t pre_off = 0;
+  uint64_t pending_progress = 0;
+
+  auto refill = [&]() -> bool {
+    if (rpos < rlen) return true;
+    rpos = rlen = 0;
+    if (rem_total == 0) return false;
+    if (pre && pre_off < pre_len) {
+      const size_t take = (size_t)std::min<uint64_t>(rem_total,
+                            std::min<size_t>(pre_len - pre_off, rbuf.size()));
+      memcpy(rbuf.data(), pre + pre_off, take);
+      pre_off += take;
+      rlen = take;
+      rem_total -= take;
+      return true;
+    }
+    const int want = (int)std::min<uint64_t>(rem_total, rbuf.size());
+    const int n = recv(s, reinterpret_cast<char*>(rbuf.data()), want, 0);
+    if (n <= 0) return false;
+    rlen = (size_t)n;
+    rem_total -= (uint64_t)n;
+    return true;
+  };
+
+  auto read_exact = [&](void* dst, size_t n) -> bool {
+    uint8_t* out = static_cast<uint8_t*>(dst);
+    size_t got = 0;
+    while (got < n) {
+      if (!refill()) return false;
+      const size_t take = std::min(n - got, rlen - rpos);
+      memcpy(out + got, rbuf.data() + rpos, take);
+      rpos += take;
+      got += take;
+    }
+    return true;
+  };
+
+  std::unordered_set<std::string> created_dirs;
+  created_dirs.reserve(128);
+  std::vector<char> io_buf(512 * 1024);
+  const std::string sep(1, XFER_SEP);
+  int files = 0;
+  uint64_t total_file_bytes = 0;
+
+  while ((rpos < rlen || rem_total > 0) && !g_stop) {
+    uint32_t path_len = 0;
+    if (!read_exact(&path_len, 4)) {
+      if (out_err) *out_err = "truncated batch header";
+      return false;
+    }
+    if (path_len == 0 || path_len > 1024u) {
+      if (out_err) *out_err = "invalid batch path length";
+      return false;
+    }
+    std::string rel_raw(path_len, '\0');
+    if (!read_exact(rel_raw.data(), path_len)) {
+      if (out_err) *out_err = "truncated batch path";
+      return false;
+    }
+    uint64_t flen = 0;
+    if (!read_exact(&flen, 8)) {
+      if (out_err) *out_err = "truncated batch file size";
+      return false;
+    }
+    std::string rel;
+    if (!sanitize_rel_path(rel_raw, XFER_SEP, &rel)) {
+      if (out_err) *out_err = "invalid relative path in batch";
+      return false;
+    }
+    const std::string out_path = gdir + sep + rel;
+    const size_t sl = out_path.rfind(XFER_SEP);
+    if (sl != std::string::npos) {
+      const std::string parent = out_path.substr(0, sl);
+      if (created_dirs.insert(parent).second) mkdirs(parent);
+    }
+    FILE* f = fopen(out_path.c_str(), "wb");
+    if (!f) {
+      if (out_err) *out_err = "cannot create file in batch";
+      return false;
+    }
+    setvbuf(f, io_buf.data(), _IOFBF, io_buf.size());
+    uint64_t fleft = flen;
+    bool ok = true;
+    while (fleft > 0) {
+      if (!refill()) { ok = false; break; }
+      const size_t take = (size_t)std::min<uint64_t>(fleft, rlen - rpos);
+      if (fwrite(rbuf.data() + rpos, 1, take, f) != take) { ok = false; break; }
+      rpos += take;
+      fleft -= take;
+      pending_progress += take;
+      if (pending_progress >= 512 * 1024) {
+        g_upload_done += pending_progress;
+        pending_progress = 0;
+      }
+    }
+    if (fclose(f) != 0) ok = false;
+    if (!ok) {
+      remove(out_path.c_str());
+      if (out_err) *out_err = "batch file write failed";
+      return false;
+    }
+    ++files;
+    total_file_bytes += flen;
+  }
+  if (pending_progress) g_upload_done += pending_progress;
+  if (out_files) *out_files = files;
+  if (out_bytes) *out_bytes = total_file_bytes;
+  return true;
+}
+
+// ---------- Parallel striped chunk upload sessions (/api/upload-chunk-*) ----------
+struct chunk_upload_session {
+  std::string id;
+  std::string staged_path;
+  std::string final_path;
+  std::string game;
+  std::string fname;
+  uint64_t total_size = 0;
+  bool is_zip = false;
+  bool is_batch = false;
+  std::map<uint64_t, uint64_t> ranges;  // offset -> length written
+  uint64_t unique_bytes = 0;
+  long long created_ms = 0;
+};
+
+std::mutex g_chunk_mu;
+std::unordered_map<std::string, chunk_upload_session> g_chunk_sessions;
+std::atomic<uint64_t> g_chunk_seq{1};
+
+bool preallocate_staged_file(const std::string& path, uint64_t total_size) {
+  FILE* f = fopen(path.c_str(), "wb");
+  if (!f) return false;
+  bool ok = true;
+  if (total_size > 0) {
+#if defined(_WIN32)
+    ok = (_chsize_s(_fileno(f), static_cast<__int64>(total_size)) == 0);
+#else
+    ok = (ftruncate(fileno(f), static_cast<off_t>(total_size)) == 0);
+#endif
+  }
+  if (fclose(f) != 0) ok = false;
+  if (!ok) remove(path.c_str());
+  return ok;
+}
+
+bool stream_chunk_to_offset(sock_t s, const char* pre, size_t pre_len,
+                            const std::string& path, uint64_t offset,
+                            uint64_t len) {
+  std::vector<char> buf(512 * 1024);
+  uint64_t got = 0;
+  uint64_t pending_progress = 0;
+#if defined(_WIN32)
+  FILE* f = _fsopen(path.c_str(), "r+b", _SH_DENYNO);
+  if (!f) return false;
+  std::vector<char> io_buf(512 * 1024);
+  setvbuf(f, io_buf.data(), _IOFBF, io_buf.size());
+  if (_fseeki64(f, static_cast<__int64>(offset), SEEK_SET) != 0) {
+    fclose(f);
+    return false;
+  }
+  bool ok = true;
+  if (pre && pre_len) {
+    const size_t wr = (size_t)std::min<uint64_t>(len, pre_len);
+    if (wr) {
+      if (fwrite(pre, 1, wr, f) != wr) ok = false;
+      else { got += wr; pending_progress += wr; }
+    }
+  }
+  while (ok && got < len && !g_stop) {
+    const int want = (int)std::min<uint64_t>(len - got, buf.size());
+    const int n = recv(s, buf.data(), want, 0);
+    if (n <= 0) { ok = false; break; }
+    if (fwrite(buf.data(), 1, (size_t)n, f) != (size_t)n) { ok = false; break; }
+    got += (uint64_t)n;
+    pending_progress += (uint64_t)n;
+    if (pending_progress >= 512 * 1024) {
+      g_upload_done += pending_progress;
+      pending_progress = 0;
+    }
+  }
+  if (pending_progress) g_upload_done += pending_progress;
+  if (fclose(f) != 0) ok = false;
+  return ok && got == len;
+#else
+  int fd = open(path.c_str(), O_RDWR);
+  if (fd < 0) return false;
+  auto write_at = [&](const char* data, size_t n, uint64_t pos) -> bool {
+    size_t done = 0;
+    while (done < n) {
+      ssize_t wr = pwrite(fd, data + done, n - done, static_cast<off_t>(pos + done));
+      if (wr <= 0) return false;
+      done += (size_t)wr;
+    }
+    return true;
+  };
+  bool ok = true;
+  if (pre && pre_len) {
+    const size_t wr = (size_t)std::min<uint64_t>(len, pre_len);
+    if (wr) {
+      if (!write_at(pre, wr, offset)) ok = false;
+      else { got += wr; pending_progress += wr; }
+    }
+  }
+  while (ok && got < len && !g_stop) {
+    const int want = (int)std::min<uint64_t>(len - got, buf.size());
+    const int n = recv(s, buf.data(), want, 0);
+    if (n <= 0) { ok = false; break; }
+    if (!write_at(buf.data(), (size_t)n, offset + got)) { ok = false; break; }
+    got += (uint64_t)n;
+    pending_progress += (uint64_t)n;
+    if (pending_progress >= 512 * 1024) {
+      g_upload_done += pending_progress;
+      pending_progress = 0;
+    }
+  }
+  if (pending_progress) g_upload_done += pending_progress;
+  if (close(fd) != 0) ok = false;
+  return ok && got == len;
+#endif
+}
+
+bool chunk_ranges_cover_total(const std::map<uint64_t, uint64_t>& ranges, uint64_t total) {
+  if (total == 0) return true;
+  uint64_t covered = 0;
+  for (const auto& kv : ranges) {
+    if (kv.first > covered) return false;
+    const uint64_t end = kv.first + kv.second;
+    if (end > covered) covered = end;
+    if (covered >= total) return true;
+  }
+  return covered >= total;
 }
 
 bool stream_chunked_to_file(sock_t s, const char* pre, size_t pre_len,
@@ -1621,8 +1917,8 @@ void send_all(sock_t s, const char* data, size_t len) {
   }
 }
 
-void respond(sock_t s, const char* code, const char* ctype,
-             const std::string& body) {
+void respond_ka(sock_t s, const char* code, const char* ctype,
+                const std::string& body, bool keep_alive) {
   // .239 DIAG: bracket send_all -- the .238 Sekiro anomaly
   // (GAP-HTTP-STATUS fired but the t+45s poll timed out,
   // handler ran, wait_ms=0) points at/after respond() /
@@ -1640,13 +1936,15 @@ void respond(sock_t s, const char* code, const char* ctype,
              code, body.size());
     log_line(rb);
   }
-  char hdr[384];
+  char hdr[448];
   int hl = snprintf(hdr, sizeof(hdr),
                     "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
                     "Access-Control-Allow-Origin: *\r\n"
                     "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n"
                     "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
-                    "Connection: close\r\n\r\n", code, ctype, body.size());
+                    "%s\r\n", code, ctype, body.size(),
+                    keep_alive ? "Connection: keep-alive\r\nKeep-Alive: timeout=15, max=500\r\n"
+                               : "Connection: close\r\n");
   if (hl > 0) send_all(s, hdr, (size_t)hl);
   if (!body.empty()) send_all(s, body.data(), body.size());
   if (resp_log) {
@@ -1660,6 +1958,11 @@ void respond(sock_t s, const char* code, const char* ctype,
              resp_ms, code);
     log_line(ra);
   }
+}
+
+void respond(sock_t s, const char* code, const char* ctype,
+             const std::string& body) {
+  respond_ka(s, code, ctype, body, false);
 }
 
 // Send one HTTP/1.1 chunked-transfer chunk (hex length, data, CRLF).
@@ -1770,8 +2073,8 @@ std::string read_control_body(sock_t s, const char* pre, size_t pre_len,
   return body;
 }
 
-void handle_client(sock_t s) {
-  sock_guard sg{s};
+bool handle_one_request(sock_t s, bool* out_keep_alive) {
+  *out_keep_alive = false;
   char req[16384];
   int rl = 0;
   int hdr_end = -1;
@@ -1786,7 +2089,7 @@ void handle_client(sock_t s) {
       break;
     }
   }
-  if (hdr_end < 0) return;
+  if (hdr_end < 0) return false;
 
   const char* pre = req + hdr_end;
   const size_t pre_len = (size_t)(rl - hdr_end);
@@ -1794,12 +2097,13 @@ void handle_client(sock_t s) {
   char method[16] = {}, raw_target[2048] = {};
   if (sscanf(req, "%15s %2047s", method, raw_target) != 2) {
     respond(s, "400 Bad Request", "text/plain", "malformed request");
-    return;
+    return false;
   }
 
   uint64_t content_len = 0;
   bool expect_100 = false;
   bool is_chunked = false;
+  bool client_keep_alive = false;
   std::string hdrs(req, (size_t)hdr_end);
   std::string hdrs_low = xfer_lower(hdrs);
   size_t clp = hdrs_low.find("\r\ncontent-length:");
@@ -1813,10 +2117,21 @@ void handle_client(sock_t s) {
       hdrs_low.find("chunked") != std::string::npos) {
     is_chunked = true;
   }
+  {
+    const size_t cp = hdrs_low.find("\r\nconnection:");
+    if (cp != std::string::npos) {
+      const size_t ce = hdrs_low.find("\r\n", cp + 2);
+      const std::string cval = hdrs_low.substr(cp + 13, ce == std::string::npos ? std::string::npos : (ce - (cp + 13)));
+      if (cval.find("keep-alive") != std::string::npos &&
+          cval.find("close") == std::string::npos) {
+        client_keep_alive = true;
+      }
+    }
+  }
 
   if (strcmp(method, "OPTIONS") == 0) {
     respond(s, "204 No Content", "text/plain", "");
-    return;
+    return false;
   }
 
   std::string target = raw_target;
@@ -1827,6 +2142,12 @@ void handle_client(sock_t s) {
     url_path = target.substr(0, qm);
     query = target.substr(qm + 1);
   }
+
+  // Only allow HTTP keep-alive reuse when the entire request body fits cleanly
+  // (no unread pipelined tail in `pre` past content_len) on our fast upload routes.
+  const bool can_keep_alive =
+      client_keep_alive && !is_chunked && (pre_len <= content_len);
+  (void)can_keep_alive;
 
   if (strcmp(method, "GET") == 0 && url_path == "/api/qr.svg") {
 #ifdef TIRAMISU_UWP_HOST
@@ -1854,11 +2175,11 @@ void handle_client(sock_t s) {
       }
       svg += "'/></svg>";
       respond(s, "200 OK", "image/svg+xml", svg);
-      return;
+      return false;
     }
 #endif
     respond(s, "404 Not Found", "text/plain", "qr unavailable");
-    return;
+    return false;
   }
 
   if (strcmp(method, "GET") == 0 && url_path.rfind("/api/cover/", 0) == 0) {
@@ -1879,7 +2200,7 @@ void handle_client(sock_t s) {
             fclose(cf);
             const bool is_png = (n >= 4 && (unsigned char)body[0] == 0x89 && body[1] == 'P');
             respond(s, "200 OK", is_png ? "image/png" : "image/jpeg", body);
-            return;
+            return false;
           }
           fclose(cf);
         }
@@ -1887,7 +2208,7 @@ void handle_client(sock_t s) {
     }
 #endif
     respond(s, "404 Not Found", "text/plain", "no cover");
-    return;
+    return false;
   }
 
   if ((strcmp(method, "PUT") == 0 || strcmp(method, "POST") == 0) &&
@@ -1897,7 +2218,7 @@ void handle_client(sock_t s) {
     if (!sanitize_game_name(url_decode(url_path.substr(11), false), &name) ||
         content_len == 0 || content_len > 8 * 1024 * 1024) {
       respond(s, "400 Bad Request", "text/plain", "bad cover request");
-      return;
+      return false;
     }
     if (expect_100) send_all(s, "HTTP/1.1 100 Continue\r\n\r\n", 25);
     std::string body;
@@ -1913,18 +2234,18 @@ void handle_client(sock_t s) {
     if (body.size() == content_len &&
         cover_art_save_bytes(name, (const uint8_t*)body.data(), body.size())) {
       respond(s, "200 OK", "application/json", "{\"ok\":true}");
-      return;
+      return false;
     }
 #endif
     respond(s, "400 Bad Request", "text/plain", "invalid cover image");
-    return;
+    return false;
   }
 
   if (strcmp(method, "POST") == 0 && url_path == "/api/upload-complete") {
     std::string game;
     if (!sanitize_game_name(query_param(query, "game"), &game)) {
       respond(s, "400 Bad Request", "text/plain", "invalid game");
-      return;
+      return false;
     }
     g_upload_total = 0;
     g_upload_done = 0;
@@ -1938,7 +2259,7 @@ void handle_client(sock_t s) {
     }
     webxfer_autopilot_begin(game);
     respond(s, "200 OK", "application/json", "{\"ok\":true}");
-    return;
+    return false;
   }
 
   if (strcmp(method, "POST") == 0 && url_path == "/api/download-url") {
@@ -1952,19 +2273,19 @@ void handle_client(sock_t s) {
     const std::string origin = get_header("origin");
     if (!origin.empty() && origin != "http://" + get_header("host")) {
       respond(s, "403 Forbidden", "text/plain", "Use the Tiramisu dashboard to start downloads");
-      return;
+      return false;
     }
     std::string body;
     if (content_len == 0 || content_len > 16384 ||
         !recv_exact_all(s, pre, pre_len, content_len, &body)) {
       respond(s, "400 Bad Request", "text/plain", "Invalid download request");
-      return;
+      return false;
     }
     std::string url, name;
     if (!parse_json_str_field(body, "url", &url) ||
         (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0)) {
       respond(s, "400 Bad Request", "text/plain", "Provide an HTTP or HTTPS URL");
-      return;
+      return false;
     }
     parse_json_str_field(body, "game", &name);
 #ifdef TIRAMISU_UWP_HOST
@@ -1973,7 +2294,7 @@ void handle_client(sock_t s) {
       const winrt::Windows::Foundation::Uri uri(winrt::to_hstring(url));
       if (uri.Host().empty() || !uri.UserName().empty() || !uri.Password().empty()) {
         respond(s, "400 Bad Request", "text/plain", "Invalid download URL");
-        return;
+        return false;
       }
       const std::string path = winrt::to_string(uri.Path());
       const size_t slash = path.rfind('/');
@@ -1989,16 +2310,16 @@ void handle_client(sock_t s) {
       if (trim_ws(name).empty()) name = filename;
     } catch (...) {
       respond(s, "400 Bad Request", "text/plain", "Invalid download URL");
-      return;
+      return false;
     }
     if (!sanitize_game_name(name, &name) || name.front() == '.' ||
         name.back() == '.') {
       respond(s, "400 Bad Request", "text/plain", "Enter a valid game name");
-      return;
+      return false;
     }
     if (g_url_active.exchange(true)) {
       respond(s, "409 Conflict", "text/plain", "Another URL download is active");
-      return;
+      return false;
     }
     {
       std::lock_guard<std::mutex> lock(g_mu);
@@ -2012,18 +2333,18 @@ void handle_client(sock_t s) {
     } catch (...) {
       finish_url_download({}, "Could not start download worker");
       respond(s, "503 Service Unavailable", "text/plain", "Could not start download");
-      return;
+      return false;
     }
     respond(s, "202 Accepted", "text/plain", "Downloading " + name + " on Xbox");
 #else
     respond(s, "501 Not Implemented", "text/plain", "URL download requires Xbox UWP host");
 #endif
-    return;
+    return false;
   }
 
   if (strcmp(method, "GET") == 0 && url_path == "/controls") {
     respond(s, "200 OK", "text/html; charset=utf-8", k_controls_page);
-    return;
+    return false;
   }
   if (strcmp(method, "POST") == 0 && url_path.rfind("/api/controls/", 0) == 0) {
     // Do not allow cross-origin browser requests to operate the app.
@@ -2036,12 +2357,12 @@ void handle_client(sock_t s) {
       };
       if (value(origin, 9) != "http://" + value(host, 7)) {
         respond(s, "403 Forbidden", "text/plain", "");
-        return;
+        return false;
       }
     }
     if (content_len > 2048) {
       respond(s, "413 Payload Too Large", "text/plain", "");
-      return;
+      return false;
     }
     const auto at = hdrs_low.find("\r\nauthorization:");
     std::string auth;
@@ -2053,21 +2374,21 @@ void handle_client(sock_t s) {
     const auto body = read_control_body(s, pre, pre_len, static_cast<size_t>(content_len));
     if (body.size() != content_len) {
       respond(s, "400 Bad Request", "text/plain", "");
-      return;
+      return false;
     }
     handle_controls(s, url_path, auth, body);
-    return;
+    return false;
   }
   if (strcmp(method, "GET") == 0 && url_path == "/") {
     respond(s, "200 OK", "text/html; charset=utf-8", k_upload_page);
-    return;
+    return false;
   }
   if (strcmp(method, "GET") == 0 && url_path == "/games") {
     // games_json() only touches g_games_dir + the filesystem — it never
     // reads g, so holding g_mu across the (slow, disk-bound) scan and the
     // socket write blocked every other handler. Build + respond lock-free.
     respond(s, "200 OK", "application/json", games_json());
-    return;
+    return false;
   }
 #ifdef TIRAMISU_UWP_HOST
   if (strcmp(method, "GET") == 0 && url_path == "/api/steam/status") {
@@ -2084,13 +2405,13 @@ void handle_client(sock_t s) {
              json_escape(acct.qr_url).c_str(),
              acct.busy ? "true" : "false", items.size());
     respond(s, "200 OK", "application/json", sb);
-    return;
+    return false;
   }
   if (strcmp(method, "GET") == 0 && url_path == "/api/steam/qr.svg") {
     const auto acct = steam_client_account();
     if (acct.qr_url.empty()) {
       respond(s, "404 Not Found", "text/plain", "no active steam qr");
-      return;
+      return false;
     }
     uint8_t qr[qrcodegen_BUFFER_LEN_MAX];
     uint8_t tmp[qrcodegen_BUFFER_LEN_MAX];
@@ -2098,7 +2419,7 @@ void handle_client(sock_t s) {
                               qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX,
                               qrcodegen_Mask_AUTO, true)) {
       respond(s, "500 Internal Server Error", "text/plain", "qr encode error");
-      return;
+      return false;
     }
     const int sz = qrcodegen_getSize(qr);
     const int quiet = 2;
@@ -2116,7 +2437,7 @@ void handle_client(sock_t s) {
     }
     svg += "'/></svg>";
     respond(s, "200 OK", "image/svg+xml", svg);
-    return;
+    return false;
   }
   if (strcmp(method, "POST") == 0 && url_path == "/api/steam/qr") {
     steam_client_begin_qr([]() {
@@ -2125,7 +2446,7 @@ void handle_client(sock_t s) {
       g.rescan_game.clear();
     });
     respond(s, "202 Accepted", "application/json", "{\"ok\":true}");
-    return;
+    return false;
   }
   if (strcmp(method, "POST") == 0 && url_path == "/api/steam/refresh") {
     steam_client_refresh_remote([]() {
@@ -2134,12 +2455,12 @@ void handle_client(sock_t s) {
       g.rescan_game.clear();
     });
     respond(s, "202 Accepted", "application/json", "{\"ok\":true}");
-    return;
+    return false;
   }
   if (strcmp(method, "POST") == 0 && url_path == "/api/steam/signout") {
     steam_client_sign_out();
     respond(s, "200 OK", "application/json", "{\"ok\":true}");
-    return;
+    return false;
   }
   if (strcmp(method, "GET") == 0 && url_path == "/api/steam/library") {
     const auto items = steam_client_items();
@@ -2158,7 +2479,7 @@ void handle_client(sock_t s) {
     }
     out += "]";
     respond(s, "200 OK", "application/json", out);
-    return;
+    return false;
   }
   if (strcmp(method, "POST") == 0 &&
       (url_path.rfind("/api/steam/download/", 0) == 0 ||
@@ -2168,18 +2489,18 @@ void handle_client(sock_t s) {
     uint64_t value = 0;
     if (id.empty() || id.size() > 10) {
       respond(s, "400 Bad Request", "text/plain", "Invalid Steam App ID");
-      return;
+      return false;
     }
     for (const char digit : id) {
       if (digit < '0' || digit > '9') {
         respond(s, "400 Bad Request", "text/plain", "Invalid Steam App ID");
-        return;
+        return false;
       }
       value = value * 10 + (digit - '0');
     }
     if (value == 0 || value > UINT32_MAX) {
       respond(s, "400 Bad Request", "text/plain", "Invalid Steam App ID");
-      return;
+      return false;
     }
     const auto appid = static_cast<uint32_t>(value);
     const bool accepted = cancel ? steam_client_cancel_download(appid)
@@ -2191,7 +2512,7 @@ void handle_client(sock_t s) {
     respond(s, accepted ? "202 Accepted" : "409 Conflict", "text/plain",
             accepted ? (cancel ? "Cancellation requested" : "Install requested")
                      : (cancel ? "No cancellable download" : "Could not queue install"));
-    return;
+    return false;
   }
 #endif
 #ifdef TIRAMISU_UWP_HOST
@@ -2203,13 +2524,13 @@ void handle_client(sock_t s) {
     snprintf(body, sizeof(body), "{\"available\":%s,\"phase\":%u,\"code\":%u}",
              available ? "true" : "false", static_cast<unsigned>(fault.phase), fault.code);
     respond(s, "200 OK", "application/json", body);
-    return;
+    return false;
   }
   if (strcmp(method, "GET") == 0 && url_path == "/api/launch-checkpoint") {
     launch_checkpoint checkpoint{};
     if (!launch_checkpoint_read(g_local_state_dir, &checkpoint)) {
       respond(s, "200 OK", "application/json", "{\"available\":false}");
-      return;
+      return false;
     }
     char body[128];
     snprintf(body, sizeof(body),
@@ -2217,7 +2538,7 @@ void handle_client(sock_t s) {
              static_cast<unsigned>(checkpoint.phase),
              static_cast<unsigned>(checkpoint.outcome), checkpoint.code);
     respond(s, "200 OK", "application/json", body);
-    return;
+    return false;
   }
   if (strcmp(method, "GET") == 0 && url_path == "/api/launch-api-tail") {
     trt_launch_api_entry entries[12]{};
@@ -2231,7 +2552,7 @@ void handle_client(sock_t s) {
     }
     body += "]}";
     respond(s, "200 OK", "application/json", body);
-    return;
+    return false;
   }
   if (strcmp(method, "GET") == 0 && url_path == "/api/render-status") {
     trt_gpu_render_stats stats{};
@@ -2320,7 +2641,7 @@ void handle_client(sock_t s) {
     }
     body += "]}";
     respond(s, "200 OK", "application/json", body);
-    return;
+    return false;
   }
 #endif
   if (strcmp(method, "GET") == 0 && url_path == "/api/storage") {
@@ -2361,7 +2682,7 @@ void handle_client(sock_t s) {
       json += "]}";
     }
     respond(s, "200 OK", "application/json", json + "]}");
-    return;
+    return false;
   }
 
   if (strcmp(method, "POST") == 0 && url_path == "/api/usb/rescan") {
@@ -2371,7 +2692,7 @@ void handle_client(sock_t s) {
       g.rescan_game.clear();
     }
     respond(s, "202 Accepted", "application/json", "{\"ok\":true}");
-    return;
+    return false;
   }
 
   if (strcmp(method, "POST") == 0 && url_path == "/api/usb/install") {
@@ -2379,12 +2700,12 @@ void handle_client(sock_t s) {
     if (content_len == 0 || content_len > 16384 ||
         !recv_exact_all(s, pre, pre_len, content_len, &body)) {
       respond(s, "400 Bad Request", "text/plain", "Invalid USB install request");
-      return;
+      return false;
     }
     std::string item_id, custom_name;
     if (!parse_json_str_field(body, "id", &item_id) || item_id.empty()) {
       respond(s, "400 Bad Request", "text/plain", "Missing USB item id");
-      return;
+      return false;
     }
     parse_json_str_field(body, "name", &custom_name);
     webxfer_usb_item found{};
@@ -2404,19 +2725,19 @@ void handle_client(sock_t s) {
     }
     if (!has_item) {
       respond(s, "404 Not Found", "text/plain", "USB item not found; rescan drives");
-      return;
+      return false;
     }
     std::string target_name = trim_ws(custom_name).empty() ? found.name : custom_name;
     if (!sanitize_game_name(target_name, &target_name) ||
         target_name.front() == '.' || target_name.back() == '.') {
       respond(s, "400 Bad Request", "text/plain", "Enter a valid target game name");
-      return;
+      return false;
     }
     {
       std::lock_guard<std::mutex> lk(g_usb_install_mu);
       if (g_usb_install_active.load() || g_usb_install_requested) {
         respond(s, "409 Conflict", "text/plain", "Another USB install is already running");
-        return;
+        return false;
       }
       g_usb_install_requested = true;
       g_usb_install_item_id = item_id;
@@ -2426,7 +2747,7 @@ void handle_client(sock_t s) {
     g_usb_done.store(0);
     g_usb_total.store(found.size_bytes);
     respond(s, "202 Accepted", "text/plain", "Downloading " + target_name + " from USB");
-    return;
+    return false;
   }
 
   if (strcmp(method, "GET") == 0 && url_path == "/api/status") {
@@ -2527,13 +2848,13 @@ void handle_client(sock_t s) {
              static_cast<unsigned long long>(use_usb_prog ? g_usb_done.load() : g_url_received.load()),
              static_cast<unsigned long long>(use_usb_prog ? g_usb_total.load() : g_url_expected.load()));
     respond(s, "200 OK", "application/json", buf);
-    return;
+    return false;
   }
   if (strcmp(method, "GET") == 0 && url_path == "/api/logs") {
     const std::string logp =
         g_local_state_dir + std::string(1, XFER_SEP) + "tiramisu.log";
     respond(s, "200 OK", "text/plain; charset=utf-8", read_log_tail(logp));
-    return;
+    return false;
   }
   if (strcmp(method, "GET") == 0 && url_path == "/api/backup-saves") {
     const std::string sep(1, XFER_SEP);
@@ -2544,7 +2865,7 @@ void handle_client(sock_t s) {
     mz_zip_archive zip{};
     if (!mz_zip_writer_init_file(&zip, tmp_zip.c_str(), 0)) {
       respond(s, "500 Server Error", "text/plain", "cannot create backup zip");
-      return;
+      return false;
     }
     std::string manifest = "Tiramisu save backup\n";
     uint64_t total_added = 0;
@@ -2563,10 +2884,10 @@ void handle_client(sock_t s) {
     if (!ok) {
       remove(tmp_zip.c_str());
       respond(s, "500 Server Error", "text/plain", "backup finalize failed");
-      return;
+      return false;
     }
     send_temp_zip_download(s, tmp_zip, "tiramisu-saves-backup.zip");
-    return;
+    return false;
   }
   if ((strcmp(method, "POST") == 0 || strcmp(method, "PUT") == 0) &&
       url_path == "/api/restore-saves") {
@@ -2588,7 +2909,7 @@ void handle_client(sock_t s) {
     if (!upload_ok) {
       remove(tmp_zip.c_str());
       respond(s, "400 Bad Request", "text/plain", "incomplete backup upload");
-      return;
+      return false;
     }
     int restored = 0;
     std::string err;
@@ -2596,13 +2917,13 @@ void handle_client(sock_t s) {
     remove(tmp_zip.c_str());
     if (!ok) {
       respond(s, "400 Bad Request", "text/plain", err);
-      return;
+      return false;
     }
     settings_load(g_local_state_dir);
     char rb[96];
     snprintf(rb, sizeof(rb), "{\"ok\":true,\"restored\":%d}", restored);
     respond(s, "200 OK", "application/json", rb);
-    return;
+    return false;
   }
   if (strcmp(method, "GET") == 0 && url_path == "/api/debug-bundle") {
     const std::string sep(1, XFER_SEP);
@@ -2613,7 +2934,7 @@ void handle_client(sock_t s) {
     mz_zip_archive zip{};
     if (!mz_zip_writer_init_file(&zip, tmp_zip.c_str(), 0)) {
       respond(s, "500 Server Error", "text/plain", "cannot create debug zip");
-      return;
+      return false;
     }
     zip_add_file_if_present(&zip, g_local_state_dir + sep + "tiramisu.log",
                             "tiramisu.log", 512ull * 1024);
@@ -2648,21 +2969,21 @@ void handle_client(sock_t s) {
     if (!ok) {
       remove(tmp_zip.c_str());
       respond(s, "500 Server Error", "text/plain", "debug finalize failed");
-      return;
+      return false;
     }
     send_temp_zip_download(s, tmp_zip, "tiramisu-debug-bundle.zip");
-    return;
+    return false;
   }
   if (strcmp(method, "GET") == 0 && url_path == "/api/list-files") {
     std::string game;
     if (!sanitize_game_name(query_param(query, "game"), &game)) {
       respond(s, "400 Bad Request", "text/plain", "invalid game name");
-      return;
+      return false;
     }
     const std::string gdir = find_game_dir(game);
     if (gdir.empty()) {
       respond(s, "404 Not Found", "text/plain", "game not found");
-      return;
+      return false;
     }
     std::vector<file_item> files;
     collect_files_rec(gdir, "", 0, &files);
@@ -2701,7 +3022,7 @@ void handle_client(sock_t s) {
     chunk += "]";
     flush_chunk();
     send_all(s, "0\r\n\r\n", 5);
-    return;
+    return false;
   }
   if (strcmp(method, "GET") == 0 && url_path.rfind("/progress/", 0) == 0) {
     char line[64];
@@ -2709,7 +3030,7 @@ void handle_client(sock_t s) {
     uint64_t dn = g_upload_done.load();
     snprintf(line, sizeof(line), "%f", tot ? (double)dn / (double)tot : 0.0);
     respond(s, "200 OK", "text/plain", line);
-    return;
+    return false;
   }
   if (strcmp(method, "POST") == 0 &&
       (url_path.rfind("/launch/", 0) == 0 || url_path.rfind("/api/launch/", 0) == 0)) {
@@ -2718,12 +3039,12 @@ void handle_client(sock_t s) {
     std::string name;
     if (!sanitize_game_name(raw_name, &name)) {
       respond(s, "400 Bad Request", "text/plain", "invalid game name");
-      return;
+      return false;
     }
     const std::string gdir = find_game_dir(name);
     if (gdir.empty()) {
       respond(s, "404 Not Found", "text/plain", "game not found");
-      return;
+      return false;
     }
     // Launch honesty (item 9): the old code returned 200 "launching" the
     // moment the flag was set, before anything ran — and silently
@@ -2750,11 +3071,11 @@ void handle_client(sock_t s) {
       respond(s, "409 Conflict", "application/json",
               "{\"error\":\"" + conflict + "\",\"name\":\"" +
                   json_escape(conflict_name) + "\"}");
-      return;
+      return false;
     }
     respond(s, "202 Accepted", "application/json",
             "{\"queued\":true,\"name\":\"" + json_escape(name) + "\"}");
-    return;
+    return false;
   }
   if (strcmp(method, "POST") == 0 && url_path == "/api/stop") {
     {
@@ -2762,7 +3083,7 @@ void handle_client(sock_t s) {
       g.stop_requested = true;
     }
     respond(s, "200 OK", "application/json", "{\"ok\":true}");
-    return;
+    return false;
   }
   if (strcmp(method, "POST") == 0 && url_path == "/api/rescan") {
     {
@@ -2771,7 +3092,7 @@ void handle_client(sock_t s) {
       g.rescan_game.clear();  // manual rescan is always a full rescan
     }
     respond(s, "200 OK", "application/json", "{\"ok\":true}");
-    return;
+    return false;
   }
   if ((strcmp(method, "DELETE") == 0 && url_path.rfind("/api/game/", 0) == 0) ||
       (strcmp(method, "POST") == 0 && url_path.rfind("/api/delete/", 0) == 0)) {
@@ -2779,16 +3100,16 @@ void handle_client(sock_t s) {
     std::string name;
     if (!sanitize_game_name(url_decode(url_path.substr(off), false), &name)) {
       respond(s, "400 Bad Request", "text/plain", "invalid game name");
-      return;
+      return false;
     }
     const std::string gdir = g_games_dir + std::string(1, XFER_SEP) + name;
     if (!dir_exists(gdir)) {
       respond(s, "404 Not Found", "text/plain", "not found");
-      return;
+      return false;
     }
     if (!remove_tree(gdir)) {
       respond(s, "500 Server Error", "text/plain", "delete failed");
-      return;
+      return false;
     }
     {
       std::lock_guard<std::mutex> lk(g_mu);
@@ -2796,52 +3117,52 @@ void handle_client(sock_t s) {
       g.rescan_game = name;  // scoped: only this game's entries vanish
     }
     respond(s, "200 OK", "application/json", "{\"deleted\":true}");
-    return;
+    return false;
   }
   if ((strcmp(method, "GET") == 0 || strcmp(method, "PUT") == 0) &&
       url_path.rfind("/api/game-profile/", 0) == 0) {
     std::string name;
     if (!sanitize_game_name(url_decode(url_path.substr(18), false), &name)) {
       respond(s, "400 Bad Request", "text/plain", "Invalid game name");
-      return;
+      return false;
     }
     const auto game = find_game_dir(name);
     if (game.empty()) {
       respond(s, "404 Not Found", "text/plain", "Game not found");
-      return;
+      return false;
     }
     const auto profile = settings_title_profile_dir(g_local_state_dir, game);
     if (strcmp(method, "GET") == 0) {
       respond(s, "200 OK", "text/plain; charset=utf-8", settings_read_user_profile(profile));
-      return;
+      return false;
     }
     std::string text;
     if (content_len > 64 * 1024 || is_chunked ||
         !recv_exact_all(s, pre, pre_len, content_len, &text) ||
         text.find('\0') != std::string::npos) {
       respond(s, "400 Bad Request", "text/plain", "Invalid or oversized settings file");
-      return;
+      return false;
     }
     const bool saved = settings_write_user_profile(profile, text);
     respond(s, saved ? "200 OK" : "500 Server Error", "text/plain",
             saved ? "Saved. Settings apply on the next launch." : "Could not write game settings");
-    return;
+    return false;
   }
   if (strcmp(method, "POST") == 0 && url_path.rfind("/api/config/", 0) == 0) {
     std::string name;
     if (!sanitize_game_name(url_decode(url_path.substr(12), false), &name)) {
       respond(s, "400 Bad Request", "text/plain", "invalid game name");
-      return;
+      return false;
     }
     const std::string gdir = g_games_dir + std::string(1, XFER_SEP) + name;
     if (!dir_exists(gdir)) {
       respond(s, "404 Not Found", "text/plain", "game not found");
-      return;
+      return false;
     }
     std::string body;
     if (!recv_exact_all(s, pre, pre_len, content_len, &body)) {
       respond(s, "400 Bad Request", "text/plain", "bad body");
-      return;
+      return false;
     }
     std::string exe_v, app_v, arg_v, inp_v;
     bool has_exe = parse_json_str_field(body, "exe", &exe_v);
@@ -2853,7 +3174,7 @@ void handle_client(sock_t s) {
       std::string safe_exe;
       if (!exe_v.empty() && !sanitize_rel_path(exe_v, '\\', &safe_exe)) {
         respond(s, "400 Bad Request", "text/plain", "invalid exe path");
-        return;
+        return false;
       }
       write_or_clear_text(gdir + sep + "tiramisu_exe.txt", safe_exe);
     }
@@ -2877,7 +3198,262 @@ void handle_client(sock_t s) {
       g.rescan_game = name;  // scoped: only this game's config changed
     }
     respond(s, "200 OK", "application/json", "{\"saved\":true}");
-    return;
+    return false;
+  }
+  if ((strcmp(method, "PUT") == 0 || strcmp(method, "POST") == 0) &&
+      url_path == "/api/upload-batch") {
+    std::string game_raw = query_param(query, "game");
+    std::string game;
+    if (!sanitize_game_name(game_raw, &game) || is_chunked || content_len == 0) {
+      respond(s, "400 Bad Request", "text/plain", "invalid batch upload request");
+      return false;
+    }
+    set_upload_timeout(s);
+    if (expect_100) send_all(s, "HTTP/1.1 100 Continue\r\n\r\n", 25);
+    const std::string sep(1, XFER_SEP);
+    const std::string gdir = g_games_dir + sep + game;
+    mkdirs(gdir);
+    set_upload_label(game);
+    g_upload_total += content_len;
+    int files = 0;
+    uint64_t bytes = 0;
+    std::string err;
+    if (!stream_batch_upload(s, pre, pre_len, content_len, gdir, &files, &bytes, &err)) {
+      respond(s, "500 Server Error", "text/plain", err.empty() ? "batch upload failed" : err);
+      return false;
+    }
+    const bool is_batch = (query_param(query, "batch") == "1");
+    {
+      std::lock_guard<std::mutex> lk(g_mu);
+      g.last_upload = game + " (" + std::to_string(files) + " files)";
+      g.last_error.clear();
+      if (!is_batch) {
+        g.rescan_requested = true;
+        g.rescan_game = game;
+      }
+    }
+    char okj[96];
+    snprintf(okj, sizeof(okj), "{\"ok\":true,\"files\":%d,\"bytes\":%llu}",
+             files, (unsigned long long)bytes);
+    *out_keep_alive = can_keep_alive;
+    respond_ka(s, "200 OK", "application/json", okj, can_keep_alive);
+    return can_keep_alive;
+  }
+  if (strcmp(method, "POST") == 0 && url_path == "/api/upload-chunk-init") {
+    const uint64_t total_size = strtoull(query_param(query, "size").c_str(), nullptr, 10);
+    const std::string name_raw = query_param(query, "name");
+    const std::string game_raw = query_param(query, "game");
+    const std::string rel_raw = query_param(query, "rel");
+    const bool is_batch = (query_param(query, "batch") == "1");
+    const std::string sep(1, XFER_SEP);
+
+    chunk_upload_session sess;
+    sess.total_size = total_size;
+    sess.is_batch = is_batch;
+    sess.created_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+
+    if (!name_raw.empty()) {
+      std::string fname = name_raw;
+      for (auto& c : fname) if (c == '/' || c == '\\' || c == ':') c = '_';
+      if (fname.find("..") != std::string::npos || fname.empty() ||
+          fname.size() <= 4 || !xfer_ieq(fname.substr(fname.size() - 4), ".zip")) {
+        respond(s, "400 Bad Request", "text/plain", "bad zip name");
+        return false;
+      }
+      const size_t stem = fname.rfind('.');
+      if (!sanitize_game_name(fname.substr(0, stem), &sess.game)) {
+        respond(s, "400 Bad Request", "text/plain", "bad zip game name");
+        return false;
+      }
+      sess.is_zip = true;
+      sess.fname = fname;
+      sess.id = "c" + std::to_string(g_chunk_seq.fetch_add(1)) + "_" + std::to_string(sess.created_ms & 0xFFFFF);
+      sess.staged_path = g_incoming + sep + ".chunk-" + sess.id + "-" + fname;
+      sess.final_path = g_games_dir + sep + sess.game;
+      g_upload_total = total_size;
+      g_upload_done = 0;
+      set_upload_label(fname);
+    } else if (!game_raw.empty() && !rel_raw.empty()) {
+      std::string rel;
+      if (!sanitize_game_name(game_raw, &sess.game) ||
+          !sanitize_rel_path(rel_raw, XFER_SEP, &rel)) {
+        respond(s, "400 Bad Request", "text/plain", "invalid game or rel path");
+        return false;
+      }
+      sess.is_zip = false;
+      sess.fname = rel;
+      sess.id = "c" + std::to_string(g_chunk_seq.fetch_add(1)) + "_" + std::to_string(sess.created_ms & 0xFFFFF);
+      sess.final_path = g_games_dir + sep + sess.game + sep + rel;
+      const size_t sl = sess.final_path.rfind(XFER_SEP);
+      if (sl != std::string::npos) mkdirs(sess.final_path.substr(0, sl));
+      sess.staged_path = (sl != std::string::npos ? sess.final_path.substr(0, sl + 1) : "") +
+                         ".tiramisu-chunk-" + sess.id;
+      set_upload_label(sess.game);
+      g_upload_total += total_size;
+    } else {
+      respond(s, "400 Bad Request", "text/plain", "missing name or game+rel");
+      return false;
+    }
+
+    if (!preallocate_staged_file(sess.staged_path, total_size)) {
+      respond(s, "500 Server Error", "text/plain", "could not preallocate staged file");
+      return false;
+    }
+    const std::string sid = sess.id;
+    {
+      std::lock_guard<std::mutex> lk(g_chunk_mu);
+      // Prune stale sessions older than 1 hour.
+      for (auto it = g_chunk_sessions.begin(); it != g_chunk_sessions.end(); ) {
+        if (sess.created_ms - it->second.created_ms > 3600000ll) {
+          remove(it->second.staged_path.c_str());
+          it = g_chunk_sessions.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      g_chunk_sessions.emplace(sid, std::move(sess));
+    }
+    char outj[160];
+    snprintf(outj, sizeof(outj),
+             "{\"ok\":true,\"upload_id\":\"%s\",\"chunk_size\":16777216}", sid.c_str());
+    *out_keep_alive = can_keep_alive;
+    respond_ka(s, "200 OK", "application/json", outj, can_keep_alive);
+    return can_keep_alive;
+  }
+  if ((strcmp(method, "PUT") == 0 || strcmp(method, "POST") == 0) &&
+      url_path == "/api/upload-chunk") {
+    const std::string sid = query_param(query, "id");
+    const uint64_t offset = strtoull(query_param(query, "offset").c_str(), nullptr, 10);
+    std::string staged_path;
+    uint64_t total_size = 0;
+    {
+      std::lock_guard<std::mutex> lk(g_chunk_mu);
+      auto it = g_chunk_sessions.find(sid);
+      if (it == g_chunk_sessions.end()) {
+        respond(s, "404 Not Found", "text/plain", "unknown upload_id");
+        return false;
+      }
+      staged_path = it->second.staged_path;
+      total_size = it->second.total_size;
+    }
+    if (is_chunked || offset > total_size || content_len > total_size - offset) {
+      respond(s, "400 Bad Request", "text/plain", "chunk out of bounds");
+      return false;
+    }
+    set_upload_timeout(s);
+    if (expect_100) send_all(s, "HTTP/1.1 100 Continue\r\n\r\n", 25);
+    if (!stream_chunk_to_offset(s, pre, pre_len, staged_path, offset, content_len)) {
+      respond(s, "500 Server Error", "text/plain", "chunk write failed");
+      return false;
+    }
+    {
+      std::lock_guard<std::mutex> lk(g_chunk_mu);
+      auto it = g_chunk_sessions.find(sid);
+      if (it != g_chunk_sessions.end()) {
+        auto& prev = it->second.ranges[offset];
+        if (content_len > prev) {
+          it->second.unique_bytes += (content_len - prev);
+          prev = content_len;
+        }
+      }
+    }
+    char outj[112];
+    snprintf(outj, sizeof(outj), "{\"ok\":true,\"offset\":%llu,\"size\":%llu}",
+             (unsigned long long)offset, (unsigned long long)content_len);
+    *out_keep_alive = can_keep_alive;
+    respond_ka(s, "200 OK", "application/json", outj, can_keep_alive);
+    return can_keep_alive;
+  }
+  if (strcmp(method, "POST") == 0 && url_path == "/api/upload-chunk-commit") {
+    const std::string sid = query_param(query, "id");
+    chunk_upload_session sess;
+    {
+      std::lock_guard<std::mutex> lk(g_chunk_mu);
+      auto it = g_chunk_sessions.find(sid);
+      if (it == g_chunk_sessions.end()) {
+        respond(s, "404 Not Found", "text/plain", "unknown upload_id");
+        return false;
+      }
+      sess = std::move(it->second);
+      g_chunk_sessions.erase(it);
+    }
+    if (!chunk_ranges_cover_total(sess.ranges, sess.total_size)) {
+      remove(sess.staged_path.c_str());
+      respond(s, "400 Bad Request", "text/plain", "missing upload chunks");
+      return false;
+    }
+#if defined(_WIN32)
+    struct _stat64 st {};
+    const bool stat_ok = _stat64(sess.staged_path.c_str(), &st) == 0;
+#else
+    struct stat st {};
+    const bool stat_ok = stat(sess.staged_path.c_str(), &st) == 0;
+#endif
+    if (!stat_ok || static_cast<uint64_t>(st.st_size) != sess.total_size) {
+      remove(sess.staged_path.c_str());
+      respond(s, "500 Server Error", "text/plain", "staged file size mismatch");
+      return false;
+    }
+    if (sess.is_zip) {
+      mkdirs(sess.final_path);
+      std::string note;
+      const bool ok = extract_zip(sess.staged_path, sess.final_path, &note);
+      remove(sess.staged_path.c_str());
+      g_upload_total = 0;
+      g_upload_done = 0;
+      set_upload_label("");
+      if (ok) {
+        char mb[32];
+        snprintf(mb, sizeof(mb), "%.1f MB", (double)sess.total_size / 1048576.0);
+        {
+          std::lock_guard<std::mutex> lk(g_mu);
+          g.last_upload = sess.game + " (" + mb + ", " + note + ")";
+          g.last_error.clear();
+          g.rescan_requested = true;
+          g.rescan_game = sess.game;
+        }
+        webxfer_autopilot_begin(sess.game);
+        respond(s, "200 OK", "text/plain",
+                "extracted: " + sess.game + " — " + note +
+                ". Hit Launch, then look at the TV.");
+      } else {
+        {
+          std::lock_guard<std::mutex> lk(g_mu);
+          g.last_error = "zip extract failed: " + note;
+        }
+        respond(s, "500 Server Error", "text/plain", "extract failed: " + note);
+      }
+      return false;
+    }
+    bool moved = false;
+#if defined(_WIN32)
+    moved = (MoveFileExA(sess.staged_path.c_str(), sess.final_path.c_str(),
+                         MOVEFILE_REPLACE_EXISTING) != 0);
+#else
+    moved = (rename(sess.staged_path.c_str(), sess.final_path.c_str()) == 0);
+#endif
+    if (!moved) {
+      remove(sess.staged_path.c_str());
+      respond(s, "500 Server Error", "text/plain", "could not commit chunked file");
+      return false;
+    }
+    {
+      std::lock_guard<std::mutex> lk(g_mu);
+      g.last_upload = sess.game + " -> " + sess.fname;
+      g.last_error.clear();
+      if (!sess.is_batch) {
+        g.rescan_requested = true;
+        g.rescan_game = sess.game;
+      }
+    }
+    if (!sess.is_batch) webxfer_autopilot_begin(sess.game);
+    char okj[64];
+    snprintf(okj, sizeof(okj), "{\"ok\":true,\"size\":%llu}",
+             (unsigned long long)sess.total_size);
+    *out_keep_alive = can_keep_alive;
+    respond_ka(s, "200 OK", "application/json", okj, can_keep_alive);
+    return can_keep_alive;
   }
   if ((strcmp(method, "PUT") == 0 || strcmp(method, "POST") == 0) &&
       url_path == "/api/upload-file") {
@@ -2887,7 +3463,7 @@ void handle_client(sock_t s) {
     if (!sanitize_game_name(game_raw, &game) ||
         !sanitize_rel_path(rel_raw, XFER_SEP, &rel)) {
       respond(s, "400 Bad Request", "text/plain", "invalid game or rel path");
-      return;
+      return false;
     }
     // Two streams writing the SAME file would interleave bytes and fail
     // verification — refuse the duplicate (409) instead of corrupting the
@@ -2897,7 +3473,7 @@ void handle_client(sock_t s) {
       std::lock_guard<std::mutex> lk(g_upload_mu);
       if (!g_uploads_inflight.insert(game + "\x1f" + rel).second) {
         respond(s, "409 Conflict", "text/plain", "already uploading");
-        return;
+        return false;
       }
     }
     inflight_guard inflight(game + "\x1f" + rel);
@@ -2914,7 +3490,7 @@ void handle_client(sock_t s) {
     if (!replace_uploaded_file(s, pre, pre_len, out_path, is_chunked,
                                content_len, &got)) {
       respond(s, "500 Server Error", "text/plain", "incomplete file");
-      return;
+      return false;
     }
     const bool is_batch = (query_param(query, "batch") == "1");
     {
@@ -2934,9 +3510,10 @@ void handle_client(sock_t s) {
       char okj[64];
       snprintf(okj, sizeof(okj), "{\"ok\":true,\"size\":%llu}",
                (unsigned long long)got);
-      respond(s, "200 OK", "application/json", okj);
+      *out_keep_alive = can_keep_alive;
+      respond_ka(s, "200 OK", "application/json", okj, can_keep_alive);
     }
-    return;
+    return can_keep_alive;
   }
   if ((strcmp(method, "PUT") == 0 || strcmp(method, "POST") == 0) &&
       url_path.rfind("/upload/", 0) == 0) {
@@ -2944,7 +3521,7 @@ void handle_client(sock_t s) {
     for (auto& c : fname) if (c == '/' || c == '\\' || c == ':') c = '_';
     if (fname.find("..") != std::string::npos || fname.empty()) {
       respond(s, "400 Bad Request", "text/plain", "bad name");
-      return;
+      return false;
     }
     // Same in-flight guard as /api/upload-file: two zips of the same name
     // would share one incoming temp file.
@@ -2952,7 +3529,7 @@ void handle_client(sock_t s) {
       std::lock_guard<std::mutex> lk(g_upload_mu);
       if (!g_uploads_inflight.insert("zip:" + fname).second) {
         respond(s, "409 Conflict", "text/plain", "already uploading");
-        return;
+        return false;
       }
     }
     inflight_guard inflight("zip:" + fname);
@@ -2981,7 +3558,7 @@ void handle_client(sock_t s) {
       g_upload_total = 0;
       g_upload_done = 0;
       set_upload_label("");
-      return;
+      return false;
     }
     char mb[32];
     snprintf(mb, sizeof(mb), "%.1f MB", (double)got / 1048576.0);
@@ -2993,7 +3570,7 @@ void handle_client(sock_t s) {
         respond(s, "400 Bad Request", "text/plain", "bad zip name");
         g_upload_total = 0;
         g_upload_done = 0;
-        return;
+        return false;
       }
       const std::string dest = g_games_dir + sep + game_name;
       mkdirs(dest);
@@ -3030,28 +3607,28 @@ void handle_client(sock_t s) {
     }
     g_upload_total = 0;
     g_upload_done = 0;
-    return;
+    return false;
   }
   if (url_path == "/api/settings" && strcmp(method, "GET") == 0) {
     respond(s, "200 OK", "application/json", dashboard_settings_json(settings_get_global()));
-    return;
+    return false;
   }
   if (url_path == "/api/settings" && strcmp(method, "POST") == 0) {
     std::string body;
     if (is_chunked || content_len > 8192 ||
         !recv_exact_all(s, pre, pre_len, content_len, &body)) {
       respond(s, "400 Bad Request", "text/plain", "Invalid settings request");
-      return;
+      return false;
     }
     auto st = settings_get_global();
     const auto previous_network_root = st.network_games_root;
     if (!apply_dashboard_settings(body, st)) {
       respond(s, "400 Bad Request", "text/plain", "Invalid settings object");
-      return;
+      return false;
     }
     if (!settings_store(st, g_local_state_dir)) {
       respond(s, "500 Server Error", "text/plain", "Could not save settings");
-      return;
+      return false;
     }
     const auto network_root = settings_get_global().network_games_root;
     webxfer_set_network_games_dir(network_root);
@@ -3062,9 +3639,25 @@ void handle_client(sock_t s) {
     }
     log_line("settings: saved from the web dashboard");
     respond(s, "200 OK", "application/json", "{\"saved\":true}");
-    return;
+    return false;
   }
   respond(s, "404 Not Found", "text/plain", "not found");
+  return false;
+}
+
+void handle_client(sock_t s) {
+  sock_guard sg{s};
+  for (int reqs = 0; reqs < 500 && !g_stop; ++reqs) {
+    bool keep_alive = false;
+    if (!handle_one_request(s, &keep_alive) || !keep_alive) break;
+#ifdef _WIN32
+    const DWORD ka_ms = 15000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&ka_ms, sizeof(ka_ms));
+#else
+    struct timeval ka_tv = {15, 0};
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&ka_tv, sizeof(ka_tv));
+#endif
+  }
 }
 
 // The HTTP listener and its workers run beside a guest that spins at ~100% CPU,
@@ -3120,7 +3713,8 @@ void listener_thread() {
     setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to_tv, sizeof(to_tv));
     setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to_tv, sizeof(to_tv));
 #endif
-    if (g_workers.load() < 16) {
+    tune_transfer_socket(c, false);
+    if (g_workers.load() < 32) {
       g_workers.fetch_add(1);
       std::thread([c]() {
         // .237 FIX: same starvation as the listener -- a worker
@@ -3410,6 +4004,7 @@ std::string webxfer_start_port(const std::string& local_state, unsigned short po
   }
   int yes = 1;
   setsockopt(g_listener, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+  tune_transfer_socket(g_listener, true);
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
