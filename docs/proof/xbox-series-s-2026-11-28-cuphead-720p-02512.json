@@ -1,0 +1,92 @@
+{
+  "console": "Xbox Series S",
+  "build": "Xan.Tiramisu 0.2.5.12",
+  "source_commit": "003443ee22ec552c677a8a5d072522ccfa9e4574",
+  "package_sha256": "d843626a178bdfbcea4ec7587b36090832201d348f5248a192eafec2b414372e",
+  "launch_path": "normal Play",
+  "title": "Cuphead",
+  "before": {
+    "0.2.5.10": {
+      "window_started_at": [
+        320,
+        240
+      ],
+      "window_collapsed_to": [
+        0,
+        0
+      ],
+      "colored_frames": false
+    },
+    "0.2.5.11": {
+      "client_area": [
+        1280,
+        720
+      ],
+      "guest_backbuffer": [
+        320,
+        240
+      ],
+      "main_menu_visible": true
+    }
+  },
+  "after": {
+    "guest_backbuffer": [
+      1280,
+      720
+    ],
+    "client_area": [
+      1280,
+      720
+    ],
+    "window_empty_transitions": 0,
+    "main_menu_visible": true,
+    "main_menu_text_detected": [
+      "DLC",
+      "EXIT",
+      "OPTIONS",
+      "START"
+    ],
+    "save_slot_and_player_selection_visible": true,
+    "opening_story_visible": true,
+    "input_source": "paired remote keyboard controls",
+    "input_result": "confirm advanced the title screen, Start opened save selection, and character selection advanced to the opening story",
+    "physical_controller_tested": false,
+    "audio_measured": false,
+    "opening_room_visible": true,
+    "opening_room_presents_per_second": {
+      "median": 60.1,
+      "min": 58.7,
+      "max": 61.8
+    },
+    "opening_room_input": "paired right and left inputs produced localized screen changes in different parts of the room",
+    "level_playthrough_measured": false
+  },
+  "successful_d3d11_presents_per_second": {
+    "metric": "counter deltas over elapsed wall time",
+    "steady_title": {
+      "min": 59.16,
+      "median": 59.43,
+      "max": 60.79
+    },
+    "player_selection": {
+      "min": 58.3,
+      "median": 60.1,
+      "max": 60.3
+    },
+    "opening_story_after_26_seconds": {
+      "min": 53.4,
+      "median": 60.1,
+      "max": 67.2
+    },
+    "loading": "Startup ran at approximately 9–13 Presents per second before reaching 60. Scene changes also paused presentation."
+  },
+  "verification": {
+    "focused_offline_tests": [
+      "test_input",
+      "test_d3d"
+    ],
+    "offline_load_corpus": "123 passed",
+    "uwp_build_and_signed_package": "pass",
+    "full_offline_gate": "blocked by the existing 64 x86 ABI gaps in the baseline"
+  }
+}
