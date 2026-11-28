@@ -9,7 +9,7 @@
 **A Windows PE64 application runtime for Xbox Dev Mode.**
 Wine's job, targeting UWP instead of POSIX.
 
-![Status](https://img.shields.io/badge/status-RACCOIN%20playable%20%7C%20God%20of%20War%20renders%20%7C%20Celeste%20playable-brightgreen)
+![Status](https://img.shields.io/badge/status-Cuphead%20playable%20%7C%20RACCOIN%20playable%20%7C%20Celeste%20playable%20%7C%20God%20of%20War%20renders-brightgreen)
 ![Suites](https://img.shields.io/badge/offline%20suites-78-blue)
 ![Coverage](https://img.shields.io/badge/corpus%20imports-100%25%20real-brightgreen)
 ![Platform](https://img.shields.io/badge/platform-Xbox%20One%20%7C%20One%20S%20%7C%20One%20X%20%7C%20Series%20X%7CS-107C10?logo=xbox&logoColor=white)
@@ -77,10 +77,23 @@ Two ideas carry the whole design:
 - **The console already has the hardware.** D3D11, D3D12, XAudio2 and the CPU
   are real. Tiramisu translates API *semantics*, not instructions.
 
-## Console proof (2026-11-19)
+## Console proof
 
-RACCOIN, God of War and Celeste are running on an Xbox Series S in Dev Mode, loaded by
-the signed Tiramisu MSIX. No CPU emulation, no streaming, no PC in the loop.
+These captures show the signed Tiramisu MSIX executing Windows game code on
+an Xbox Series S in Dev Mode.
+
+### Cuphead — native Xbox gameplay
+
+The original Windows x64 build runs natively on Xbox Series S in Dev Mode
+through Tiramisu 0.2.5.12. Its main menu and the opening section of Forest
+Follies rendered at 1280 × 720. The clip shows Cuphead running, jumping, and
+shooting during encounters with enemies.
+
+![Cuphead main menu on Xbox Series S](docs/proof/cuphead-main-menu.jpg)
+
+[![Cuphead Forest Follies gameplay on Xbox Series S](docs/proof/cuphead-gameplay.gif)](docs/proof/cuphead-gameplay.mp4)
+
+The silent 15-second clip uses 25 Xbox Device Portal display captures. [Runtime evidence](docs/proof/xbox-series-s-2026-11-28-cuphead-720p-02512.json)
 
 ### RACCOIN — playable
 
@@ -550,6 +563,7 @@ are worth calling out because they define the shape of every other claim:
 
 | Game (corpus, gitignored) | Type | Result |
 |---|---|---|
+| **Cuphead** | Unity, Windows x64, D3D11 | **Native on Xbox Series S.** Main menu, tutorial, overworld, and opening Forest Follies gameplay verified. |
 | **RACCOIN** | Unity 6 IL2CPP, Steam, D3D11 | **Playable on console.** Menu, live run, coin physics, HUD progression; 7.2 s capture. |
 | **God of War** (PC) | AAA in-house engine, x64, D3D11 | **Boots and renders on console.** The opening forest, across four boots; menu and gameplay next. |
 | **Celeste** (v1.4.0.0) | XNA / Mono + FNA (managed .NET) | **Playable on console.** Title, menu, Chapter 1 gameplay; first managed game to run. Audio silent. |
@@ -836,7 +850,7 @@ failure is a red gate, never a skipped test.
 | [docs/xbox-one-family.md](docs/xbox-one-family.md) | Xbox One / One S / One X support map — hardware, manifest capabilities, test matrix |
 | [docs/promo-reel.md](docs/promo-reel.md) | 60-second setup/promo shot list and capture recipe |
 | [docs/known-issues.md](docs/known-issues.md) · [docs/troubleshooting.md](docs/troubleshooting.md) | measured limitations, and how to get unstuck |
-| [docs/proof/](docs/proof/) | console captures: RACCOIN menu, run and clip; four God of War boots; Celeste title, menu, greyscale test and gameplay |
+| [docs/proof/](docs/proof/) | console captures: Cuphead menu and Forest Follies clip; RACCOIN menu, run and clip; four God of War boots; Celeste title, menu, greyscale test and gameplay |
 | [GAP-MAP.md](GAP-MAP.md) | live gap table, W-lanes, dependency order, triggers |
 | [CHANGELOG.md](CHANGELOG.md) | version + change history |
 

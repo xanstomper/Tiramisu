@@ -88,5 +88,37 @@
     "offline_load_corpus": "123 passed",
     "uwp_build_and_signed_package": "pass",
     "full_offline_gate": "blocked by the existing 64 x86 ABI gaps in the baseline"
+  },
+  "media_capture": {
+    "date_utc": "2026-11-28",
+    "scene": "Forest Follies, opening section (Run & Gun)",
+    "observed": [
+      "movement",
+      "jumping",
+      "shooting",
+      "enemy encounters"
+    ],
+    "input_source": "paired remote keyboard controls",
+    "capture_source": "Xbox Device Portal display screenshots",
+    "screenshots": 25,
+    "screenshot_errors": 0,
+    "sampled_seconds": 14.33,
+    "mean_screenshots_per_second": 1.68,
+    "mp4_duration_seconds": 15.0,
+    "audio_captured": false,
+    "full_level_completion_verified": false,
+    "render_status_after_capture": {
+      "d3d11_successful_presents": 203632,
+      "d3d11_width": 1280,
+      "d3d11_height": 720,
+      "guest_lit_pixels": 16,
+      "host_lit_pixels": 16,
+      "guest_commit_mib": 438
+    },
+    "files": [
+      "docs/proof/cuphead-main-menu.jpg",
+      "docs/proof/cuphead-gameplay.mp4",
+      "docs/proof/cuphead-gameplay.gif"
+    ]
   }
 }
