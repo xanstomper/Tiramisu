@@ -9,6 +9,7 @@
 #include "bridge_gdi.h"
 #include "bridge_opengl32.h"
 #include "bridge_user32.h"
+#include "gdi_glyph.h"
 #include "gdi_raster.h"
 #include "input.h"
 #include "thunk.h"
@@ -42,7 +43,7 @@ constexpr u32 TRT_GDI_OBJ_REGION = 4;
 constexpr u32 TRT_GDI_OBJ_BITMAP = 5;
 constexpr u32 TRT_GDI_OBJ_PALETTE = 6;
 
-constexpr u32 LF_BYTES = 96;
+constexpr u32 LF_BYTES = trt_glyph::logfontw_bytes;
 
 struct gdi_obj {
   u32 type;
@@ -440,15 +441,18 @@ void* TRT_GUEST_ABI trt_CreateFontW(int cHeight, int cWidth, int cEscapement,
                                     u32 iCharSet, u32 iOutPrecision,
                                     u32 iClipPrecision, u32 iQuality,
                                     u32 iPitchAndFamily, const u16* pszFaceName) {
-  (void)bItalic; (void)bUnderline; (void)bStrikeOut; (void)iCharSet;
-  (void)iOutPrecision; (void)iClipPrecision; (void)iQuality;
-  (void)iPitchAndFamily; (void)pszFaceName;
-  u8 lfw[LF_BYTES] = {};
-  *(i32*)(lfw + 0) = cHeight;
-  *(i32*)(lfw + 4) = cWidth;
-  *(i32*)(lfw + 8) = cEscapement;
-  *(i32*)(lfw + 12) = cOrientation;
-  *(i32*)(lfw + 16) = cWeight;
+  const i32 fields[] = {cHeight, cWidth, cEscapement, cOrientation, cWeight};
+  const u8 attributes[] = {
+      u8(bItalic != 0), u8(bUnderline != 0), u8(bStrikeOut != 0), u8(iCharSet),
+      u8(iOutPrecision), u8(iClipPrecision), u8(iQuality), u8(iPitchAndFamily),
+  };
+  u8 lfw[LF_BYTES]{};
+  memcpy(lfw, fields, sizeof(fields));
+  memcpy(lfw + sizeof(fields), attributes, sizeof(attributes));
+  if (pszFaceName) {
+    for (size_t i = 0; i < 31 && pszFaceName[i]; ++i)
+      memcpy(lfw + 28 + i * sizeof(u16), pszFaceName + i, sizeof(u16));
+  }
   return trt_CreateFontIndirectW(lfw);
 }
 
@@ -458,11 +462,15 @@ void* TRT_GUEST_ABI trt_CreateFontA(int cHeight, int cWidth, int cEscapement,
                                     u32 iCharSet, u32 iOutPrecision,
                                     u32 iClipPrecision, u32 iQuality,
                                     u32 iPitchAndFamily, const char* pszFaceName) {
-  (void)pszFaceName;
+  u16 wide_face[32]{};
+  if (pszFaceName) {
+    for (size_t i = 0; i < 31 && pszFaceName[i]; ++i)
+      wide_face[i] = static_cast<u8>(pszFaceName[i]);
+  }
   return trt_CreateFontW(cHeight, cWidth, cEscapement, cOrientation, cWeight,
                          bItalic, bUnderline, bStrikeOut, iCharSet,
                          iOutPrecision, iClipPrecision, iQuality,
-                         iPitchAndFamily, nullptr);
+                         iPitchAndFamily, wide_face);
 }
 
 void* TRT_GUEST_ABI trt_CreateSolidBrush(u32 color) {
@@ -2742,13 +2750,27 @@ int TRT_GUEST_ABI trt_ExtEscape(void* hdc, int nEscape, int cbInput,
   return 0;
 }
 
-// GetGlyphOutlineW: font outline extraction not supported on console.
+// Copy the selected LOGFONTW into a local record before calling the host.
+static bool glyph_font_for_dc(void* hdc, u8 (&logfont)[LF_BYTES]) {
+  if (!trt_user32_dc_is_valid(hdc)) return false;
+  auto* object = obj_by_handle(static_cast<u32>(reinterpret_cast<uintptr_t>(dc_font(hdc))));
+  if (object && object->type == TRT_GDI_OBJ_FONT)
+    memcpy(logfont, object->data, sizeof(logfont));
+  return true;
+}
 u32 TRT_GUEST_ABI trt_GetGlyphOutlineW(void* hdc, u32 uChar, u32 fuFormat,
                                        void* lpgm, u32 cbBuffer, void* lpvBuffer,
                                        const void* lpmat2) {
-  (void)hdc; (void)uChar; (void)fuFormat; (void)lpgm;
-  (void)cbBuffer; (void)lpvBuffer; (void)lpmat2;
-  return (u32)-1;  // GDI_ERROR
+  if (!lpgm || !lpmat2) return trt_glyph::error;
+  u8 logfont[LF_BYTES]{};
+  if (!glyph_font_for_dc(hdc, logfont)) return trt_glyph::error;
+  trt_glyph::matrix transform{};
+  memcpy(&transform, lpmat2, sizeof(transform));
+  trt_glyph::glyph_metrics metrics{};
+  const u32 bytes = trt_glyph::outline(logfont, uChar, fuFormat, &metrics,
+                                       cbBuffer, lpvBuffer, &transform);
+  if (bytes != trt_glyph::error) memcpy(lpgm, &metrics, sizeof(metrics));
+  return bytes;
 }
 
 // GetKerningPairsW: kerning pairs not available.
@@ -2878,15 +2900,21 @@ u32 TRT_GUEST_ABI trt_GetDIBColorTable(void* hdc, u32 start, u32 count,
   return n;
 }
 
-// Glyph indices: the host renders text through its own stack, which indexes by
-// UTF-16 code unit. Returning the input characters is a usable documented
-// identity mapping instead of an invented glyph table.
 u32 TRT_GUEST_ABI trt_GetGlyphIndicesW(void* hdc, const u16* text, int count,
                                        u16* indices, u32 flags) {
-  (void)hdc; (void)flags;
-  if (!text || !indices || count < 0) return 0xFFFFFFFFu;  // GDI_ERROR
+  if (count < 0 || (count && (!text || !indices))) return trt_glyph::error;
+  u8 logfont[LF_BYTES]{};
+  if (!glyph_font_for_dc(hdc, logfont)) return trt_glyph::error;
+#ifdef _WIN32
+  constexpr u32 mark_missing = 1;  // GGI_MARK_NONEXISTING_GLYPHS
+  return trt_glyph::indices(logfont, text, static_cast<u32>(count), indices,
+                             (flags & mark_missing) != 0);
+#else
+  // The software text renderer uses UTF-16 code units as its glyph indices.
+  (void)flags;
   for (int i = 0; i < count; ++i) indices[i] = text[i];
-  return (u32)count;
+  return static_cast<u32>(count);
+#endif
 }
 
 // OUTLINETEXTMETRICW: there is no outline font engine behind the DC, so the

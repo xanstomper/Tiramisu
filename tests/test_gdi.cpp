@@ -557,6 +557,23 @@ int main(int argc, char** argv) {
                 logfonta[28] == 'A' && logfonta[31] == 'a',
             "GetObjectA(font) -> LOGFONTA with the face name");
 
+      auto get_object_w = (fn_getobj)resolve_gdi("GetObjectW");
+      using create_font_fn = void*(TRT_GUEST_ABI*)(int, int, int, int, int,
+          u32, u32, u32, u32, u32, u32, u32, u32, const u16*);
+      auto create_font_w = (create_font_fn)resolve_gdi("CreateFontW");
+      auto delete_object = (fn_i_i)resolve_gdi("DeleteObject");
+      const u16 face_name[] = {'A', 'r', 'i', 'a', 'l', 0};
+      void* direct_font = create_font_w
+          ? create_font_w(-18, 0, 0, 0, 700, 1, 0, 0, 1, 0, 0, 0, 0, face_name)
+          : nullptr;
+      u8 direct_logfont[92]{};
+      CHECK(direct_font && get_object_w &&
+                get_object_w(direct_font, 92, direct_logfont) == 92 &&
+                direct_logfont[20] == 1 && direct_logfont[23] == 1 &&
+                memcmp(direct_logfont + 28, face_name, sizeof(face_name)) == 0,
+            "CreateFontW preserves face and attributes in a 92-byte LOGFONTW");
+      if (direct_font && delete_object) delete_object(direct_font);
+
       u8 cs[32] = {};
       CHECK(p_tci((void*)(uintptr_t)1252, cs, 2) == 1 &&
                 *(u32*)(cs + 0) == 0 && *(u32*)(cs + 4) == 1252,

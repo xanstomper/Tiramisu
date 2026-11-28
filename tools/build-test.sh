@@ -589,6 +589,10 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   -o "$out/test_gdi"
 "$out/test_gdi" "$out/guest_gdi.exe"
 
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_gdi_glyph.cpp "$out/libtrt.a" -o "$out/test_gdi_glyph"
+"$out/test_gdi_glyph"
+
 # --- 26b. desktop-application paint path: window -> WM_PAINT -> GDI raster --
 # A desktop-shaped guest (RegisterClassEx -> CreateWindowEx -> message pump)
 # must receive the paint cycle, run its own WM_PAINT handler, and its
