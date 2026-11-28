@@ -184,6 +184,28 @@ extern "C" TRT_GUEST_ABI u32 fake_AddRef(void*) {
   return ++g_added_refs;
 }
 
+struct device_guid { u32 data1; u16 data2, data3; u8 data4[8]; };
+constexpr device_guid k_device_iid{
+    0xdb6f6ddb, 0xac77, 0x4e88, {0x82, 0x53, 0x81, 0x9d, 0xf9, 0xbb, 0xf1, 0x40}};
+constexpr device_guid k_device_unknown{};
+static unsigned g_native_get_device_calls;
+
+int TRT_GUEST_ABI fake_dev_QueryInterface(void* self, const void* iid, void** out) {
+  if (!iid || !out) return static_cast<int>(0x80070057u);
+  *out = nullptr;
+  if (memcmp(iid, &k_device_iid, sizeof(k_device_iid)) != 0)
+    return static_cast<int>(0x80004002u);
+  fake_AddRef(self);
+  *out = self;
+  return 0;
+}
+
+int TRT_GUEST_ABI mock_native_get_device(void*, const void*, void** device) {
+  ++g_native_get_device_calls;
+  if (device) *device = g_fake_texture;  // Raw native device must not escape.
+  return 0;
+}
+
 // --- device ---
 extern "C" TRT_GUEST_ABI int fake_dev_CreateRenderTargetView(void* self, void* back,
                                                void* desc, void** out) {
@@ -200,7 +222,7 @@ extern "C" TRT_GUEST_ABI int fake_dev_GetImmediateContext(void* self, void** out
 
 // ID3D11Device: 3 (IUnknown) + 40 own methods = 43 slots
 const void* g_dev_vtbl[43] = {
-    [0] = (const void*)&fake_generic_hr,   // QueryInterface
+    [0] = (const void*)&fake_dev_QueryInterface,   // QueryInterface
     [1] = (const void*)&fake_AddRef,   // AddRef
     [2] = (const void*)&fake_generic_hr,   // Release
     [3] = (const void*)&fake_generic_hr,   // CreateBuffer
@@ -298,6 +320,7 @@ const void* g_sc_vtbl[41] = {
     [0] = (const void*)&fake_generic_hr,
     [1] = (const void*)&fake_AddRef,
     [2] = (const void*)&fake_generic_hr,
+    [7] = (const void*)&mock_native_get_device,
     [8] = (const void*)&fake_sc_Present,   // Present
     [9] = (const void*)&fake_sc_GetBuffer, // GetBuffer
     [13] = (const void*)&mock_native_resize,
@@ -523,9 +546,28 @@ int main(int argc, char** argv) {
   CHECK(trt_gpu_d3d11_uses_stable_backbuffer(2, 0) &&
             !trt_gpu_d3d11_uses_stable_backbuffer(2, 3),
         "desktop DISCARD gets a stable backbuffer while native flip keeps rotating");
-  CHECK(g_added_refs == 2, "combined creation retains the device and context");
+  CHECK(g_added_refs == 3, "combined creation retains device references for the caller and swap chain and a context reference");
   if (sc && sc != g_fake_swapchain) {
     const void** vt = *(const void***)sc;
+    using get_device_fn = int (TRT_GUEST_ABI *)(void*, const void*, void**);
+    const auto get_device = (get_device_fn)vt[7];
+    void* device = nullptr;
+    CHECK(get_device(sc, &k_device_iid, &device) == 0 && device == dev &&
+              g_native_get_device_calls == 0,
+          "swap chain queries the guest device for an owned interface without using the raw chain");
+    if (device == dev) {
+      using release_fn = u32 (TRT_GUEST_ABI *)(void*);
+      ((release_fn)(*static_cast<const void***>(device))[2])(device);
+    }
+    device = sc;
+    CHECK(get_device(sc, &k_device_unknown, &device) == static_cast<int>(0x80004002u) &&
+              !device,
+          "swap chain clears the output when the guest device does not recognize the IID");
+    device = sc;
+    CHECK(get_device(sc, nullptr, &device) == static_cast<int>(0x80070057u) && !device,
+          "swap chain rejects a null IID");
+    CHECK(get_device(sc, &k_device_iid, nullptr) == static_cast<int>(0x80004003u),
+          "swap chain rejects a null output pointer");
     using buffer_fn = int (TRT_GUEST_ABI *)(void*, u32, const void*, void**);
     using present_fn = int (TRT_GUEST_ABI *)(void*, u32, u32);
     using get_desc_fn = int (TRT_GUEST_ABI *)(void*, void*);

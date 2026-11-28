@@ -41,8 +41,19 @@ void* retain_com_object(void* object) {
   return object;
 }
 
+void release_com_object(void* object) {
+  if (object) {
+    const auto vtable = *static_cast<const void***>(object);
+    using release = u32 (TRT_GUEST_ABI *)(void*);
+    if (vtable && vtable[2]) reinterpret_cast<release>(const_cast<void*>(vtable[2]))(object);
+  }
+}
+
+void* create_guest_d3d11_device();
+
 constexpr int TRT_E_NOTIMPL = 0x80004001;  // E_NOTIMPL
 constexpr int TRT_E_NOINTERFACE = 0x80004002;
+constexpr int TRT_E_POINTER = 0x80004003;
 constexpr int TRT_E_INVALIDARG = 0x80070057;  // E_INVALIDARG (TRT_-prefixed: never a Win32 macro name)
 
 // Windows semantics: D3D11CreateDevice walks pFeatureLevels IN ORDER and
@@ -243,7 +254,11 @@ void record_present(u32 flags, int hr) {
 struct fake_swapchain {
   const void** vtbl;
   u32 refcount;
+  void* d3d11_device;
 };
+
+std::mutex g_swapchain_lifetime;
+
 
 static void* active_sc() {
   if (g_sc_is_d3d12 && g_hooks.d3d12_swapchain) return g_hooks.d3d12_swapchain;
@@ -285,11 +300,13 @@ static bool is_swapchain_iid(const void* riid) {
   return false;
 }
 
+u32 TRT_GUEST_ABI fake_sc_AddRef(void* self);
+
 int TRT_GUEST_ABI fake_sc_QueryInterface(void* self, const void* riid, void** ppv) {
   if (!ppv) return TRT_E_NOINTERFACE;
   if (!riid || is_swapchain_iid(riid)) {
     *ppv = self;
-    ++((fake_swapchain*)self)->refcount;
+    fake_sc_AddRef(self);
     return 0;
   }
   void* sc = active_sc();
@@ -299,12 +316,25 @@ int TRT_GUEST_ABI fake_sc_QueryInterface(void* self, const void* riid, void** pp
   return ((fn_t)slot)(sc, riid, ppv);
 }
 u32 TRT_GUEST_ABI fake_sc_AddRef(void* self) {
-  return ++((fake_swapchain*)self)->refcount;
+  std::lock_guard lock(g_swapchain_lifetime);
+  return ++static_cast<fake_swapchain*>(self)->refcount;
 }
 u32 TRT_GUEST_ABI fake_sc_Release(void* self) {
-  fake_swapchain* sc = (fake_swapchain*)self;
-  if (sc->refcount > 1) --sc->refcount;  // host owns real swapchain
-  return sc->refcount;
+  auto* proxy = static_cast<fake_swapchain*>(self);
+  void* old_device = nullptr;
+  u32 refs;
+  {
+    std::lock_guard lock(g_swapchain_lifetime);
+    // The bridge keeps one reference to the proxy itself.
+    if (proxy->refcount > 1) --proxy->refcount;
+    refs = proxy->refcount;
+    if (refs == 1) {
+      old_device = proxy->d3d11_device;
+      proxy->d3d11_device = nullptr;
+    }
+  }
+  release_com_object(old_device);
+  return refs;
 }
 int TRT_GUEST_ABI fake_sc_SetPrivateData(void* self, const void* name, u32 sz, const void* data) {
   (void)self;
@@ -333,16 +363,36 @@ int TRT_GUEST_ABI fake_sc_GetPrivateData(void* self, const void* name, u32* sz, 
 // Both a virtual swap chain and a virtual adapter belong to the guest factory.
 int TRT_GUEST_ABI get_factory_parent(void*, const void* riid, void** parent);
 int TRT_GUEST_ABI fake_sc_GetDevice(void* self, const void* riid, void** dev) {
-  (void)self;
-  void* sc = active_sc();
-  void* slot = real_sc_slot(7);
-  if (slot && sc) {
-    using fn_t = int (TRT_GUEST_ABI *)(void*, const void*, void**);
-    return ((fn_t)slot)(sc, riid, dev);
+  if (!dev) return TRT_E_POINTER;
+  *dev = nullptr;
+  if (!riid) return TRT_E_INVALIDARG;
+  using query_interface = int (TRT_GUEST_ABI *)(void*, const void*, void**);
+
+  if (!g_sc_is_d3d12) {
+    void* device;
+    {
+      std::lock_guard lock(g_swapchain_lifetime);
+      device = retain_com_object(static_cast<fake_swapchain*>(self)->d3d11_device);
+    }
+    if (!device) return TRT_E_NOINTERFACE;
+    const auto vtbl = *static_cast<const void***>(device);
+    const int hr = vtbl && vtbl[0]
+        ? reinterpret_cast<query_interface>(const_cast<void*>(vtbl[0]))(device, riid, dev)
+        : TRT_E_NOINTERFACE;
+    release_com_object(device);
+    return hr;
   }
-  if (!dev) return TRT_E_NOINTERFACE;
-  *dev = g_sc_is_d3d12 ? g_hooks.d3d12_device : g_hooks.device;
-  return *dev ? 0 : TRT_E_NOTIMPL;
+
+  void* sc = active_sc();
+  if (void* slot = real_sc_slot(7); slot && sc) {
+    return reinterpret_cast<query_interface>(slot)(sc, riid, dev);
+  }
+  void* device = g_hooks.d3d12_device;
+  if (!device) return TRT_E_NOINTERFACE;
+  const auto vtbl = *static_cast<const void***>(device);
+  return vtbl && vtbl[0]
+      ? reinterpret_cast<query_interface>(const_cast<void*>(vtbl[0]))(device, riid, dev)
+      : TRT_E_NOINTERFACE;
 }
 int TRT_GUEST_ABI fake_sc_Present(void* self, u32 sync, u32 flags) {
   (void)self;
@@ -749,7 +799,17 @@ const void* g_swapchain_proxy_vtbl[41] = {
     (const void*)&fake_sc_ResizeBuffers1,           // 39
     (const void*)&fake_sc_SetHDRMetaData,           // 40
 };
-fake_swapchain g_swapchain_proxy_obj = {g_swapchain_proxy_vtbl, 1};
+fake_swapchain g_swapchain_proxy_obj = {g_swapchain_proxy_vtbl, 1, nullptr};
+
+void set_swapchain_device(void* owned_device) {
+  void* old_device;
+  {
+    std::lock_guard lock(g_swapchain_lifetime);
+    old_device = g_swapchain_proxy_obj.d3d11_device;
+    g_swapchain_proxy_obj.d3d11_device = owned_device;
+  }
+  release_com_object(old_device);
+}
 
 // ---------------------------------------------------------------------------
 // Offline IDXGIAdapter4 (used when no hardware factory hook is present)
@@ -1217,7 +1277,7 @@ int TRT_GUEST_ABI fake_GetParent(void*, const void*, void** parent) {
 
 int create_swapchain_impl(void* device, u32 w, u32 h, u32 fmt, u32 count,
                           u32 swap_effect, void** swapchain, void* hwnd,
-                          swapchain_sampling sampling) {
+                          swapchain_sampling sampling, void** created_device = nullptr) {
   if (!swapchain) return TRT_E_NOINTERFACE;
   *swapchain = nullptr;
   g_sc_presented.store(false);
@@ -1233,21 +1293,28 @@ int create_swapchain_impl(void* device, u32 w, u32 h, u32 fmt, u32 count,
       }
       g_hooks.d3d12_swapchain = sc12;
     }
+    set_swapchain_device(nullptr);
     g_sc_is_d3d12 = true;
     g_sc_backbuf_idx = 0;
     g_sc_buf_count = count >= 2 ? count : 2;
     g_sc_width = w ? w : (g_hooks.width ? g_hooks.width : 1280);
     g_sc_height = h ? h : (g_hooks.height ? g_hooks.height : 720);
     *swapchain = &g_swapchain_proxy_obj;
-    ++g_swapchain_proxy_obj.refcount;
+    fake_sc_AddRef(&g_swapchain_proxy_obj);
     return 0;
   }
   if (!g_hooks.swapchain) return TRT_E_NOTIMPL;
   const int hr = configure_guest_swapchain(w, h, fmt, count, swap_effect, hwnd, true, sampling);
   if (hr < 0) return hr;
+  // GetDevice must return interfaces from the device that created the guest
+  // swap chain. The native CoreWindow chain owns a different interface and
+  // returning it would bypass the guest device's runtime hooks.
+  void* device_for_swapchain = device ? retain_com_object(device) : create_guest_d3d11_device();
+  set_swapchain_device(device_for_swapchain);
+  if (created_device) *created_device = retain_com_object(device_for_swapchain);
   g_sc_is_d3d12 = false;
   *swapchain = &g_swapchain_proxy_obj;
-  ++g_swapchain_proxy_obj.refcount;
+  fake_sc_AddRef(&g_swapchain_proxy_obj);
   g_d3d11_swapchains.fetch_add(1, std::memory_order_relaxed);
   return 0;
 }
@@ -1459,6 +1526,11 @@ static_assert(sizeof(g_offline_adapter_vtbl) / sizeof(g_offline_adapter_vtbl[0])
 
 fake_factory g_factory_obj = {g_factory_vtbl, 1};
 
+
+void* create_guest_d3d11_device() {
+  return retain_com_object(g_hooks.device);
+}
+
 int TRT_GUEST_ABI get_factory_parent(void*, const void* riid, void** parent) {
   if (!parent) return TRT_E_INVALIDARG;
   if (!riid) {
@@ -1502,7 +1574,7 @@ extern "C" int TRT_GUEST_ABI trt_D3D11CreateDevice(void* adapter, u32 driver_typ
   const int hr = trt_apply_fl_contract(feature_levels, feature_level_count,
                                        &negotiated);
   if (hr != 0) return hr;
-  if (out_device) *out_device = retain_com_object(g_hooks.device);
+  if (out_device) *out_device = create_guest_d3d11_device();
   if (out_context) *out_context = retain_com_object(g_hooks.context);
   if (out_level) *out_level = negotiated;
   return 0;  // S_OK
@@ -1529,15 +1601,16 @@ extern "C" int TRT_GUEST_ABI trt_D3D11CreateDeviceAndSwapChain(void* adapter, u3
   if (out_swapchain) {
     // DXGI_SWAP_CHAIN_DESC, using the same layout as IDXGIFactory::CreateSwapChain.
     const auto* desc = static_cast<const u32*>(swapchain_desc);
-    const int result = create_swapchain_impl(g_hooks.device, desc ? desc[0] : 0,
+    const int result = create_swapchain_impl(nullptr, desc ? desc[0] : 0,
         desc ? desc[1] : 0, desc ? desc[4] : 0, desc ? desc[10] : 0,
         desc ? desc[15] : 3, out_swapchain, desktop_swapchain_window(desc),
-        desc ? swapchain_sampling{desc[7], desc[8]} : swapchain_sampling{});
+        desc ? swapchain_sampling{desc[7], desc[8]} : swapchain_sampling{}, out_device);
     if (result < 0) return result;
+  } else if (out_device) {
+    *out_device = create_guest_d3d11_device();
   }
 
   // Publish references only after both parts have succeeded.
-  if (out_device) *out_device = retain_com_object(g_hooks.device);
   if (out_context) *out_context = retain_com_object(g_hooks.context);
   if (out_level) *out_level = level;
   return 0;
@@ -1612,7 +1685,10 @@ const trt_named_fn k_dxgi_fns[] = {
 
 
 void trt_gpu_set_hooks(const trt_gpu_hooks* hooks) {
-  if (hooks) g_hooks = *hooks;
+  if (!hooks) return;
+  if (hooks->device != g_hooks.device || !hooks->swapchain)
+    set_swapchain_device(nullptr);
+  g_hooks = *hooks;
 }
 
 const trt_gpu_hooks* trt_gpu_hooks_get(void) { return &g_hooks; }
@@ -1644,6 +1720,7 @@ u32 trt_gpu_count_lit_rgb32(const void* pixels, u32 width, u32 height, u32 row_p
 }
 
 void trt_gpu_reset_render_stats(void) {
+  set_swapchain_device(nullptr);
   g_output_mode_changes_logged.store(0, std::memory_order_relaxed);
   g_d3d11_devices.store(0, std::memory_order_relaxed);
   g_d3d11_swapchains.store(0, std::memory_order_relaxed);
