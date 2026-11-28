@@ -114,7 +114,8 @@
     },
     "files": [
       "docs/proof/cuphead-main-menu.jpg",
-      "docs/proof/cuphead-gameplay.mp4"
+      "docs/proof/cuphead-gameplay.mp4",
+      "docs/proof/cuphead-gameplay.webp"
     ],
     "successful_presents_per_second_during_recording": {
       "metric": "D3D11 successful Present deltas during capture after the first 2 seconds",
@@ -122,6 +123,7 @@
       "minimum": 25.48,
       "median": 47.85,
       "maximum": 55.11
-    }
+    },
+    "animated_preview": "Looping WebP derived from the captured MP4 at the original frame timing"
   }
 }

@@ -92,9 +92,16 @@ through Tiramisu 0.2.5.12. Its main menu and the opening section of Forest
 Follies rendered at 1280 × 720. The clip shows Cuphead running, jumping, and
 shooting during encounters with enemies.
 
-![Cuphead main menu on Xbox Series S](docs/proof/cuphead-main-menu.jpg)
+![Cuphead running, jumping, and shooting in Forest Follies on Xbox Series S](docs/proof/cuphead-gameplay.webp)
+
+<details>
+<summary>MP4 player</summary>
 
 https://github.com/user-attachments/assets/fbe63bd8-fe84-4508-bf5d-50ba74d2c953
+
+</details>
+
+![Cuphead main menu on Xbox Series S](docs/proof/cuphead-main-menu.jpg)
 
 The silent 17-second MP4 uses 43 Xbox Device Portal captures at about 2.4 frames per second. During the take, the median game presentation rate was 47.9 D3D11 Presents per second. [Runtime evidence](docs/proof/xbox-series-s-2026-11-28-cuphead-720p-02512.json)
 
