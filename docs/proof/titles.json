@@ -38,8 +38,8 @@
       "dir": "cuphead",
       "build": "Unity, D3D11",
       "machine": "PE32+ x64",
-      "boots": "guest entry and D3D11 reached on 0.2.5.5",
-      "renders": "**no visible game frame** — readable offscreen, guest and host samples stayed black on 0.2.5.5",
+      "boots": "guest entry and D3D11 reached on 0.2.5.8",
+      "renders": "**no visible game frame** — pixel shader invocations and a readable offscreen target, with black guest and host samples on 0.2.5.8",
       "audio": "not measured",
       "input": "game response unverified",
       "playable": "**no** — menu unreached",
@@ -53,7 +53,8 @@
         "docs/proof/xbox-series-s-2026-11-27-runtime-061.json",
         "docs/proof/xbox-series-s-2026-11-27-runtime-062.json",
         "docs/proof/xbox-series-s-2026-11-28-runtime-0254.json",
-        "docs/proof/xbox-series-s-2026-11-28-runtime-0255.json"
+        "docs/proof/xbox-series-s-2026-11-28-runtime-0255.json",
+        "docs/proof/xbox-series-s-2026-11-28-shader-dxbc-0258.json"
       ]
     },
     {

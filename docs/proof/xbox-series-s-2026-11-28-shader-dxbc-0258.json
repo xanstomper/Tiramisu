@@ -1,0 +1,125 @@
+{
+  "date_utc": "2026-11-28",
+  "console": "Xbox Series S",
+  "package_version": "0.2.5.8",
+  "source_commit": "7df6eb9bbdb7685dcbe60484df100bf04aca6e21",
+  "package_sha256": "bd95cb310a9f0af04314a85dae422c6a4cca139554752e1e70023f190192d13f",
+  "entry_point": "Play (LAN dashboard)",
+  "offline_gates": {
+    "bridge_dxbc_regression": "three checks failed before the patch and passed with the patch",
+    "d3dx_dxgi_conformance": "passed",
+    "load_only_pe_files_passed": 123,
+    "uwp_build_and_package": "passed"
+  },
+  "shader_fixture": {
+    "fixture_executable_sha256": "7b8548d0baac81eca75655eda21f7c492a02731339002c6e79cea4c9df0da043",
+    "render_contract": "D3D11 input layout from an extracted DXBC signature and a pixel shader with reflection chunks stripped by the patched bridge",
+    "pixel_shader_rgb": [
+      0.18,
+      0.72,
+      0.3
+    ],
+    "render": {
+      "elapsed_ms": 6000,
+      "d3d11_device_calls": 1,
+      "d3d11_swapchains": 1,
+      "d3d11_successful_presents": 234,
+      "draw_probe_pixel_invocations": 107904,
+      "draw_probe_vertices": 6,
+      "coverage_samples": 2,
+      "surface_other_samples": 0,
+      "surface_other_result": 0,
+      "surface_other_lit_pixels": 0,
+      "guest_lit_pixels": 8,
+      "host_lit_pixels": 8,
+      "shader_input_bc3_nontransparent_lit_peak": 0
+    },
+    "screen_captures": [
+      {
+        "phase": 2,
+        "lit_pixels": 53029,
+        "total": 129600,
+        "green_pixels": 52803,
+        "center_rgb": [
+          46,
+          184,
+          76
+        ]
+      },
+      {
+        "phase": 4,
+        "lit_pixels": 53029,
+        "total": 129600,
+        "green_pixels": 52803,
+        "center_rgb": [
+          46,
+          184,
+          76
+        ]
+      },
+      {
+        "phase": 6,
+        "lit_pixels": 53029,
+        "total": 129600,
+        "green_pixels": 52803,
+        "center_rgb": [
+          46,
+          184,
+          76
+        ]
+      }
+    ]
+  },
+  "cuphead": {
+    "render": {
+      "elapsed_ms": 85000,
+      "d3d11_device_calls": 1,
+      "d3d11_swapchains": 1,
+      "d3d11_successful_presents": 3375,
+      "draw_probe_pixel_invocations": 307200,
+      "draw_probe_vertices": 24,
+      "coverage_samples": 28,
+      "surface_other_samples": 28,
+      "surface_other_result": 0,
+      "surface_other_lit_pixels": 0,
+      "guest_lit_pixels": 0,
+      "host_lit_pixels": 0,
+      "shader_input_bc3_nontransparent_lit_peak": 256
+    },
+    "screen_captures": [
+      {
+        "phase": 24,
+        "lit_pixels": 0,
+        "total": 129600
+      },
+      {
+        "phase": 48,
+        "lit_pixels": 0,
+        "total": 129600
+      },
+      {
+        "phase": 85,
+        "lit_pixels": 0,
+        "total": 129600
+      },
+      {
+        "phase": "key-90",
+        "lit_pixels": 0,
+        "total": 129600
+      },
+      {
+        "phase": "key-13",
+        "lit_pixels": 0,
+        "total": 129600
+      },
+      {
+        "phase": "key-40",
+        "lit_pixels": 0,
+        "total": 129600
+      }
+    ],
+    "visible_game_frame": false,
+    "visible_menu": false,
+    "visible_game_response": false
+  }
+}
