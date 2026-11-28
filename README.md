@@ -94,8 +94,6 @@ shooting during encounters with enemies.
 
 ![Cuphead running, jumping, and shooting in Forest Follies on Xbox Series S](docs/proof/cuphead-gameplay.webp)
 
-https://github.com/user-attachments/assets/fbe63bd8-fe84-4508-bf5d-50ba74d2c953
-
 </details>
 
 ![Cuphead main menu on Xbox Series S](docs/proof/cuphead-main-menu.jpg)
