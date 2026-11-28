@@ -683,8 +683,15 @@ int TRT_STDCALL trt_GetSystemMetrics(int idx) {
   int w = 0, h = 0;
   trt_display_size(&w, &h);
   switch (idx) {
-    case 0: return w;   // SM_CXSCREEN
-    case 1: return h;   // SM_CYSCREEN
+    // The virtual desktop has one monitor, no taskbar and no host-drawn chrome.
+    case 0:   // SM_CXSCREEN
+    case 16:  // SM_CXFULLSCREEN
+    case 78:  // SM_CXVIRTUALSCREEN
+      return w;
+    case 1:   // SM_CYSCREEN
+    case 17:  // SM_CYFULLSCREEN
+    case 79:  // SM_CYVIRTUALSCREEN
+      return h;
     case 2: return 1;   // SM_CXVSCROLL
     case 3: return 10;  // SM_CYHSCROLL
     case 13: return 32; // SM_CXCURSOR

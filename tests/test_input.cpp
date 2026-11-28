@@ -39,6 +39,8 @@ int TRT_STDCALL trt_ClipCursor(const void* lpRect);
 int TRT_STDCALL trt_GetClipCursor(void* lpRect);
 int TRT_STDCALL trt_SetCursorPos(int x, int y);
 int TRT_STDCALL trt_GetSystemMetrics(int idx);
+int TRT_STDCALL trt_SystemParametersInfoW(u32, u32, void*, u32);
+int TRT_STDCALL trt_SystemParametersInfoA(u32, u32, void*, u32);
 u32 TRT_STDCALL trt_GetMessagePos(void);
 u32 TRT_STDCALL trt_XInputGetState(u32 user_index, void* state_out);
 u32 TRT_STDCALL trt_XInputSetState(u32 user_index, const void* vibration);
@@ -460,6 +462,29 @@ int main() {
         if (wm.message == 0x0200u /*WM_MOUSEMOVE*/) saw_move = true;
       }
       CHECK(saw_move, "SetCursorPos posts WM_MOUSEMOVE for guests that wait on it");
+    }
+    {
+      int previous_w, previous_h;
+      trt_display_size(&previous_w, &previous_h);
+      trt_input_display_size(1366, 768);
+      CHECK(trt_GetSystemMetrics(78) == 1366 && trt_GetSystemMetrics(79) == 768 &&
+                trt_GetSystemMetrics(16) == 1366 && trt_GetSystemMetrics(17) == 768,
+            "Virtual desktop and fullscreen metrics follow the host client surface");
+      for (auto spi : {trt_SystemParametersInfoW, trt_SystemParametersInfoA}) {
+        int output[96];
+        for (int& word : output) word = -1;
+        CHECK(spi(0x0030, 0, output, 0) && output[0] == 0 && output[1] == 0 &&
+                  output[2] == 1366 && output[3] == 768 && output[4] == -1,
+              "SPI_GETWORKAREA fills exactly one RECT with the current work area");
+        output[0] = 8; output[1] = -1; output[2] = -1;
+        CHECK(spi(0x0048, 8, output, 0) && output[0] == 8 &&
+                  output[1] == 0 && output[2] == -1,
+              "SPI_GETANIMATION preserves cbSize and reports the virtual window policy");
+        output[0] = 4;
+        CHECK(!spi(0x0048, 4, output, 0) && output[0] == 4 &&
+                  !spi(0x0030, 0, nullptr, 0), "Display queries reject invalid outputs");
+      }
+      trt_input_display_size(previous_w, previous_h);
     }
     // games gate mouse creation on these metrics
     {

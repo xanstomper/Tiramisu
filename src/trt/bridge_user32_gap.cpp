@@ -1651,17 +1651,28 @@ int TRT_STDCALL trt_GetSystemMetricsForDpi(int nIndex, u32 dpi) {
 
 int TRT_STDCALL trt_SystemParametersInfoW(u32 action, u32 psize, void* param,
                                           u32 flags) {
-  (void)psize; (void)flags;
+  (void)flags;
   switch (action) {
-    case 0x0030:  // SPI_GETNONCLIENTMETRICS
-      if (param) memset(param, 0, 340);
+    case 0x0029:  // SPI_GETNONCLIENTMETRICS
+      trt_SetLastError(120);  // ERROR_CALL_NOT_IMPLEMENTED
+      return 0;
+    case 0x0030: {  // SPI_GETWORKAREA
+      if (!param) { trt_SetLastError(87); return 0; }
+      auto* area = static_cast<rect_i32*>(param);
+      area->l = area->t = 0;
+      trt_display_size(&area->r, &area->b);
       return 1;
-    case 0x0048:  // SPI_GETWORKAREA
-      if (param) {
-        rect_i32* r = (rect_i32*)param;
-        r->l = 0; r->t = 0; r->r = 1920; r->b = 1080;
+    }
+    case 0x0048: {  // SPI_GETANIMATION
+      struct animation_info { u32 size; i32 minimize_animation; };
+      auto* info = static_cast<animation_info*>(param);
+      if (!info || info->size != sizeof(*info) || (psize && psize != sizeof(*info))) {
+        trt_SetLastError(87);
+        return 0;
       }
+      info->minimize_animation = 0;
       return 1;
+    }
     case 0x1014:
     case 0x1016:  // SPI_GETSCREENSAVEACTIVE
       if (param) *(int*)param = 0;
