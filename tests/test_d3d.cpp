@@ -16,6 +16,7 @@
 // IUnknown is 3 slots, then the interface's own methods in declaration order.
 #include "../src/trt/trt.h"
 #include "../src/trt/input.h"
+#include "../src/trt/bridge_user32.h"
 #include "../src/trt/bridge_d3d.h"
 
 #include <stdio.h>
@@ -793,6 +794,22 @@ int main(int argc, char** argv) {
                   trt_GetClientRect(window, client) &&
                   client[2] == 1280 && client[3] == 360,
               "ResizeTarget with one zero dimension preserves the other client dimension");
+        trt_gpu_get_resize_stats(&resize);
+        trt_window_size_trace trace{};
+        CHECK(trt_user32_window_size_trace(resize.client_window, &trace) &&
+                  trace.initial_width == 800 && trace.initial_height == 600 &&
+                  trace.empty_transitions == 0,
+              "DXGI identifies the actual HWND and its initial client dimensions");
+        trt_SetWindowPos(window, nullptr, 0, 0, 0, 0, 0x0001u);
+        trt_SetWindowPos(window, nullptr, 0, 0, 0, 37, 0x0016u);
+        trt_SetWindowPos(window, nullptr, 0, 0, 640, 360, 0x0016u);
+        trt_SetWindowPos(window, nullptr, 0, 0, 0, 0, 0x0002u);
+        CHECK(trt_user32_window_size_trace(resize.client_window, &trace) &&
+                  trace.empty_transitions == 2 && trace.prior_width == 1280 &&
+                  trace.prior_height == 360 && trace.empty_width == 0 &&
+                  trace.empty_height == 37 && trace.empty_flags == 0x0016u,
+              "Only actual transitions count and later changes preserve the first one");
+
       }
       hooks.configure_d3d11_swapchain = nullptr;
       hooks.get_d3d11_backbuffer = nullptr;

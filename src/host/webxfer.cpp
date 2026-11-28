@@ -27,6 +27,7 @@
 #ifdef TIRAMISU_UWP_HOST
   #include "cover_art.h"
   #include "../trt/bridge_d3d.h"
+  #include "../trt/bridge_user32.h"
   #include "swapchain.h"
   #include "../trt/iso.h"
   #include <memory>
@@ -2510,6 +2511,18 @@ bool handle_one_request(sock_t s, bool* out_keep_alive) {
              static_cast<unsigned long long>(trt_mem_budget_committed() / 1048576ULL),
              trt_mem_budget_get_mb());
     std::string body(buf);
+    trt_window_size_trace window{};
+    if (trt_user32_window_size_trace(resize.client_window, &window)) {
+      char geometry[288];
+      snprintf(geometry, sizeof(geometry),
+               ",\"window_initial_size\":[%d,%d],\"window_empty_transitions\":%u,"
+               "\"window_before_first_empty\":[%d,%d],\"window_first_empty\":[%d,%d],"
+               "\"window_first_empty_flags\":%u",
+               window.initial_width, window.initial_height, window.empty_transitions,
+               window.prior_width, window.prior_height, window.empty_width,
+               window.empty_height, window.empty_flags);
+      body += geometry;
+    }
     const auto bindings = swapchain_guest_target_bindings();
     char target_stats[384];
     snprintf(target_stats, sizeof(target_stats),

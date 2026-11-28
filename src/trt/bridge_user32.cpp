@@ -60,6 +60,7 @@ struct guest_window {
   i64 proc;             // guest WNDPROC
   i32 x, y;             // guest window origin
   i32 cx, cy;           // current client surface size
+  trt_window_size_trace sizes;
   i32 upd_l, upd_t, upd_r, upd_b;  // owed repaint (empty when l >= r)
   u64 parent;
   wchar_t class_name[64];
@@ -273,6 +274,8 @@ void* TRT_STDCALL trt_CreateWindowExW(u32 exstyle, const wchar_t* cls,
     rec.y = y == (-2147483647 - 1) ? 0 : y;
     rec.cx = w > 0 ? w : 1920;
     rec.cy = h > 0 ? h : 1080;
+    rec.sizes.initial_width = rec.cx;
+    rec.sizes.initial_height = rec.cy;
     rec.upd_l = rec.upd_t = 0;
     rec.upd_r = rec.upd_b = 0;
     if (cls && ((uintptr_t)cls >> 16) != 0) {
@@ -1065,6 +1068,17 @@ int TRT_STDCALL trt_SetWindowPos(void* hwnd, void* after, i32 x, i32 y,
     if (!(flags & no_size)) {
       cx = cx < 0 ? 0 : cx;
       cy = cy < 0 ? 0 : cy;
+      if (match->cx > 0 && match->cy > 0 && (!cx || !cy)) {
+        auto& sizes = match->sizes;
+        if (!sizes.empty_transitions) {
+          sizes.prior_width = match->cx;
+          sizes.prior_height = match->cy;
+          sizes.empty_width = cx;
+          sizes.empty_height = cy;
+          sizes.empty_flags = flags;
+        }
+        ++sizes.empty_transitions;
+      }
       resized = match->cx != cx || match->cy != cy;
       match->cx = cx;
       match->cy = cy;
@@ -1088,6 +1102,14 @@ int TRT_STDCALL trt_SetWindowPos(void* hwnd, void* after, i32 x, i32 y,
   if (moved) dispatch(id, 0x0003u /*WM_MOVE*/, 0, pack_dims(x, y));
   if (resized) dispatch(id, 0x0005u /*WM_SIZE*/, 0, pack_dims(cx, cy));
   return 1;
+}
+
+bool trt_user32_window_size_trace(u64 hwnd, trt_window_size_trace* out) {
+  if (!out) return false;
+  std::lock_guard<std::mutex> lock(g_win_mu);
+  const auto* window = find_win_locked(hwnd);
+  *out = window ? window->sizes : trt_window_size_trace{};
+  return window != nullptr;
 }
 
 extern "C" int trt_user32_window_rect(void* hwnd, i32* rect) {

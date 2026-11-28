@@ -17,6 +17,15 @@ int trt_bridge_register_user32(void);
 i64 trt_user32_window_proc(u64 hwnd, const i64* replacement);
 int trt_user32_window_title(u64 hwnd, u16* text, int capacity);
 
+// Per-window geometry observed by the bridge. Captures only the first change
+// from a nonempty client area to an empty one during this window's lifetime.
+typedef struct trt_window_size_trace {
+  i32 initial_width, initial_height;
+  i32 prior_width, prior_height, empty_width, empty_height;
+  u32 empty_flags, empty_transitions;
+} trt_window_size_trace;
+bool trt_user32_window_size_trace(u64 hwnd, trt_window_size_trace* out);
+
 // ---- DC records (shared with bridge_gdi) ----
 // GetDC hands out record handles; ReleaseDC frees them. bridge_gdi keys
 // its per-DC state on these SAME records so SelectObject(hdc) from a

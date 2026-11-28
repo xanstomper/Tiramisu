@@ -79,6 +79,7 @@ typedef struct trt_gpu_render_stats {
 } trt_gpu_render_stats;
 
 typedef struct trt_gpu_resize_stats {
+  u64 client_window;  // internal guest HWND for correlating USER32 dimensions
   u32 target_calls, target_width, target_height;
   int target_result;
   u32 buffer_calls, buffer_requested_width, buffer_requested_height;

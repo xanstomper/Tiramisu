@@ -190,6 +190,10 @@ int configure_guest_swapchain(u32 width, u32 height, u32 fmt, u32 count,
     g_resize_stats.buffer_result = hr;
   }
   if (hr < 0) return hr;
+  if (creating) {
+    std::lock_guard<std::mutex> lock(g_resize_stats_mutex);
+    g_resize_stats.client_window = reinterpret_cast<uintptr_t>(hwnd);
+  }
   g_d3d11_width.store(width);
   g_d3d11_height.store(height);
   g_d3d11_hwnd = hwnd;
